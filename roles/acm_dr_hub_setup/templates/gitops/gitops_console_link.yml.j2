@@ -1,0 +1,11 @@
+apiVersion: console.openshift.io/v1
+kind: ConsoleLink
+metadata:
+  name: "{{ item.name }}"
+spec:
+  applicationMenu:
+    section: OpenShift GitOps
+    imageURL: "{{ item.image_url }}"
+  href: "https://{{ item.host }}"
+  location: ApplicationMenu
+  text: "{{ item.text }}"

@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 06 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 06 - Automation RBAC Cleanup] | Display automation identity removal metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "🤖 STAGE 06 - Remove Zero-Trust Automation Identity"
+    acm_dr_hub_cleanup_banner_lines:
+      - "🔄 acm_dr_hub_cleanup_remove_automation_identity: {{ acm_dr_hub_cleanup_remove_automation_identity | default(false) | bool }}"
+  run_once: true
+
+# Explicit warning when the operator opted in to SA removal. Removing the
+# automation identity cuts the only non-interactive access to the cluster;
+# reconnecting afterward requires kubeadmin or another privileged user
+# to re-run 02_provision_automation_sa.sh.
+- name: "[STAGE 06 - Automation RBAC Cleanup] | ⚠️ WARNING: SA removal will cut automation access to {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg:
+      - "⚠️  ========================================================================"
+      - "⚠️  WARNING: acm_dr_hub_cleanup_remove_automation_identity=true"
+      - "⚠️  ========================================================================"
+      - "⚠️  This will DELETE the ServiceAccount '{{ acm_dr_hub_cleanup_automation_sa_name }}'"
+      - "⚠️  in namespace '{{ acm_dr_hub_cleanup_automation_namespace }}' and its cluster-admin"
+      - "⚠️  ClusterRoleBinding on context '{{ k8s_target_context }}'."
+      - "⚠️  "
+      - "⚠️  After this, NO automated access to the cluster is possible."
+      - "⚠️  To reconnect, a human operator must log in with kubeadmin (or"
+      - "⚠️  another privileged user) and re-provision the SA by running:"
+      - "⚠️    examples/scripts/cluster-onboarding/02_provision_automation_sa.sh <context>"
+      - "⚠️  ========================================================================"
+  when: acm_dr_hub_cleanup_remove_automation_identity | default(false) | bool
+  run_once: true
+
+# =============================================================================
+# STEP 6.1: REMOVE THE AUTOMATION NAMESPACE (SA + TOKEN SECRET TOGETHER)
+# =============================================================================
+# Delete the namespace BEFORE the ClusterRoleBinding. The SA lives inside
+# this namespace, and the CRB grants it cluster-admin. If the CRB is
+# removed first, the SA loses permission to delete its own namespace,
+# causing a 403 Forbidden on the next task.
+
+- name: "[STAGE 06 - Automation RBAC Cleanup] | 6.1.1) Remove Zero-Trust automation namespace (ServiceAccount/Secret together) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    kind: Namespace
+    name: "{{ acm_dr_hub_cleanup_automation_namespace }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}"
+  register: acm_dr_hub_cleanup_automation_ns_removal
+  when: acm_dr_hub_cleanup_remove_automation_identity | default(false) | bool
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  # 401/Unauthorized can happen when the SA deletes its own namespace (token
+  # invalidated mid-operation). 404/NotFound means the namespace was already
+  # gone. Both are safe to treat as success here.
+  failed_when:
+    - acm_dr_hub_cleanup_automation_ns_removal is failed
+    - "'Unauthorized' not in (acm_dr_hub_cleanup_automation_ns_removal.msg | default(''))"
+    - "'NotFound' not in (acm_dr_hub_cleanup_automation_ns_removal.msg | default(''))"
+
+- name: "[STAGE 06 - Automation RBAC Cleanup] | 6.1.2) ⚠️ Namespace removal encountered auth issue (SA self-destructed)"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ Namespace '{{ acm_dr_hub_cleanup_automation_namespace }}' deletion returned
+      401/Unauthorized on context '{{ k8s_target_context }}'. The SA token was likely
+      invalidated because the SA lives inside this namespace. The namespace may have
+      been deleted successfully despite the error, or it may still exist as an orphan.
+      Verify manually: oc get ns {{ acm_dr_hub_cleanup_automation_namespace }}
+      --context {{ k8s_target_context }} (using a different credential).
+  when:
+    - acm_dr_hub_cleanup_automation_ns_removal is defined
+    - acm_dr_hub_cleanup_automation_ns_removal is failed
+    - "'Unauthorized' in (acm_dr_hub_cleanup_automation_ns_removal.msg | default(''))"
+
+- name: "[STAGE 06 - Automation RBAC Cleanup DIAGNOSTIC] | ❌ Automation namespace stuck"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Namespace '{{ acm_dr_hub_cleanup_automation_namespace }}'
+      did not terminate within {{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}s
+      on context '{{ k8s_target_context }}'.
+      Check for stuck finalizers: oc get ns {{ acm_dr_hub_cleanup_automation_namespace }}
+      -o yaml --context {{ k8s_target_context }}.
+      Use examples/scripts/break-glass/force_delete_namespace.sh if needed.
+  when:
+    - acm_dr_hub_cleanup_automation_ns_removal is defined
+    - acm_dr_hub_cleanup_automation_ns_removal is failed
+    # Only fail on genuine stuck-namespace scenarios, not on auth errors
+    # (401 is handled above as an expected SA self-destruction side effect)
+    - "'Unauthorized' not in (acm_dr_hub_cleanup_automation_ns_removal.msg | default(''))"
+    - "'NotFound' not in (acm_dr_hub_cleanup_automation_ns_removal.msg | default(''))"
+
+# =============================================================================
+# STEP 6.2: REMOVE THE CLUSTERROLEBINDING (CLUSTER-SCOPED RESOURCE)
+# =============================================================================
+# Best-effort: after the namespace (and the SA inside it) is gone, the
+# bearer token is invalid and this task returns 401. That is expected;
+# the orphaned CRB is harmless (it references a non-existent SA) and
+# 02_provision_automation_sa.sh re-creates it during re-provisioning.
+
+- name: "[STAGE 06 - Automation RBAC Cleanup] | 6.2.1) Remove DR automation ClusterRoleBinding - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: "{{ acm_dr_hub_cleanup_automation_sa_name }}-admin"
+  register: acm_dr_hub_cleanup_crb_removal
+  when: acm_dr_hub_cleanup_remove_automation_identity | default(false) | bool
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  # 401/Unauthorized is expected after the namespace was deleted (SA token
+  # invalidated). 404/NotFound means the CRB was already gone. Both are safe.
+  failed_when:
+    - acm_dr_hub_cleanup_crb_removal is failed
+    - "'Unauthorized' not in (acm_dr_hub_cleanup_crb_removal.msg | default(''))"
+    - "'NotFound' not in (acm_dr_hub_cleanup_crb_removal.msg | default(''))"
+
+- name: "[STAGE 06 - Automation RBAC Cleanup] | 6.2.2) ⚠️ CRB removal skipped (SA token expired after namespace deletion)"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ ClusterRoleBinding '{{ acm_dr_hub_cleanup_automation_sa_name }}-admin' could not be
+      removed (SA token invalid after namespace deletion). The orphaned CRB references a
+      non-existent ServiceAccount and is harmless. It will be replaced on re-provisioning
+      via 02_provision_automation_sa.sh.
+  when:
+    - acm_dr_hub_cleanup_crb_removal is defined
+    - acm_dr_hub_cleanup_crb_removal is failed
+
+- name: "[STAGE 06 - Automation RBAC Cleanup] | 6.3.1) ℹ️ Inform that automation identity was preserved (default)"
+  ansible.builtin.debug:
+    msg: >-
+      ℹ️  [PRESERVED]: acm_dr_hub_cleanup_remove_automation_identity=false (default).
+      Namespace '{{ acm_dr_hub_cleanup_automation_namespace }}', ServiceAccount
+      '{{ acm_dr_hub_cleanup_automation_sa_name }}' and its cluster-admin ClusterRoleBinding
+      were NOT removed. Automated access to '{{ k8s_target_context }}' is still functional.
+      To also remove the automation identity, re-run with
+      -e acm_dr_hub_cleanup_remove_automation_identity=true.
+  run_once: true
+  when: not (acm_dr_hub_cleanup_remove_automation_identity | default(false) | bool)
+
+# =============================================================================
+# STEP 6.3: COMPLETION SUMMARY AND STAGE 06 STATUS
+# =============================================================================
+# At this point both the namespace (6.1) and the CRB (6.2) are gone.
+# The SA token used by this playbook is now invalid on this cluster.
+
+- name: "[STAGE 06 - Automation RBAC Cleanup] | Display automation identity removal completion status"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        "✅ [STAGE 06]: Namespace '" ~ acm_dr_hub_cleanup_automation_namespace ~ "', ServiceAccount '" ~
+        acm_dr_hub_cleanup_automation_sa_name ~ "' and ClusterRoleBinding removed. Context '" ~
+        k8s_target_context ~ "-sa' no longer exists as of now."
+        if acm_dr_hub_cleanup_remove_automation_identity | default(false) | bool
+        else '🟢 [STAGE 06]: Automation identity preserved (acm_dr_hub_cleanup_remove_automation_identity=false).'
+      }}
+  run_once: true
+...

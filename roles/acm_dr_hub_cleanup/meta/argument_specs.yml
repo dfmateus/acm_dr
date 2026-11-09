@@ -1,0 +1,333 @@
+---
+argument_specs:
+  main:
+    short_description: Controlled decommissioning of an RHACM DR node
+    description:
+      - >-
+        Inverse operation of acm_dr_hub_setup: decommissions a cluster that was
+        elected as an RHACM DR node, removing only what is pertinent to the DR
+        role (ACM, scoped GitOps, OADP config, Observability) while preserving
+        the GitOps/OADP operators and the backup data in cloud storage
+        (Azure Blob or AWS S3) by default.
+    author:
+      - Diego Felipe Mateus
+    options:
+      # --- COSMETIC AND GENERAL CONTROL PARAMETERS ---
+      acm_dr_hub_cleanup_separator_char:
+        description:
+          - Character used for visual separators in console output.
+        type: str
+        default: "="
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_default_message_padding:
+        description:
+          - Number of spaces for padding console messages.
+        type: int
+        default: 4
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_debug_no_log:
+        description:
+          - Suppresses task output for security-sensitive operations. Set to false to expose hidden output during troubleshooting sessions.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      # --- SAFETY GATES ---
+      acm_dr_hub_cleanup_confirm:
+        description: >-
+          Mandatory explicit confirmation. Without this, Stage 00 refuses to proceed.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_force:
+        description: >-
+          Overrides the safety lock that prevents cleanup of a Hub that appears
+          to be ACTIVE in production (BackupSchedule present and not paused).
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_dry_run:
+        description: Simulation mode with dryRun=All on the API Server. No actual removals.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      # --- CLOUD PROVIDER SELECTOR ---
+      acm_dr_hub_cleanup_cloud_provider:
+        description: >-
+          Cloud storage backend that was used during setup. Controls which
+          provider-specific cleanup tasks run at Stage 05 (Azure Blob or
+          AWS S3). Must match the cloud_provider value used in
+          acm_dr_hub_setup. Must be "azure" or "aws".
+        type: str
+        default: "azure"
+        choices:
+          - azure
+          - aws
+        version_added: "1.6.0"
+      # --- CLEANUP SCOPE ---
+      acm_dr_hub_cleanup_remove_automation_identity:
+        description: >-
+          Remove Zero-Trust automation namespace/ServiceAccount/RBAC.
+          Disabled by default because removing the SA cuts automated access
+          to the cluster; reconnecting requires kubeadmin or another
+          privileged user to re-provision the SA.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_purge_azure_storage:
+        description: >-
+          Remove the Storage Account and Containers in Azure (irreversible action).
+          Disabled by default because the primary Hub may share the same storage.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_known_peer_hubs:
+        description: >-
+          List of kubeconfig contexts for other hubs sharing the same cloud storage.
+          When storage purge is enabled and this list is non-empty, the cleanup preflight
+          queries each peer hub's BSL status and warns if any peer still depends on the
+          shared storage. When empty (default), only a generic warning is shown.
+        type: list
+        elements: str
+        default: []
+        version_added: "1.2.0"
+      # --- ACM NAMESPACES AND RESOURCES ---
+      acm_dr_hub_cleanup_mch_namespace:
+        description: MultiClusterHub namespace.
+        type: str
+        default: "open-cluster-management"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_mch_name:
+        description: MultiClusterHub Custom Resource name.
+        type: str
+        default: "multiclusterhub"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_mch_pull_secret:
+        description:
+          - Pull secret name for RHACM.
+        type: str
+        default: "rhacm-pull-secret"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_mch_operator_subscription:
+        description: ACM operator Subscription name.
+        type: str
+        default: "advanced-cluster-management"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_mch_operatorgroup:
+        description:
+          - ACM OperatorGroup name.
+        type: str
+        default: "open-cluster-management-group"
+        version_added: "1.0.0"
+      # --- OBSERVABILITY ---
+      acm_dr_hub_cleanup_observability_namespace:
+        description: MultiClusterObservability (Thanos) namespace.
+        type: str
+        default: "open-cluster-management-observability"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_observability_mco_name:
+        description:
+          - MultiClusterObservability Custom Resource name.
+        type: str
+        default: "observability"
+        version_added: "1.0.0"
+      # --- OADP ---
+      acm_dr_hub_cleanup_oadp_namespace:
+        description: OADP/Velero namespace.
+        type: str
+        default: "open-cluster-management-backup"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_oadp_dpa_name:
+        description: DataProtectionApplication name to remove.
+        type: str
+        default: "dpa-hub"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_oadp_cloud_secret_name:
+        description: >-
+          Name of the OADP cloud credentials Secret to remove. OADP 1.6+
+          requires "cloud-credentials" for reconciliation, so this is now
+          the same across all providers.
+        type: str
+        default: "cloud-credentials"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_schedule_name:
+        description: BackupSchedule name to remove.
+        type: str
+        default: "schedule-acm-hub"
+        version_added: "1.0.0"
+      # --- GITOPS ---
+      acm_dr_hub_cleanup_gitops_namespace_acm:
+        description: Governance ArgoCD instance namespace.
+        type: str
+        default: "openshift-gitops-acm"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_gitops_namespace_appdemo:
+        description: Demo ArgoCD instance namespace.
+        type: str
+        default: "openshift-gitops-appdemo"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_policies_namespace:
+        description: Governance policies namespace.
+        type: str
+        default: "acm-policies"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_gitops_repo_secret_name:
+        description:
+          - GitOps repository credentials Secret name.
+        type: str
+        default: "repo-acm-ocp-creds"
+        version_added: "1.0.0"
+      # --- ZERO-TRUST AUTOMATION ---
+      acm_dr_hub_cleanup_automation_namespace:
+        description: Automation identity namespace.
+        type: str
+        default: "ansible-automation"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_automation_sa_name:
+        description: Automation ServiceAccount name.
+        type: str
+        default: "ansible-dr-orchestrator"
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_automation_secret_name:
+        description:
+          - Automation ServiceAccount token Secret name.
+        type: str
+        default: "ansible-dr-orchestrator-token"
+        version_added: "1.0.0"
+      # --- AZURE CREDENTIALS ---
+      acm_dr_hub_cleanup_guid:
+        description: Environment GUID (required only if purge_azure_storage=true).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_azure_subscription_id:
+        description: Azure Subscription ID.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_azure_tenant_id:
+        description: Azure Tenant ID.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_azure_client_id:
+        description: Azure Service Principal Client ID.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_azure_client_secret:
+        description: Azure Service Principal Client Secret.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_azure_resource_group:
+        description:
+          - Azure Resource Group name (required only if purge_azure_storage=true).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_azure_storage_account_name:
+        description:
+          - Azure Storage Account name (required only if purge_azure_storage=true).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      # --- AWS CREDENTIALS (for storage purge when cloud_provider=aws) ---
+      acm_dr_hub_cleanup_purge_aws_storage:
+        description: >-
+          Remove the S3 buckets in AWS (irreversible action). Disabled by
+          default because the primary Hub may share the same storage.
+          Only applies when cloud_provider=aws.
+        type: bool
+        default: false
+        version_added: "1.6.0"
+      acm_dr_hub_cleanup_aws_access_key_id:
+        description: >-
+          AWS IAM Access Key ID for S3 cleanup operations (read from env
+          AWS_ACCESS_KEY_ID). Required when purge_aws_storage=true.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_cleanup_aws_secret_access_key:
+        description: >-
+          AWS IAM Secret Access Key for S3 cleanup operations (read from
+          env AWS_SECRET_ACCESS_KEY). Required when purge_aws_storage=true.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_cleanup_aws_region:
+        description: >-
+          AWS region where the S3 buckets were provisioned (e.g. us-east-1).
+          Required when purge_aws_storage=true.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_cleanup_aws_s3_bucket_backup:
+        description: >-
+          S3 bucket name for OADP/Velero backups (to be deleted when
+          purge_aws_storage=true).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_cleanup_aws_s3_bucket_observability:
+        description: >-
+          S3 bucket name for Thanos observability data (to be deleted when
+          purge_aws_storage=true). Optional; when empty, only the backup
+          bucket is purged.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      # --- TIMEOUTS ---
+      acm_dr_hub_cleanup_mch_delete_timeout:
+        description: Timeout (seconds) for MultiClusterHub removal.
+        type: int
+        default: 1800
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_mco_delete_timeout:
+        description: Timeout (seconds) for MultiClusterObservability removal.
+        type: int
+        default: 600
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_namespace_delete_timeout:
+        description: Timeout (seconds) for namespace removal.
+        type: int
+        default: 600
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_argocd_delete_timeout:
+        description: Timeout (seconds) for ArgoCD instance removal.
+        type: int
+        default: 300
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_restore_cr_wait_timeout:
+        description: >-
+          How long (seconds) to wait for ACM Restore CRs to disappear after
+          deletion before force-removing their finalizers (Stage 02).
+        type: int
+        default: 120
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_mch_remediation_retries:
+        description: >-
+          Polling retries for the Stage 04 MCH re-wait loop after inline
+          break-glass (D.8). Total wait = retries × delay = 20 × 60 = 1200
+          seconds (20 minutes). D.9 force-removes the MCH finalizer if
+          this loop exhausts its retries.
+        type: int
+        default: 20
+        version_added: "1.0.0"
+      acm_dr_hub_cleanup_mch_remediation_delay:
+        description: Interval in seconds between Stage 04 MCH remediation polling retries.
+        type: int
+        default: 60
+        version_added: "1.0.0"
+...

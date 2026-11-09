@@ -1,0 +1,61 @@
+---
+# =============================================================================
+# bootstrap-cluster.yml
+#
+# Creates the ansible-dr-orchestrator ServiceAccount, ClusterRoleBinding, and
+# non-expiring token Secret on a target cluster. Run once per cluster before
+# configuring permanent credentials in AAP.
+#
+# Connection modes (checked in order):
+#   1. k8s_target_context - kubeconfig context name (-e k8s_target_context=<ctx>)
+#   2. K8S_AUTH_HOST + K8S_AUTH_API_KEY - AAP built-in "OpenShift Bearer Token" credential
+#   3. KUBECONFIG / K8S_AUTH_KUBECONFIG - existing local kubeconfig file
+# =============================================================================
+- name: "Bootstrap cluster automation identity"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]
+      tags: [always]
+
+    - name: "[PRE-FLIGHT] | Derive target context from ACM_DR_TARGET_CONTEXT when not set"
+      ansible.builtin.set_fact:
+        k8s_target_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT') }}"
+      when: k8s_target_context is not defined
+
+    # When using the AAP built-in "OpenShift Bearer Token" credential, K8S_AUTH_HOST
+    # and K8S_AUTH_API_KEY are injected directly - no kubeconfig file is written and
+    # k8s_target_context may be empty. The assert below accepts either a context or
+    # native K8S_AUTH_* env vars as valid connection proofs.
+    - name: "[PRE-FLIGHT] | Assert a cluster connection method is available"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (k8s_target_context | default('') | length > 0) or
+            (lookup('ansible.builtin.env', 'K8S_AUTH_HOST') | length > 0) or
+            (lookup('ansible.builtin.env', 'KUBECONFIG') | length > 0) or
+            (lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | length > 0)
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => No cluster connection method found.
+          Provide one of: k8s_target_context (-e), K8S_AUTH_HOST + K8S_AUTH_API_KEY
+          (AAP built-in credential), or KUBECONFIG / K8S_AUTH_KUBECONFIG (kubeconfig path).
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Connection method resolved.
+          Context: {{ k8s_target_context | default('(native K8S_AUTH_* env vars)') }}
+
+  roles:
+    - role: "{{ playbook_dir }}/../roles/acm_dr_cluster_onboard"
+...

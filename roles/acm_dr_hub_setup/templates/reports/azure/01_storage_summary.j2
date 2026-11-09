@@ -1,0 +1,15 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 01 - AZURE BLOB STORAGE PROVISIONED & READY
+{{ _sep }}
+ 📦 RESOURCE GROUP:     {{ acm_dr_hub_setup_azure_resource_group }}
+ 💾 STORAGE ACCOUNT:    {{ acm_dr_hub_setup_azure_storage_account_name }}
+ 🗄️ CONTAINER BACKUP:   {{ acm_dr_hub_setup_azure_container_backup }} (Velero/OADP)
+ 📊 CONTAINER OBS:      {{ acm_dr_hub_setup_azure_container_observability }} (Thanos)
+ 🔐 RBAC PERMISSION:    Storage Blob Data Contributor assigned
+{{ _sep }}
+ ⚠️  SECURITY & ARCHITECTURE NOTE:
+ The created containers have public access blocked by default.
+ The Service Principal credentials have been configured with scope
+ exclusive to the Disaster Recovery Storage Account.
+{{ _sep }}

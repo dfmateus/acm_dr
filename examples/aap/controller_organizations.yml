@@ -1,0 +1,39 @@
+---
+# examples/aap/controller_organizations.yml
+#
+# Organization definition for Red Hat Ansible Automation Platform.
+# Compatible with the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES - replace before importing:
+#   {{ aap_organization }}  → Your AAP Organization name (e.g., "ACM DR Operations")
+#
+# Usage:
+#   ansible-playbook -e @examples/aap/controller_organizations.yml \
+#     -e "controller_hostname=https://aap.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=changeme" \
+#     -e "aap_organization=ACM DR Operations" \
+#     infra.controller_configuration.organizations
+#
+# IMPORT ORDER: organizations must be created BEFORE any other resource
+# (execution environments, inventories, projects, credentials, templates).
+# Create this first on a fresh AAP instance.
+
+controller_organizations:
+
+  # ---------------------------------------------------------------------------
+  # ACM DR Operations Organization
+  # ---------------------------------------------------------------------------
+  # Single organization that owns all ACM DR automation resources.
+  # If your AAP uses the built-in "Default" organization, set aap_organization=Default
+  # and skip creating this file - the Default org already exists.
+  - name: "{{ aap_organization }}"
+    description: >-
+      RHACM 2.17 Multi-Cluster Business Continuity automation. Owns all ACM DR Job
+      Templates, Workflow Templates, Credential Types, credential instances, inventories,
+      projects, and execution environments for the ansible-acm-dr collection.
+    max_hosts: 10  # count - localhost-only automation; limit prevents accidental inventory expansion
+    # Galaxy credentials are set here if the EE requires private Automation Hub for collection download.
+    # For public Galaxy (default), leave this empty.
+    galaxy_credentials: []
+...

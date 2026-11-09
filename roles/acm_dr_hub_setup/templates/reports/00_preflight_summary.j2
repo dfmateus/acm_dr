@@ -1,0 +1,16 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 00 - PREFLIGHT & SAFETY VALIDATION PASSED
+{{ _sep }}
+ 🎯 TARGET CONTEXT:        {{ k8s_target_context }}
+ 🏷️  HUB TYPE:              {{ is_primary_hub | default(false) | bool | ternary('PRIMARY HUB (ACTIVE)', 'SECONDARY / PASSIVE HUB (DR)') }}
+ 🛠️  LOCAL TOOLS:           az and oc (Available and validated)
+ 🔐 OPENSHIFT ACCESS:      cluster-admin confirmed
+ 🤖 AUTOMATION RBAC:       ServiceAccount {{ acm_dr_hub_setup_automation_sa_name }} ready
+ ⚙️  PRIOR RHACM STATUS:   {{ acm_dr_hub_setup_acm_installed | default(false) | ternary('Installed and Running (Stage 02 will be skipped)', 'Absent / Requires Installation') }}
+{{ _sep }}
+ ⚠️  SECURITY & OPERATIONS NOTE:
+ All connectivity prerequisites, environment variables,
+ and Red Hat OpenShift permissions have been successfully validated.
+ The environment is ready to proceed with automation.
+{{ _sep }}

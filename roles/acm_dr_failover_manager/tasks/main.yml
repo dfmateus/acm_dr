@@ -1,0 +1,297 @@
+---
+# roles/acm_dr_failover_manager/tasks/main.yml
+# =============================================================================
+# STAGE DISPATCHER - execution order vs. file numbering
+# =============================================================================
+# The logical stage sequence below does NOT match the numeric prefix of the
+# task files. The sanitization step (KCS 7039710 MSA token purge) was moved
+# from its original position (after Verify Spokes) to before it, but the file
+# was not renamed to avoid disrupting git history and cross-references. The
+# table below is the authoritative mapping:
+#
+#  Logical stage  | Dispatcher label          | Task file
+#  ---------------+---------------------------+-----------------------------
+#  00             | Preflight & Safety Guard  | 00_preflight_check.yml
+#  01             | Map Spoke Fleet           | 01_discover_fleet.yml
+#  02             | Apply Fencing             | 02_pause_schedule.yml
+#  02a            | Pre-Restore Cleanup       | 02a_pre_restore_cleanup.yml
+#  03             | Activate DR Hub           | 03_activate_hub.yml
+#  04             | Sanitize Passive Hub      | 07_sanitize_passive_hub.yml *
+#  05             | Validate Spoke Connectivity | 04_verify_spokes.yml *
+#  05b            | Repair Addon Cert Mismatch  | 04b_repair_addon_certs.yml
+#  06             | Protect New Leader Hub    | 05_create_schedule.yml
+#  06a            | Recycle Additional Hubs   | 05a_recycle_passive_hubs.yml
+#  07             | Isolate and Detach Old Hub| 06_detach_old_hub.yml *
+#  07a            | Convergence Wait          | 07a_convergence_wait.yml
+#  08             | Integrity and Compliance  | 08_postflight_check.yml
+#
+# (*) File number does not match logical stage. Do not renumber these files
+#     without updating all cross-references in docs/ and tests/.
+#
+# WHY include_tasks AND NOT import_tasks:
+# Stages 04, 05, 07, and 08 use `when:` conditions that reference variables
+# computed by earlier stages at runtime (e.g., acm_dr_failover_manager_spoke_list
+# set by Stage 01 discover_fleet). import_tasks evaluates `when` statically at
+# parse time - before any tasks have run - so those conditions always resolve to
+# the default value and the stages are silently skipped. include_tasks evaluates
+# `when` at runtime, after the earlier stages have set the variables. Never
+# change these to import_tasks without testing that the conditional stages still
+# execute correctly in both dry-run and production mode.
+# =============================================================================
+
+- name: "[FAILOVER DISPATCHER] | Display role initialization status and operational metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🚀 INITIALIZING: ACM DR FAILOVER ORCHESTRATOR"
+    acm_dr_failover_manager_banner_lines:
+      - "🌐 SOURCE HUB:      {{ active_hub | default('NOT DEFINED') }}"
+      - "📡 DESTINATION HUB: {{ passive_hub | default('NOT DEFINED') }}"
+      - >-
+        🛡️  SIMULATION MODE:     {{ (acm_dr_failover_manager_dry_run | default(false)) | bool
+        | ternary('ENABLED (DRY-RUN)', 'DISABLED (PRODUCTION)') }}
+  run_once: true
+  tags:
+    - always
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 00 - Preflight & Safety Guard"
+  ansible.builtin.include_tasks: 00_preflight_check.yml
+  tags:
+    - preflight
+    - stage00
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 01 - Map Spoke Fleet"
+  ansible.builtin.include_tasks: 01_discover_fleet.yml
+  tags:
+    - discover_fleet
+    - stage01
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 02 - Apply Fencing (Pause Schedule)"
+  ansible.builtin.include_tasks: 02_pause_schedule.yml
+  tags:
+    - pause_schedule
+    - stage02
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 02a - Pre-Restore Cleanup on Destination Hub"
+  ansible.builtin.include_tasks: 02a_pre_restore_cleanup.yml
+  when: >-
+    (acm_dr_failover_manager_dest_terminating_ns.resources | default([]) | length > 0) or
+    (acm_dr_failover_manager_dest_stale_restores.resources | default([]) | length > 0)
+  tags:
+    - pre_restore_cleanup
+    - stage02a
+
+# ansible.builtin.pause with a prompt is not viable in AAP 2.7: the web UI
+# does not reliably render the interactive input field, and there is no API
+# endpoint to resume it. When invoked from a Workflow Template, the WF
+# approval node is the real human gate - a blocking pause inside the JT
+# adds friction without adding safety. Changed to debug so the audit trail
+# records that this point was reached without halting automation.
+# For CLI use: see the debug message in the output and abort the playbook
+# manually if needed before Stage 03 begins.
+- name: "🚦 [GATE] | Critical Point of No Return - Stage 02 complete, fencing applied on Source"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ POINT OF NO RETURN: BackupSchedule fencing has been applied on Source Hub
+      '{{ active_hub }}'. Proceeding with DR Hub activation on '{{ passive_hub }}'.
+      This action is irreversible without a second failover cycle.
+      skip_gates={{ acm_dr_failover_manager_skip_gates | default(false) }},
+      dry_run={{ acm_dr_failover_manager_dry_run | default(false) }}.
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false)) | bool
+  tags:
+    - always
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 03 - Activate DR Hub (Restore)"
+  tags:
+    - activate_hub
+    - stage03
+  block:
+    - name: "[FAILOVER DISPATCHER] | Execute Stage 03 - Activate DR Hub (Restore) [block]"
+      ansible.builtin.include_tasks: 03_activate_hub.yml
+  rescue:
+    # The D.7 fail task in 03_activate_hub.yml triggered this rescue. The diagnostic
+    # report (D.1-D.6) has already been printed above. Tasks here undo Stage 02
+    # fencing so the environment returns to a known-good state before the pipeline
+    # surfaces the original failure.
+    - name: "[FAILOVER DISPATCHER] | OP-11 ROLLBACK - Stage 03 failed: evaluating rollback"
+      ansible.builtin.debug:
+        msg: >-
+          ❌ Stage 03 (Restore) failed on DR Hub '{{ passive_hub }}'.
+          Rollback is {{ 'ENABLED' if (acm_dr_failover_manager_rollback_on_restore_failure | default(true) | bool) else 'DISABLED' }}.
+          {{ 'Initiating: re-enabling BackupSchedule on source Hub ' + active_hub + '.'
+             if (acm_dr_failover_manager_rollback_on_restore_failure | default(true) | bool)
+             else 'Set acm_dr_failover_manager_rollback_on_restore_failure=true to enable automatic rollback.' }}
+
+    - name: "[FAILOVER DISPATCHER] | OP-11 ROLLBACK - Re-enable BackupSchedule on Source Hub"
+      kubernetes.core.k8s_json_patch:
+        context: "{{ active_hub }}"
+        api_version: cluster.open-cluster-management.io/v1beta1
+        kind: BackupSchedule
+        name: "{{ acm_dr_failover_manager_schedule_name }}"
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+        patch:
+          - op: replace
+            path: /spec/paused
+            value: false
+      when:
+        - acm_dr_failover_manager_rollback_on_restore_failure | default(true) | bool
+        - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+    - name: "[FAILOVER DISPATCHER] | OP-11 ROLLBACK - ⏳ Poll BackupSchedule until status.phase=Enabled on Source Hub"
+      kubernetes.core.k8s_info:
+        context: "{{ active_hub }}"
+        api_version: cluster.open-cluster-management.io/v1beta1
+        kind: BackupSchedule
+        name: "{{ acm_dr_failover_manager_schedule_name }}"
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+      register: acm_dr_failover_manager_r_rollback_schedule
+      until: >-
+        (acm_dr_failover_manager_r_rollback_schedule.resources | default([{}]))[0]
+        .get('status', {}).get('phase', '') == 'Enabled'
+      retries: "{{ acm_dr_failover_manager_rollback_wait_retries }}"
+      delay: "{{ acm_dr_failover_manager_rollback_wait_delay }}"
+      failed_when: false  # non-blocking: log the phase without masking the original Stage 03 failure
+      when:
+        - acm_dr_failover_manager_rollback_on_restore_failure | default(true) | bool
+        - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+    - name: "[FAILOVER DISPATCHER] | OP-11 ROLLBACK - Delete failed Restore CR from DR Hub"
+      kubernetes.core.k8s:
+        context: "{{ passive_hub }}"
+        state: absent
+        api_version: cluster.open-cluster-management.io/v1beta1
+        kind: Restore
+        name: "{{ acm_dr_failover_manager_restore_name }}"
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+      when:
+        - acm_dr_failover_manager_rollback_on_restore_failure | default(true) | bool
+        - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+    - name: "[FAILOVER DISPATCHER] | OP-11 ROLLBACK - Report rollback outcome"
+      ansible.builtin.debug:
+        msg:
+          - "======================================================================"
+          - " 🔄 OP-11 ROLLBACK SUMMARY"
+          - "======================================================================"
+          - ""
+          - " Source Hub    : {{ active_hub }}"
+          - " BackupSchedule: {{ acm_dr_failover_manager_schedule_name }}"
+          - " Schedule Phase: {{ (acm_dr_failover_manager_r_rollback_schedule.resources | default([{}]))[0].get('status', {}).get('phase', 'unknown (poll skipped or timed out)') }}"
+          - ""
+          - " DR Hub        : {{ passive_hub }}"
+          - " Restore CR    : {{ acm_dr_failover_manager_restore_name }} (deleted)"
+          - ""
+          - " The source Hub will resume generating backups within the next schedule cycle."
+          - " Review the D.6 diagnostic report above. Fix the root cause before retrying."
+          - "======================================================================"
+      when: acm_dr_failover_manager_rollback_on_restore_failure | default(true) | bool
+
+    - name: "[FAILOVER DISPATCHER] | OP-11 ROLLBACK - Fail pipeline with rollback context"
+      ansible.builtin.fail:
+        msg: >-
+          ❌ FAILED! Oh. No! => Stage 03 (Restore) failed on DR Hub '{{ passive_hub }}'.
+          {{ 'Automatic rollback completed. BackupSchedule re-enabled on ' + active_hub + '. '
+             + 'The source Hub resumes backups within the next schedule cycle. '
+             + 'Review the D.6 diagnostic above for Restore conditions, BSL status, and Velero pod state.'
+             if (acm_dr_failover_manager_rollback_on_restore_failure | default(true) | bool)
+             else 'Rollback is DISABLED. The source Hub BackupSchedule is still PAUSED on '
+             + active_hub + '. Re-enable it manually before retrying: '
+             + 'oc patch backupschedule/' + acm_dr_failover_manager_schedule_name
+             + ' -n ' + acm_dr_failover_manager_backup_ns
+             + ' --context ' + active_hub
+             + ' --type merge -p \'{"spec":{"paused":false}}\'' }}
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 04 - Sanitize Passive Hub and Reconnect Fleet (KCS 7039710) [file: 07_sanitize_passive_hub.yml]"
+  ansible.builtin.include_tasks: 07_sanitize_passive_hub.yml
+  when:
+    - acm_dr_failover_manager_spoke_list is defined
+    - acm_dr_failover_manager_spoke_list | length > 0
+  tags:
+    - sanitize
+    - stage04
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 05 - Validate Spoke Connectivity [file: 04_verify_spokes.yml]"
+  ansible.builtin.include_tasks: 04_verify_spokes.yml
+  when:
+    - acm_dr_failover_manager_spoke_list is defined
+    - acm_dr_failover_manager_spoke_list | length > 0
+  tags:
+    - verify_spokes
+    - stage05
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 05b - Repair Addon Hub-Kubeconfig CA Mismatch [file: 04b_repair_addon_certs.yml]"
+  # After OADP restore, addon agent hub-kubeconfig secrets on every spoke carry
+  # certs signed by the SOURCE hub's CSR signer CA. The DESTINATION hub rejects
+  # them with HTTP 401. Deleting and recreating each ManagedClusterAddon forces
+  # the addon framework to issue fresh CSRs signed by the destination hub's CA.
+  # Bypassed when acm_dr_failover_manager_skip_addon_cert_repair=true (external CA).
+  ansible.builtin.include_tasks: 04b_repair_addon_certs.yml
+  when:
+    - not (acm_dr_failover_manager_skip_addon_cert_repair | default(false) | bool)
+    - acm_dr_failover_manager_spoke_list is defined
+    - acm_dr_failover_manager_spoke_list | length > 0
+  tags:
+    - addon_cert_repair
+    - stage05b
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 07b - MSA Spoke Verifier (opt-in EE→Spoke network probe) [file: 05_msa_verify_spokes.yml]"
+  # Opt-in: reads MSA tokens from the passive Hub and probes each reachable Spoke API
+  # server directly from the EE. Detects NSG-level asymmetry that Stage 05 (Hub-side
+  # only) cannot see. Non-blocking per Spoke - diagnostic report, not a failover gate.
+  # Requires acm_dr_msa_provisioner to have run during Spoke onboarding.
+  ansible.builtin.include_tasks: 05_msa_verify_spokes.yml
+  when:
+    - acm_dr_failover_manager_enable_msa_verification | default(false) | bool
+    - acm_dr_failover_manager_spoke_list is defined
+    - acm_dr_failover_manager_spoke_list | length > 0
+  tags:
+    - msa_verify
+    - stage07b
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 06 - Protect New Leader Hub"
+  ansible.builtin.include_tasks: 05_create_schedule.yml
+  tags:
+    - create_schedule
+    - stage06
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 06a - Recycle Additional Passive Hubs"
+  ansible.builtin.include_tasks: 05a_recycle_passive_hubs.yml
+  when:
+    - >-
+      (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+       if acm_dr_failover_manager_additional_passive_hubs is string
+       else acm_dr_failover_manager_additional_passive_hubs)
+      | default([], true) | length > 0
+    - not (acm_dr_failover_manager_skip_passive_recycling | default(false) | bool)
+  tags:
+    - recycle_passive_hubs
+    - stage06a
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 07 - Isolate and Detach Old Hub [file: 06_detach_old_hub.yml]"
+  ansible.builtin.include_tasks: 06_detach_old_hub.yml
+  when:
+    - acm_dr_failover_manager_spoke_list is defined
+    - acm_dr_failover_manager_spoke_list | length > 0
+  tags:
+    - detach_old_hub
+    - stage07
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 07a - Convergence Wait"
+  ansible.builtin.include_tasks: 07a_convergence_wait.yml
+  when:
+    - acm_dr_failover_manager_spoke_list is defined
+    - acm_dr_failover_manager_spoke_list | length > 0
+  tags:
+    - convergence_wait
+    - stage07a
+
+- name: "[FAILOVER DISPATCHER] | Execute Stage 08 - Integrity and Compliance Audit"
+  ansible.builtin.include_tasks: 08_postflight_check.yml
+  when:
+    - acm_dr_failover_manager_spoke_list is defined
+    - acm_dr_failover_manager_spoke_list | length > 0
+  tags:
+    - postflight
+    - stage08
+...

@@ -1,0 +1,20 @@
+---
+# roles/acm_argocd_instance/tasks/07_applicationset.yml
+# =============================================================================
+# STAGE 07: APPLICATIONSET (GENERATOR PER acm_argocd_instance_setup_generator_type)
+# =============================================================================
+
+- name: "[APPLICATIONSET] | 7.1) Create ApplicationSet - 'list' generator - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: applicationset_list.yml.j2
+  when: acm_argocd_instance_setup_generator_type == 'list'
+
+- name: "[APPLICATIONSET] | 7.2) Create ApplicationSet - 'cluster_decision' generator - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: applicationset_cluster_decision.yml.j2
+  when: acm_argocd_instance_setup_generator_type == 'cluster_decision'
+...

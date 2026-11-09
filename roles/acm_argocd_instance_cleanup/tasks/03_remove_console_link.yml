@@ -1,0 +1,19 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/03_remove_console_link.yml
+# =============================================================================
+# STAGE 03: REMOVE CONSOLE LINK (CLUSTER-SCOPED RESOURCE)
+# =============================================================================
+# Note: the naming must match exactly what was created by
+# acm_argocd_instance (templates/console_link.yml.j2) - same name (instance
+# + context) to be found deterministically.
+
+- name: "[REMOVE CONSOLE LINK] | 3.1) Remove ConsoleLink - {{ acm_argocd_instance_cleanup_name }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: console.openshift.io/v1
+    kind: ConsoleLink
+    name: "argocd-{{ acm_argocd_instance_cleanup_name }}-{{ k8s_target_context }}"
+  check_mode: "{{ acm_argocd_instance_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+...

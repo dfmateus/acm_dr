@@ -1,0 +1,98 @@
+---
+# playbooks/cleanup-argocd-instance.yml
+# =============================================================================
+# GENERIC ARGOCD INSTANCE REMOVAL (roles/acm_argocd_instance_cleanup)
+# =============================================================================
+# Inverse operation of playbooks/manage-argocd-instance.yml. Removes AS MANY
+# instances as the client defines in the 'acm_argocd_instances_cleanup' list, without
+# affecting the shared OpenShift GitOps Operator or other instances.
+#
+# Example:
+#   ansible-playbook playbooks/cleanup-argocd-instance.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e acm_argocd_instance_cleanup_confirm=true \
+#     -e '{"acm_argocd_instances_cleanup": [{"name": "minha-instancia", "namespace": "meu-ns",
+#          "managed_namespaces": [{"name": "app-a"}, {"name": "app-b"}]}]}'
+#
+# Tip: run first with '-e acm_argocd_instance_cleanup_dry_run=true' to see
+# exactly what would be removed, without applying any actual changes.
+#
+# Variables (required):
+#   k8s_target_context                    - Hub SA context. Injected via ACM DR Target Cluster credential.
+#   acm_argocd_instances_cleanup          - list of instances to remove. Each item needs 'name'
+#                                           and 'namespace'; 'managed_namespaces' is optional.
+#   acm_argocd_instance_cleanup_confirm   - MUST be 'true'. The playbook refuses to run without it.
+#
+# Variables (optional):
+#   acm_argocd_instance_cleanup_dry_run   - true runs in check_mode/diff (default: false)
+#   acm_argocd_instance_cleanup_remove_managed_namespaces - false preserves workload namespaces
+#                                           while removing GitOps infrastructure (default: true)
+#
+# Dependencies:
+#   collections: kubernetes.core
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+#                acm_argocd_instance_cleanup (5-stage removal per instance)
+#
+# Expected outcome:
+#   Exit 0 - All instances removed cleanly: ApplicationSet pruned by the running controller,
+#             namespace terminated, RBAC and ConsoleLink deleted.
+#   Exit 1 - A removal stage fails (missing instance, finalizer stuck, API error).
+#             If a namespace gets stuck in Terminating, see docs/runbook/break-glass.md.
+# =============================================================================
+
+- name: "[ARGOCD INSTANCE CLEANUP] | Generic ArgoCD instance removal"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Uses the runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster
+      # credentials from AAP or scripts/lib/load_cluster_env.sh), falling back to the legacy
+      # monolithic K8S_AUTH_KUBECONFIG / KUBECONFIG env var when no per-cluster vars exist.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]  # propagate to tasks inside the role so they also run
+      tags: [always]  # ensures the include itself runs regardless of --tags filtering
+
+    # Derive k8s_target_context from per-cluster credentials when not passed
+    # as extra var. ACM_DR_TARGET_CONTEXT is injected by the "ACM DR Target
+    # Cluster" credential type or exported via load_cluster_env.sh.
+    - name: "[PRE-FLIGHT] | Derive target context from per-cluster credentials"
+      ansible.builtin.set_fact:
+        k8s_target_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') }}"  # noqa var-naming[no-role-prefix]
+      when:
+        - k8s_target_context is not defined
+        - lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') | length > 0
+
+    - name: "ARGOCD INSTANCE CLEANUP PLAYBOOK | Validate required parameters"
+      ansible.builtin.assert:
+        that:
+          - k8s_target_context is defined and k8s_target_context | length > 0
+          - acm_argocd_instances_cleanup is defined and acm_argocd_instances_cleanup | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => provide '-e k8s_target_context=...' and a list
+          'acm_argocd_instances_cleanup' with at least one item.
+        success_msg: "✅ PASSED! Oh. Yes! => {{ acm_argocd_instances_cleanup | length }} ArgoCD instance(s) to remove."
+
+  tasks:
+    - name: "[ARGOCD INSTANCE CLEANUP] | Remove each instance defined in the list"
+      ansible.builtin.include_role:
+        name: acm_argocd_instance_cleanup
+      loop: "{{ acm_argocd_instances_cleanup }}"
+      loop_control:
+        loop_var: acm_argocd_instance_cleanup_item
+        label: "{{ acm_argocd_instance_cleanup_item.name | default('unnamed') }}"
+      vars:
+        acm_argocd_instance_cleanup_name: "{{ acm_argocd_instance_cleanup_item.name }}"
+        acm_argocd_instance_cleanup_namespace: "{{ acm_argocd_instance_cleanup_item.namespace }}"
+        acm_argocd_instance_cleanup_managed_namespaces: "{{ acm_argocd_instance_cleanup_item.managed_namespaces | default([]) }}"
+        acm_argocd_instance_cleanup_remove_managed_namespaces: "{{ acm_argocd_instance_cleanup_item.remove_managed_namespaces | default(true) }}"
+...

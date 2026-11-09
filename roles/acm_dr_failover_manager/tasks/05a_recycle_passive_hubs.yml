@@ -1,0 +1,206 @@
+---
+# =============================================================================
+# STAGE 06a: RECYCLE PASSIVE SYNC RESTORES ON ADDITIONAL PASSIVE HUBS
+# =============================================================================
+# After a failover from Hub-A (old leader) to Hub-B (new leader), any additional
+# passive hubs (Hub-C, Hub-D, ...) still have their passive sync Restore CRs
+# pointing at Hub-A's backups (filtered by Hub-A's clusterID). This stage
+# deletes those stale Restore CRs and recreates them so they pick up backups
+# from the new leader (Hub-B).
+#
+# Safety: connectivity failures to additional passive hubs are non-blocking
+# warnings (the primary failover is already complete at this point). The Restore
+# CR uses "latest" which is safe because the old leader's BackupSchedule has
+# been paused (Stage 02) and the new leader's BackupSchedule is already active
+# (Stage 06), so "latest" resolves to the new leader's backups.
+
+# =============================================================================
+# STEP 5a.1: VALIDATE CONNECTIVITY TO ADDITIONAL PASSIVE HUBS
+# =============================================================================
+
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.1.1) Validate connectivity to additional passive hubs"
+  kubernetes.core.k8s_info:
+    context: "{{ item }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_passive_hub_connectivity
+  loop: >-
+    {{ (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+        if acm_dr_failover_manager_additional_passive_hubs is string
+        else acm_dr_failover_manager_additional_passive_hubs)
+       | default([], true) }}
+  loop_control:
+    label: "{{ item }}"
+  # Non-blocking: the primary failover is already complete
+  failed_when: false
+
+# Filter out unreachable hubs (failed k8s_info) and warn about them
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.1.2) ⚠️ Warn about unreachable passive hubs"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [PASSIVE HUB UNREACHABLE]: Cannot reach context '{{ item.item }}'.
+      The passive sync Restore on this hub will NOT be recycled. After resolving
+      connectivity, re-run acm_dr_hub_setup on this hub to restore sync.
+  loop: "{{ acm_dr_failover_manager_passive_hub_connectivity.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - item.resources is not defined or item.resources | length == 0
+
+# Build the list of reachable passive hubs for subsequent steps
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.1.3) Build list of reachable passive hubs"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_reachable_passive_hubs: >-
+      {{
+        acm_dr_failover_manager_passive_hub_connectivity.results | default([])
+        | selectattr('resources', 'defined')
+        | selectattr('resources', 'ne', [])
+        | map(attribute='item')
+        | list
+      }}
+
+# =============================================================================
+# STEP 5a.2: DISCOVER AND DELETE EXISTING PASSIVE SYNC RESTORE CRs
+# =============================================================================
+
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.2.1) Discover existing Restore CRs on passive hub - {{ item }}"
+  kubernetes.core.k8s_info:
+    context: "{{ item }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_passive_restore_discovery
+  loop: "{{ acm_dr_failover_manager_reachable_passive_hubs | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: acm_dr_failover_manager_reachable_passive_hubs | default([]) | length > 0
+  failed_when: false
+
+# Delete only Restore CRs that have syncRestoreWithNewBackups: true (passive sync).
+# This is more precise than deleting all Restore CRs, which could include an
+# activation Restore from a previous partial failover.
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.2.2) Delete passive sync Restore CRs on additional passive hubs"
+  kubernetes.core.k8s:
+    context: "{{ item.0.item }}"
+    state: absent
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ item.1.metadata.name }}"
+  loop: >-
+    {{
+      acm_dr_failover_manager_passive_restore_discovery.results | default([])
+      | subelements('resources', skip_missing=True)
+    }}
+  loop_control:
+    label: "{{ item.0.item | default('unknown') }} / {{ item.1.metadata.name | default('unknown') }}"
+  # Only delete Restore CRs with syncRestoreWithNewBackups: true (passive sync)
+  when: item.1.spec.syncRestoreWithNewBackups | default(false) | bool
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+# =============================================================================
+# STEP 5a.3: WAIT FOR API SETTLE AFTER RESTORE CR DELETION
+# =============================================================================
+
+# 5a.3.1 (fixed pause) removed: task 5a.3.3 already polls until the Restore CR is gone.
+# A fixed pause before a poll that covers the same condition only adds latency.
+
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.3.2) 🔎 [DRY-RUN] Would wait for API settle"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 [DRY-RUN]: Would wait {{ acm_dr_failover_manager_gc_wait_time }} seconds
+      for the Kubernetes API Garbage Collector to finalize Restore CR deletion on
+      {{ acm_dr_failover_manager_reachable_passive_hubs | length }} passive hub(s).
+  when:
+    - acm_dr_failover_manager_reachable_passive_hubs | default([]) | length > 0
+    - acm_dr_failover_manager_dry_run | default(false) | bool
+
+# Poll each passive hub until the Restore CR is fully gone (finalizers cleared).
+# The cluster-backup-chart finalizer can hold the resource in Terminating state
+# for well over a minute while it waits for underlying velero Restores to finish.
+# A fixed pause is not long enough; recreating while the CR is still terminating
+# silently no-ops and leaves the hub without a Restore CR.
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.3.3) ⏳ Poll until Restore CR is fully deleted on each passive hub"
+  kubernetes.core.k8s_info:
+    context: "{{ item }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    name: "{{ acm_dr_failover_manager_passive_restore_name }}"
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_r_passive_restore_gone
+  until: >-
+    acm_dr_failover_manager_r_passive_restore_gone.resources | default([]) | length == 0
+  retries: "{{ acm_dr_failover_manager_restore_gc_wait_retries }}"
+  delay: "{{ acm_dr_failover_manager_restore_gc_wait_delay }}"
+  loop: "{{ acm_dr_failover_manager_reachable_passive_hubs | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - acm_dr_failover_manager_reachable_passive_hubs | default([]) | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  # Non-blocking: if the poll times out, 5a.4.1 will still attempt the create.
+  # A failed create is visible in job output; this avoid a silent race condition.
+  failed_when: false
+
+# =============================================================================
+# STEP 5a.4: RECREATE PASSIVE SYNC RESTORE CR ON EACH REACHABLE PASSIVE HUB
+# =============================================================================
+# The recreated CR uses "latest" (not explicit clusterID) because:
+# - The old leader's BackupSchedule has been paused (Stage 02)
+# - The new leader's BackupSchedule has been created (Stage 06)
+# - New backups from the new leader will be the only "latest" ones appearing
+#   in shared storage
+# - The passive sync Restore's syncRestoreWithNewBackups: true will
+#   automatically pick up the new leader's backups at the next sync interval
+
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.4.1) Recreate passive sync Restore CR on passive hub - {{ item }}"
+  kubernetes.core.k8s:
+    context: "{{ item }}"
+    state: present
+    definition:
+      apiVersion: cluster.open-cluster-management.io/v1beta1
+      kind: Restore
+      metadata:
+        name: "{{ acm_dr_failover_manager_passive_restore_name }}"
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+      spec:
+        # Enable continuous pull from shared storage
+        syncRestoreWithNewBackups: true
+        # How often to check for new backups from the new leader
+        restoreSyncInterval: "{{ acm_dr_failover_manager_passive_restore_sync_interval }}"
+        # CleanupRestored: removes only previously restored resources before applying new backup
+        cleanupBeforeRestore: "{{ acm_dr_failover_manager_cleanup_before_restore }}"
+        # Restore credentials from the latest available backup (new leader's)
+        veleroCredentialsBackupName: latest
+        # Restore resources from the latest available backup (new leader's)
+        veleroResourcesBackupName: latest
+        # CRITICAL: must be 'skip' on passive hubs to prevent premature cluster activation
+        veleroManagedClustersBackupName: skip
+  loop: "{{ acm_dr_failover_manager_reachable_passive_hubs | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: acm_dr_failover_manager_reachable_passive_hubs | default([]) | length > 0
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+# =============================================================================
+# STEP 5a.5: RECYCLING SUMMARY
+# =============================================================================
+
+- name: "[STAGE 06a - Recycle Passive Hubs] | 5a.5.1) Display passive hub recycling summary"
+  ansible.builtin.debug:
+    msg:
+      - "{{ acm_dr_failover_manager_separator_char | default('=') * 75 }}"
+      - " 🔄 PASSIVE HUB RECYCLING SUMMARY"
+      - "{{ '-' * 75 }}"
+      - " 📋 TOTAL ADDITIONAL PASSIVE HUBS:  {{ acm_dr_failover_manager_additional_passive_hubs | length }}"
+      - " ✅ REACHABLE AND RECYCLED:          {{ acm_dr_failover_manager_reachable_passive_hubs | default([]) | length }}"
+      - " ⚠️  UNREACHABLE (SKIPPED):           {{ acm_dr_failover_manager_additional_passive_hubs | length - (acm_dr_failover_manager_reachable_passive_hubs | default([]) | length) }}"
+      - " ✅ NEW HUB:                         {{ passive_hub }}"
+      - " 🔄 RESTORE CR NAME:                {{ acm_dr_failover_manager_passive_restore_name }}"
+      - " ⏱️  SYNC INTERVAL:                  {{ acm_dr_failover_manager_passive_restore_sync_interval }}"
+      - "{{ (acm_dr_failover_manager_dry_run | default(false) | bool) | ternary('🔎 MODE: DRY-RUN (no actual changes applied)', '🚀 MODE: PRODUCTION (Restore CRs recycled)') }}"
+      - "{{ acm_dr_failover_manager_separator_char | default('=') * 75 }}"
+...

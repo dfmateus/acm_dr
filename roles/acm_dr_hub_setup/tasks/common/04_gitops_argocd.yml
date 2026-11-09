@@ -1,0 +1,662 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 04 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 04 - GitOps] | Display Red Hat OpenShift GitOps Multi-Tenant configuration metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "🐙 STAGE 04 - Multi-Instance OpenShift GitOps & RHACM Integration"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT:        {{ k8s_target_context }}"
+      - "📂 OPERATOR NAMESPACE:    {{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}"
+      - "📂 GITOPS ACM NAMESPACE:  {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}"
+      - "📂 GITOPS DEMO NAMESPACE: {{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}"
+      - "🔗 GITHUB REPOSITORY:     {{ acm_dr_hub_setup_github_repo_url }}"
+  run_once: true
+
+# =============================================================================
+# STEP 4.1: NAMESPACES, SANITIZATION, AND OPENSHIFT GITOPS OPERATOR INSTALLATION
+# =============================================================================
+
+- name: "[STAGE 04 - GitOps] | 4.1.1) Create Multi-Tenant environment Namespaces (gitops_namespaces.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_namespaces.yml.j2
+
+- name: "[STAGE 04 - GitOps] | 4.1.2a) Query existing OperatorGroups in the Namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    namespace: "{{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}"
+  register: acm_dr_hub_setup_existing_og_info
+
+- name: "[STAGE 04 - GitOps] | 4.1.2b) Remove conflicting/orphaned OperatorGroups from the Namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+  loop: "{{ acm_dr_hub_setup_existing_og_info.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name | default('unnamed_resource') }}"
+  when:
+    - item.metadata.name is defined
+    - item.metadata.name != 'openshift-gitops-operator-group'
+
+- name: "[STAGE 04 - GitOps] | 4.1.3) Query Operator PackageManifest from the OpenShift catalog - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: packages.operators.coreos.com/v1
+    kind: PackageManifest
+    name: openshift-gitops-operator
+    namespace: openshift-marketplace
+  register: acm_dr_hub_setup_gitops_packagemanifest
+  when: acm_dr_hub_setup_gitops_channel | default('auto') == 'auto'
+
+- name: "[STAGE 04 - GitOps] | 4.1.4) Resolve dynamic Operator channel (defaultChannel / latest) - {{ k8s_target_context }}"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_gitops_resolved_channel: >-
+      {{
+        acm_dr_hub_setup_gitops_channel
+        if (acm_dr_hub_setup_gitops_channel is defined and acm_dr_hub_setup_gitops_channel != 'auto')
+        else (
+          acm_dr_hub_setup_gitops_packagemanifest.resources[0].status.defaultChannel
+          if (
+            acm_dr_hub_setup_gitops_packagemanifest.resources is defined and
+            acm_dr_hub_setup_gitops_packagemanifest.resources | length > 0 and
+            acm_dr_hub_setup_gitops_packagemanifest.resources[0].status.defaultChannel is defined
+          )
+          else 'latest'
+        )
+      }}
+
+- name: "[STAGE 04 - GitOps] | 4.1.5) Display the selected installation channel - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "The selected channel for Red Hat OpenShift GitOps is: {{ acm_dr_hub_setup_gitops_resolved_channel }}"
+
+- name: "[STAGE 04 - GitOps] | 4.1.6) Install the Red Hat OpenShift GitOps Operator (gitops_operator.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_operator.yml.j2
+
+- name: "[STAGE 04 - GitOps] | 4.1.6a) ⏳ WAIT - Discover pending InstallPlan (Manual mode) - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: InstallPlan
+    namespace: "{{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}"
+  register: acm_dr_hub_setup_install_plans
+  until:
+    - (acm_dr_hub_setup_install_plans.resources | default([])) | length > 0
+    - (acm_dr_hub_setup_install_plans.resources | default([]) | selectattr('spec.approved', 'equalto', false) | list | length > 0)
+  retries: 30
+  delay: 10
+  when: acm_dr_hub_setup_gitops_approval | default('Automatic') == 'Manual'
+  ignore_errors: true
+
+- name: "[STAGE 04 - GitOps] | 4.1.6b) Approve pending GitOps Operator InstallPlan - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: patched
+    api_version: operators.coreos.com/v1alpha1
+    kind: InstallPlan
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace }}"
+    definition:
+      spec:
+        approved: true
+  loop: "{{ acm_dr_hub_setup_install_plans.resources | default([]) | selectattr('spec.approved', 'equalto', false) | list }}"
+  when:
+    - acm_dr_hub_setup_gitops_approval | default('Automatic') == 'Manual'
+    - acm_dr_hub_setup_install_plans.resources is defined
+
+- name: "[STAGE 04 - GitOps] | 4.1.7) ⏳ WAIT - Validate AtLatestKnown state on Subscription - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    namespace: "{{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}"
+    name: openshift-gitops-operator
+  register: acm_dr_hub_setup_gitops_sub_info
+  until:
+    - (acm_dr_hub_setup_gitops_sub_info.resources | default([])) | length > 0
+    - acm_dr_hub_setup_gitops_sub_info.resources[0].status.state | default('') == 'AtLatestKnown'
+    - acm_dr_hub_setup_gitops_sub_info.resources[0].status.installedCSV | default('') | length > 0
+  retries: 40
+  delay: 10
+  ignore_errors: true
+
+- name: "[STAGE 04 - GitOps] | 4.1.8) ⏳ WAIT - Validate ClusterServiceVersion (CSV) Succeeded status - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}"
+    name: "{{ acm_dr_hub_setup_gitops_sub_info.resources[0].status.installedCSV }}"
+  register: acm_dr_hub_setup_gitops_csv_info
+  until:
+    - (acm_dr_hub_setup_gitops_csv_info.resources | default([])) | length > 0
+    - acm_dr_hub_setup_gitops_csv_info.resources[0].status.phase | default('') == 'Succeeded'
+  retries: 40
+  delay: 10
+  # Cascade-skip: 4.1.8 needs installedCSV from the Subscription register.
+  when: acm_dr_hub_setup_gitops_sub_info is not failed
+  ignore_errors: true
+
+- name: "[STAGE 04 - GitOps] | 4.1.9) 🔍 ASSERT - Ensure full GitOps Operator stability before proceeding - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_gitops_sub_info.resources[0].status.state == 'AtLatestKnown'
+      - acm_dr_hub_setup_gitops_csv_info.resources[0].status.phase == 'Succeeded'
+    fail_msg: "❌ FAILED! Oh. No! => Red Hat OpenShift GitOps Operator did not reach AtLatestKnown and Succeeded states in OLM."
+    success_msg: "✅ PASSED! Oh. Yes! => GitOps Operator Subscription and CSV are 100% installed and validated."
+  # Cascade-skip: assert accesses Subscription and CSV registers directly.
+  when:
+    - acm_dr_hub_setup_gitops_sub_info is not failed
+    - acm_dr_hub_setup_gitops_csv_info is defined
+    - acm_dr_hub_setup_gitops_csv_info is not failed
+
+- name: "[STAGE 04 - GitOps] | 4.1.10) ⏳ WAIT - Validate GitOps Operator Controller Manager readiness - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    namespace: "{{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}"
+    name: openshift-gitops-operator-controller-manager
+  register: acm_dr_hub_setup_gitops_op_deploy
+  until:
+    - (acm_dr_hub_setup_gitops_op_deploy.resources | default([])) | length > 0
+    - acm_dr_hub_setup_gitops_op_deploy.resources[0].status.readyReplicas | default(0) | int > 0
+  retries: 40
+  delay: 10
+  # Cascade-skip: controller manager only exists after CSV succeeds.
+  when:
+    - acm_dr_hub_setup_gitops_csv_info is defined
+    - acm_dr_hub_setup_gitops_csv_info is not failed
+  ignore_errors: true
+
+# =============================================================================
+# GITOPS OPERATOR OLM GROUPED DIAGNOSTIC SECTION
+# =============================================================================
+# Runs if any of the 4 OLM polls failed (4.1.6a through 4.1.10).
+# Identifies which checkpoint failed first and gathers OLM evidence.
+
+# D.1) Identify which OLM checkpoint failed first.
+- name: "[STAGE 04 - GitOps OLM DIAGNOSTIC] | D.1) Identify failed OLM checkpoint"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_gitops_olm_failed_step: >-
+      {% if acm_dr_hub_setup_install_plans is defined
+      and acm_dr_hub_setup_install_plans is failed
+      %}InstallPlan discovery (4.1.6a){% elif acm_dr_hub_setup_gitops_sub_info is failed
+      %}Subscription AtLatestKnown (4.1.7){% elif acm_dr_hub_setup_gitops_csv_info is defined
+      and acm_dr_hub_setup_gitops_csv_info is failed
+      %}CSV Succeeded (4.1.8){% elif acm_dr_hub_setup_gitops_op_deploy is defined
+      and acm_dr_hub_setup_gitops_op_deploy is failed
+      %}Controller Manager readiness (4.1.10){% else %}unknown{% endif %}
+  when: >-
+    (acm_dr_hub_setup_install_plans is defined and acm_dr_hub_setup_install_plans is failed) or
+    acm_dr_hub_setup_gitops_sub_info is failed or
+    (acm_dr_hub_setup_gitops_csv_info is defined and acm_dr_hub_setup_gitops_csv_info is failed) or
+    (acm_dr_hub_setup_gitops_op_deploy is defined and acm_dr_hub_setup_gitops_op_deploy is failed)
+
+# D.2) Read Subscription and operator pod status for diagnostic context.
+- name: "[STAGE 04 - GitOps OLM DIAGNOSTIC] | D.2) Read GitOps operator pod status"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}"
+    label_selectors:
+      - "control-plane=gitops-operator"
+  register: acm_dr_hub_setup_diag_gitops_olm_pods
+  failed_when: false
+  when: >-
+    (acm_dr_hub_setup_install_plans is defined and acm_dr_hub_setup_install_plans is failed) or
+    acm_dr_hub_setup_gitops_sub_info is failed or
+    (acm_dr_hub_setup_gitops_csv_info is defined and acm_dr_hub_setup_gitops_csv_info is failed) or
+    (acm_dr_hub_setup_gitops_op_deploy is defined and acm_dr_hub_setup_gitops_op_deploy is failed)
+
+# D.3) Build diagnostic summary and troubleshooting hints.
+- name: "[STAGE 04 - GitOps OLM DIAGNOSTIC] | D.3) Build OLM diagnostic"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_gitops_olm_summary: >-
+      Subscription:
+      {% set sub = acm_dr_hub_setup_gitops_sub_info.resources | default([]) %}
+      {% if sub | length > 0 %}state={{ sub[0].status.state | default('Unknown') }},
+      installedCSV={{ sub[0].status.installedCSV | default('(none)')
+      }}{% else %}not found{% endif %}.
+      CSV:
+      {% if acm_dr_hub_setup_gitops_csv_info is defined %}
+      {% set csv = acm_dr_hub_setup_gitops_csv_info.resources | default([]) %}
+      {% if csv | length > 0 %}phase={{ csv[0].status.phase | default('Unknown')
+      }}{% else %}not found{% endif %}{% else %}(skipped){% endif %}.
+      {% set pods = acm_dr_hub_setup_diag_gitops_olm_pods.resources | default([]) %}
+      Operator pods:
+      {% if pods | length == 0 %}none found.{% else %}{% for pod in pods
+      %}{{ pod.metadata.name }}={{ pod.status.phase | default('Unknown')
+      }}{%- for cs in pod.status.containerStatuses | default([])
+      %}{%- if cs.state.waiting is defined %} ({{ cs.name
+      }}: {{ cs.state.waiting.reason | default('Waiting') }}){% endif
+      %}{%- endfor %}; {% endfor %}{% endif %}
+    acm_dr_hub_setup_diag_gitops_olm_hints: >-
+      {% set step = acm_dr_hub_setup_diag_gitops_olm_failed_step | default('') | trim %}
+      {% set hints = [] %}
+      {% if 'InstallPlan' in step %}
+      {%   set _ = hints.append(
+             'NO INSTALLPLAN: Manual approval mode is active but no pending InstallPlan '
+             ~ 'appeared within 5 minutes. Check the CatalogSource health: '
+             ~ 'oc get catalogsource -n openshift-marketplace --context '
+             ~ k8s_target_context ~ '.') %}
+      {% elif 'Subscription' in step %}
+      {%   set _ = hints.append(
+             'SUBSCRIPTION NOT READY: The GitOps Subscription did not reach AtLatestKnown. '
+             ~ 'Common causes: (1) CatalogSource is offline, (2) channel name is wrong, '
+             ~ '(3) the operator package was removed from the catalog. Check: '
+             ~ 'oc get sub -n ' ~ (acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator'))
+             ~ ' -o yaml --context ' ~ k8s_target_context ~ '.') %}
+      {% elif 'CSV' in step %}
+      {%   set _ = hints.append(
+             'CSV NOT SUCCEEDED: The ClusterServiceVersion did not reach Succeeded phase. '
+             ~ 'This usually means the operator pod failed to start. Check CSV conditions: '
+             ~ 'oc get csv -n ' ~ (acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator'))
+             ~ ' -o yaml --context ' ~ k8s_target_context ~ '.') %}
+      {% elif 'Controller Manager' in step %}
+      {%   set _ = hints.append(
+             'CONTROLLER NOT READY: CSV succeeded but the controller-manager Deployment '
+             ~ 'has no ready replicas. Check operator pod logs: oc logs -n '
+             ~ (acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator'))
+             ~ ' -l control-plane=gitops-operator --context ' ~ k8s_target_context ~ '.') %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append(
+             'No specific pattern matched. Check the Subscription and CSV status manually.') %}
+      {% endif %}
+      {{ hints }}
+  when: >-
+    (acm_dr_hub_setup_install_plans is defined and acm_dr_hub_setup_install_plans is failed) or
+    acm_dr_hub_setup_gitops_sub_info is failed or
+    (acm_dr_hub_setup_gitops_csv_info is defined and acm_dr_hub_setup_gitops_csv_info is failed) or
+    (acm_dr_hub_setup_gitops_op_deploy is defined and acm_dr_hub_setup_gitops_op_deploy is failed)
+
+# D.4) Print the structured diagnostic report.
+- name: "[STAGE 04 - GitOps OLM DIAGNOSTIC] | D.4) ❌ GITOPS OLM FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ GITOPS OPERATOR OLM INSTALL FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "FAILED CHECKPOINT:"
+      - "  {{ acm_dr_hub_setup_diag_gitops_olm_failed_step | default('unknown') | trim }}"
+      - ""
+      - "TARGET CLUSTER:"
+      - "  {{ k8s_target_context }}"
+      - ""
+      - "STATUS:"
+      - "{{ acm_dr_hub_setup_diag_gitops_olm_summary | default('  (could not gather status)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_hub_setup_diag_gitops_olm_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: >-
+    (acm_dr_hub_setup_install_plans is defined and acm_dr_hub_setup_install_plans is failed) or
+    acm_dr_hub_setup_gitops_sub_info is failed or
+    (acm_dr_hub_setup_gitops_csv_info is defined and acm_dr_hub_setup_gitops_csv_info is failed) or
+    (acm_dr_hub_setup_gitops_op_deploy is defined and acm_dr_hub_setup_gitops_op_deploy is failed)
+
+# D.5) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 04 - GitOps OLM DIAGNOSTIC] | D.5) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => GitOps Operator OLM install failed at checkpoint
+      '{{ acm_dr_hub_setup_diag_gitops_olm_failed_step | default('unknown') | trim }}'
+      on context '{{ k8s_target_context }}'.
+      See the diagnostic report above for Subscription/CSV status, operator pod status,
+      and troubleshooting hints.
+  when: >-
+    (acm_dr_hub_setup_install_plans is defined and acm_dr_hub_setup_install_plans is failed) or
+    acm_dr_hub_setup_gitops_sub_info is failed or
+    (acm_dr_hub_setup_gitops_csv_info is defined and acm_dr_hub_setup_gitops_csv_info is failed) or
+    (acm_dr_hub_setup_gitops_op_deploy is defined and acm_dr_hub_setup_gitops_op_deploy is failed)
+
+# =============================================================================
+# STEP 4.2: GOVERNANCE INSTANCE PROVISIONING (RHACM POLICIES)
+# =============================================================================
+
+- name: "[STAGE 04 - GitOps] | 4.2.1) Create Git Credentials Secret (gitops_repo_secret.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_repo_secret.yml.j2
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 04 - GitOps] | 4.2.2) Create ArgoCD for RHACM Governance (gitops_argocd_cr.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_argocd_cr.yml.j2
+  register: acm_dr_hub_setup_argocd_acm_cr_result
+
+- name: "[STAGE 04 - GitOps] | 4.2.3) ⏳ WAIT - Validate Governance ArgoCD Server readiness - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    namespace: "{{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}"
+    name: openshift-gitops-acm-server
+  register: acm_dr_hub_setup_argocd_acm_srv
+  until:
+    - (acm_dr_hub_setup_argocd_acm_srv.resources | default([])) | length > 0
+    - acm_dr_hub_setup_argocd_acm_srv.resources[0].status.readyReplicas | default(0) | int > 0
+  retries: 40
+  delay: 10
+  ignore_errors: true
+
+- name: "[STAGE 04 - GitOps] | 4.2.4) 🔍 ASSERT - Validate ArgoCD ACM Governance instance availability - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_argocd_acm_srv.resources[0].status.readyReplicas > 0
+    fail_msg: "❌ FAILED! Oh. No! => ArgoCD instance openshift-gitops-acm-server is not ready."
+    success_msg: "✅ PASSED! Oh. Yes! => ArgoCD ACM Governance active and ready to receive RHACM policies."
+  when: acm_dr_hub_setup_argocd_acm_srv is not failed
+
+- name: "[STAGE 04 - GitOps] | 4.2.5) Apply RBAC rules for Governance and AppDemo (gitops_rbac.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_rbac.yml.j2
+
+- name: "[STAGE 04 - GitOps] | 4.2.6) Apply RHACM integration: Placement and GitOpsCluster (gitops_rhacm_integration.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_rhacm_integration.yml.j2
+
+- name: "[STAGE 04 - GitOps] | 4.2.7) Create RHACM Policies ApplicationSet (gitops_appset_policies.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_appset_policies.yml.j2
+
+# =============================================================================
+# STEP 4.3: APPLICATION INSTANCE PROVISIONING (APPDEMO)
+# =============================================================================
+
+# Note (Real Finding): the Git credentials Secret (4.2.1) was only created in the
+# Governance ArgoCD instance namespace (openshift-gitops-acm). The AppDemo ArgoCD instance
+# (openshift-gitops-appdemo) is a separate operator operand with repository scope
+# isolated per namespace - without this Secret here, the AppDemo ArgoCD never authenticates
+# to the Git repository and the appdemo/appdemo2 Applications remain with sync Unknown
+# ("authentication required: Repository not found").
+- name: "[STAGE 04 - GitOps] | 4.3.0) Create Git Credentials Secret for ArgoCD AppDemo (gitops_repo_secret.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_repo_secret.yml.j2
+  vars:
+    acm_dr_hub_setup_gitops_repo_secret_namespace: "{{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 04 - GitOps] | 4.3.1) Create ArgoCD for Demo Applications (gitops_appdemo_argocd_cr.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_appdemo_argocd_cr.yml.j2
+  register: acm_dr_hub_setup_argocd_demo_cr_result
+
+- name: "[STAGE 04 - GitOps] | 4.3.2) ⏳ WAIT - Validate Applications ArgoCD Server readiness - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    namespace: "{{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}"
+    name: openshift-gitops-appdemo-server
+  register: acm_dr_hub_setup_argocd_demo_srv
+  until:
+    - (acm_dr_hub_setup_argocd_demo_srv.resources | default([])) | length > 0
+    - acm_dr_hub_setup_argocd_demo_srv.resources[0].status.readyReplicas | default(0) | int > 0
+  retries: 40
+  delay: 10
+  ignore_errors: true
+
+- name: "[STAGE 04 - GitOps] | 4.3.3) 🔍 ASSERT - Validate ArgoCD AppDemo instance availability - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_argocd_demo_srv.resources[0].status.readyReplicas > 0
+    fail_msg: "❌ FAILED! Oh. No! => ArgoCD instance openshift-gitops-appdemo-server is not ready."
+    success_msg: "✅ PASSED! Oh. Yes! => ArgoCD AppDemo active and ready to orchestrate workloads."
+  when: acm_dr_hub_setup_argocd_demo_srv is not failed
+
+# =============================================================================
+# ARGOCD INSTANCE GROUPED DIAGNOSTIC SECTION
+# =============================================================================
+# Runs if either ArgoCD instance poll (4.2.3 or 4.3.2) failed. Reads the
+# ArgoCD CR status and instance pod status to explain what is blocking.
+
+# D.1) Identify which ArgoCD instance failed to start.
+- name: "[STAGE 04 - GitOps ArgoCD DIAGNOSTIC] | D.1) Identify failed ArgoCD instance"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_argocd_failed_instances: >-
+      {% set failed = [] %}
+      {% if acm_dr_hub_setup_argocd_acm_srv is failed %}
+      {%   set _ = failed.append('openshift-gitops-acm-server in '
+             ~ (acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm'))) %}
+      {% endif %}
+      {% if acm_dr_hub_setup_argocd_demo_srv is failed %}
+      {%   set _ = failed.append('openshift-gitops-appdemo-server in '
+             ~ (acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo'))) %}
+      {% endif %}
+      {{ failed }}
+  when: acm_dr_hub_setup_argocd_acm_srv is failed or acm_dr_hub_setup_argocd_demo_srv is failed
+
+# D.2) Read ArgoCD CR status from the failed namespaces.
+- name: "[STAGE 04 - GitOps ArgoCD DIAGNOSTIC] | D.2) Read ArgoCD CR status (ACM)"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: argoproj.io/v1beta1
+    kind: ArgoCD
+    namespace: "{{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}"
+  register: acm_dr_hub_setup_diag_argocd_acm_cr
+  failed_when: false
+  when: acm_dr_hub_setup_argocd_acm_srv is failed
+
+- name: "[STAGE 04 - GitOps ArgoCD DIAGNOSTIC] | D.2b) Read ArgoCD CR status (AppDemo)"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: argoproj.io/v1beta1
+    kind: ArgoCD
+    namespace: "{{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}"
+  register: acm_dr_hub_setup_diag_argocd_demo_cr
+  failed_when: false
+  when: acm_dr_hub_setup_argocd_demo_srv is failed
+
+# D.3) Build diagnostic summary and hints.
+- name: "[STAGE 04 - GitOps ArgoCD DIAGNOSTIC] | D.3) Build ArgoCD diagnostic"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_argocd_summary: >-
+      {% if acm_dr_hub_setup_argocd_acm_srv is failed %}
+      ACM instance:
+      {% set acm_cr = acm_dr_hub_setup_diag_argocd_acm_cr.resources | default([]) %}
+      {% if acm_cr | length > 0 %}phase={{ acm_cr[0].status.phase | default('Unknown')
+      }}{% else %}ArgoCD CR not found{% endif %}.
+      {% endif %}
+      {% if acm_dr_hub_setup_argocd_demo_srv is failed %}
+      AppDemo instance:
+      {% set demo_cr = acm_dr_hub_setup_diag_argocd_demo_cr.resources | default([]) %}
+      {% if demo_cr | length > 0 %}phase={{ demo_cr[0].status.phase | default('Unknown')
+      }}{% else %}ArgoCD CR not found{% endif %}.
+      {% endif %}
+    acm_dr_hub_setup_diag_argocd_hints: >-
+      {% set hints = [] %}
+      {% set _ = hints.append(
+           'ARGOCD SERVER NOT READY: The ArgoCD server Deployment has no ready replicas '
+           ~ 'after 6.7 minutes. Common causes: (1) the GitOps operator controller-manager '
+           ~ 'is not running, (2) the ArgoCD CR template has invalid values, '
+           ~ '(3) the namespace is missing required RBAC. Check the ArgoCD CR status '
+           ~ 'and operator logs: oc logs -n '
+           ~ (acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator'))
+           ~ ' -l control-plane=gitops-operator --context ' ~ k8s_target_context ~ '.') %}
+      {{ hints }}
+  when: acm_dr_hub_setup_argocd_acm_srv is failed or acm_dr_hub_setup_argocd_demo_srv is failed
+
+# D.4) Print the structured diagnostic report.
+- name: "[STAGE 04 - GitOps ArgoCD DIAGNOSTIC] | D.4) ❌ ARGOCD FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ ARGOCD INSTANCE SETUP FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "FAILED INSTANCES:"
+      - "{{ acm_dr_hub_setup_diag_argocd_failed_instances | default(['  unknown']) }}"
+      - ""
+      - "TARGET CLUSTER:"
+      - "  {{ k8s_target_context }}"
+      - ""
+      - "STATUS:"
+      - "{{ acm_dr_hub_setup_diag_argocd_summary | default('  (could not gather status)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_hub_setup_diag_argocd_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: acm_dr_hub_setup_argocd_acm_srv is failed or acm_dr_hub_setup_argocd_demo_srv is failed
+
+# D.5) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 04 - GitOps ArgoCD DIAGNOSTIC] | D.5) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => ArgoCD instance setup failed on context '{{ k8s_target_context }}'.
+      Failed instances:
+      {{ acm_dr_hub_setup_diag_argocd_failed_instances | default([]) | join(', ') }}.
+      See the diagnostic report above for ArgoCD CR status and troubleshooting hints.
+  when: acm_dr_hub_setup_argocd_acm_srv is failed or acm_dr_hub_setup_argocd_demo_srv is failed
+
+- name: "[STAGE 04 - GitOps] | 4.3.4) Create ApplicationSet for Demo Applications (gitops_appset_appdemo.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_appset_appdemo.yml.j2
+
+# =============================================================================
+# STEP 4.4: GRACEFUL RESTART AND ROUTE/ICON COLLECTION
+# =============================================================================
+
+- name: "[STAGE 04 - GitOps] | 4.4.1) Execute Rollout Restart on ArgoCD server Deployments - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: patched
+    kind: Deployment
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+  loop:
+    - { name: "openshift-gitops-acm-server", namespace: "{{ acm_dr_hub_setup_gitops_namespace_acm }}" }
+    - { name: "openshift-gitops-appdemo-server", namespace: "{{ acm_dr_hub_setup_gitops_namespace_appdemo }}" }
+  when: >
+    (acm_dr_hub_setup_argocd_acm_cr_result is defined and acm_dr_hub_setup_argocd_acm_cr_result is changed) or
+    (acm_dr_hub_setup_argocd_demo_cr_result is defined and acm_dr_hub_setup_argocd_demo_cr_result is changed)
+
+- name: "[STAGE 04 - GitOps] | 4.4.2) Retrieve the RHACM GitOps instance Route - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: route.openshift.io/v1
+    kind: Route
+    namespace: "{{ acm_dr_hub_setup_gitops_namespace_acm }}"
+    name: openshift-gitops-acm-server
+  register: acm_dr_hub_setup_route_acm
+
+- name: "[STAGE 04 - GitOps] | 4.4.3) Retrieve the GitOps AppDemo instance Route - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: route.openshift.io/v1
+    kind: Route
+    namespace: "{{ acm_dr_hub_setup_gitops_namespace_appdemo }}"
+    name: openshift-gitops-appdemo-server
+  register: acm_dr_hub_setup_route_demo
+
+- name: "[STAGE 04 - GitOps] | 4.4.4) Query existing ConsoleLinks to extract the Argo CD icon - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: console.openshift.io/v1
+    kind: ConsoleLink
+  register: acm_dr_hub_setup_console_links_info
+
+- name: "[STAGE 04 - GitOps] | 4.4.5) Resolve default Argo CD icon imageURL - {{ k8s_target_context }}"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_argocd_icon_url: >-
+      {{
+        (
+          acm_dr_hub_setup_console_links_info.resources | default([]) |
+          selectattr('spec.applicationMenu.imageURL', 'defined') |
+          map(attribute='spec.applicationMenu.imageURL') | first
+        ) if (
+          acm_dr_hub_setup_console_links_info.resources is defined and
+          (acm_dr_hub_setup_console_links_info.resources | selectattr('spec.applicationMenu.imageURL', 'defined') | list | length > 0)
+        ) else ''
+      }}
+
+# =============================================================================
+# STEP 4.5: CONSOLE LINKS PUBLICATION AND DYNAMIC PLUGINS ENABLEMENT
+# =============================================================================
+
+- name: "[STAGE 04 - GitOps] | 4.5.1) Publish dynamic ConsoleLinks to OpenShift Web Console - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: gitops/gitops_console_link.yml.j2
+  loop:
+    - name: "gitops-acm-{{ k8s_target_context }}"
+      host: "{{ (acm_dr_hub_setup_route_acm.resources[0].spec.host) | default('') }}"
+      text: "GitOps ACM Governance ({{ k8s_target_context }})"
+      image_url: "{{ acm_dr_hub_setup_argocd_icon_url | default('') | trim }}"
+    - name: "gitops-appdemo-{{ k8s_target_context }}"
+      host: "{{ (acm_dr_hub_setup_route_demo.resources[0].spec.host) | default('') }}"
+      text: "GitOps AppDemo Workloads ({{ k8s_target_context }})"
+      image_url: "{{ acm_dr_hub_setup_argocd_icon_url | default('') | trim }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - acm_dr_hub_setup_route_acm.resources is defined and acm_dr_hub_setup_route_acm.resources | length > 0
+    - acm_dr_hub_setup_route_demo.resources is defined and acm_dr_hub_setup_route_demo.resources | length > 0
+
+- name: "[STAGE 04 - GitOps] | 4.5.2) Query enabled plugins in the OpenShift Console - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: console.operator.openshift.io/v1
+    kind: Console
+    name: cluster
+  register: acm_dr_hub_setup_console_cluster
+
+- name: "[STAGE 04 - GitOps] | 4.5.3) Enable the GitOps Operator Dynamic Console Plugin - {{ k8s_target_context }}"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ k8s_target_context }}"
+    api_version: console.operator.openshift.io/v1
+    kind: Console
+    name: cluster
+    patch:
+      - op: "{{ 'add' if (acm_dr_hub_setup_console_cluster.resources[0].spec.plugins is defined) else 'replace' }}"
+        path: "{{ '/spec/plugins/-' if (acm_dr_hub_setup_console_cluster.resources[0].spec.plugins is defined) else '/spec/plugins' }}"
+        value: "{{ 'gitops-plugin' if (acm_dr_hub_setup_console_cluster.resources[0].spec.plugins is defined) else ['gitops-plugin'] }}"
+  when:
+    - acm_dr_hub_setup_console_cluster.resources | length > 0
+    - "'gitops-plugin' not in (acm_dr_hub_setup_console_cluster.resources[0].spec.plugins | default([]))"
+
+# =============================================================================
+# STEP 4.6: COMPLETION SUMMARY AND STAGE 04 CONCLUSION STATUS
+# =============================================================================
+
+- name: "[STAGE 04 - GitOps] | Display Red Hat OpenShift GitOps Multi-Tenant completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/04_gitops_argocd_summary.j2').split('\n') }}"
+...

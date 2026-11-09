@@ -1,0 +1,206 @@
+---
+# roles/acm_dr_hub_cleanup/defaults/main.yml
+# =============================================================================
+# DEFAULT VARIABLES FILE FOR THE ACM_DR_LAB_CLEANUP ROLE
+# =============================================================================
+# This role is the "inverse operation" of acm_dr_hub_setup: it decommissions a
+# cluster that was previously elected as an RHACM DR node, returning it to
+# general-purpose use. It does NOT blindly uninstall everything -- it removes
+# only what is pertinent to the DR node role. See README.md (section "Scope:
+# What Is Removed and What Is Preserved") for the full rationale behind each
+# decision below.
+
+# -----------------------------------------------------------------------------
+# 0. COSMETIC AND GENERAL CONTROL PARAMETERS (CONSOLE / AWX UX)
+# -----------------------------------------------------------------------------
+acm_dr_hub_cleanup_separator_char: "="
+acm_dr_hub_cleanup_default_message_padding: 4
+
+# Suppresses task output for security-sensitive operations (tokens, secrets,
+# kubeconfig content). Set to false (-e acm_dr_hub_cleanup_debug_no_log=false)
+# to expose hidden output during troubleshooting sessions.
+acm_dr_hub_cleanup_debug_no_log: true  # bool - set false to reveal no_log task output
+
+# Simulation mode: uses Kubernetes-native check_mode/diff (dryRun=All on the
+# API Server) for all mutable tasks. No removals are applied.
+acm_dr_hub_cleanup_dry_run: false
+
+# -----------------------------------------------------------------------------
+# 1. SAFETY GATES (MANDATORY BEFORE ANY DESTRUCTIVE ACTION)
+# -----------------------------------------------------------------------------
+# Explicit and mandatory confirmation. Without this, Stage 00 refuses to
+# proceed, even in dry-run mode. This exists to prevent anyone from running
+# this role "by accident" against the wrong context.
+acm_dr_hub_cleanup_confirm: false
+
+# Overrides the Stage 00 safety lock that prevents cleanup of a Hub that
+# appears to be ACTIVE in production (BackupSchedule present and NOT paused).
+# Only enable if you are absolutely certain you are decommissioning the correct node.
+acm_dr_hub_cleanup_force: false
+
+# -----------------------------------------------------------------------------
+# 1a. CLOUD PROVIDER SELECTOR
+# -----------------------------------------------------------------------------
+# Must match the cloud_provider used during acm_dr_hub_setup. Controls which
+# Stage 05 storage cleanup task runs and which OADP credential Secret name to
+# remove in Stage 02.
+acm_dr_hub_cleanup_cloud_provider: "azure"  # string - "azure" or "aws"
+
+# -----------------------------------------------------------------------------
+# 2. CLEANUP SCOPE (WHAT IS REMOVED AND WHAT IS PRESERVED)
+# -----------------------------------------------------------------------------
+# Controls whether Stage 06 removes the Zero-Trust automation identity
+# (namespace ansible-automation, ServiceAccount ansible-dr-orchestrator,
+# and the cluster-admin ClusterRoleBinding). DISABLED by default because
+# removing the SA cuts the only non-interactive access to the cluster;
+# reconnecting afterward requires kubeadmin or another privileged user
+# to re-provision the SA via 02_provision_automation_sa.sh. Enable only
+# when you intentionally want to revoke all automation access to the
+# cluster (e.g., full decommissioning, not just DR role removal).
+acm_dr_hub_cleanup_remove_automation_identity: false
+
+# Fully removes the Storage Account and Containers in Azure (actual
+# Backup/Observability data). DISABLED by default: the primary ACM Hub
+# typically still depends on the same shared storage. Only enable if you are
+# certain that NO other Hub (including the primary) depends on this data
+# anymore -- the action is irreversible.
+acm_dr_hub_cleanup_purge_azure_storage: false
+
+# List of kubeconfig contexts for other hubs sharing the same Azure storage
+# with this hub. When acm_dr_hub_cleanup_purge_azure_storage=true and this list
+# is non-empty, the cleanup preflight queries each peer hub's BSL status and
+# warns if any peer still depends on the shared storage. When empty (default),
+# only a generic warning is shown. This does NOT block the purge; it adds
+# visibility so the operator can make an informed decision.
+acm_dr_hub_cleanup_known_peer_hubs: []  # list of str -- kubeconfig contexts of peer hubs
+
+# -----------------------------------------------------------------------------
+# 3. NAMESPACES AND RESOURCE NAMES - RED HAT ACM / MULTICLUSTERHUB
+# (fully removed, including operator Subscription/CSV -- see README)
+# -----------------------------------------------------------------------------
+acm_dr_hub_cleanup_mch_namespace: "open-cluster-management"
+acm_dr_hub_cleanup_mch_name: "multiclusterhub"
+acm_dr_hub_cleanup_mch_pull_secret: "rhacm-pull-secret"
+acm_dr_hub_cleanup_mch_operator_subscription: "advanced-cluster-management"
+acm_dr_hub_cleanup_mch_operatorgroup: "open-cluster-management-group"
+
+# -----------------------------------------------------------------------------
+# 4. NAMESPACES AND RESOURCE NAMES - OBSERVABILITY (THANOS)
+# (the observability.open-cluster-management.io Custom Resource is provided by
+# the ACM operator itself, so it disappears when ACM is removed above)
+# -----------------------------------------------------------------------------
+acm_dr_hub_cleanup_observability_namespace: "open-cluster-management-observability"
+acm_dr_hub_cleanup_observability_mco_name: "observability"
+
+# -----------------------------------------------------------------------------
+# 5. NAMESPACES AND RESOURCE NAMES - OADP / VELERO
+# (the OADP Operator, its OperatorGroup/Subscription/CSV and the namespace
+# itself are PRESERVED by default -- only the DR-specific configuration is removed)
+# -----------------------------------------------------------------------------
+acm_dr_hub_cleanup_oadp_namespace: "open-cluster-management-backup"
+acm_dr_hub_cleanup_oadp_dpa_name: "dpa-hub"
+# OADP credential Secret name. Must match what acm_dr_hub_setup created.
+# acm_dr_hub_setup uses "cloud-credentials-azure" for Azure (the Velero Azure
+# plugin resolves credentials by this literal name, regardless of the DPA
+# credential.name field) and "cloud-credentials" for AWS / OADP 1.6+.
+# Mirror the same conditional here so the cleanup removes the correct Secret.
+acm_dr_hub_cleanup_oadp_cloud_secret_name: >-
+  {{ 'cloud-credentials-azure'
+     if (acm_dr_hub_cleanup_cloud_provider | default('azure')) == 'azure'
+     else 'cloud-credentials' }}
+acm_dr_hub_cleanup_schedule_name: "schedule-acm-hub"
+
+# -----------------------------------------------------------------------------
+# 6. NAMESPACES AND RESOURCE NAMES - RED HAT OPENSHIFT GITOPS
+# (the GitOps Operator, its Subscription/CSV and the operator's own namespace
+# are PRESERVED by default -- only the governance/appdemo ArgoCD instances
+# created by acm_dr_hub_setup are removed)
+# -----------------------------------------------------------------------------
+acm_dr_hub_cleanup_gitops_namespace_acm: "openshift-gitops-acm"
+acm_dr_hub_cleanup_gitops_namespace_appdemo: "openshift-gitops-appdemo"
+acm_dr_hub_cleanup_policies_namespace: "acm-policies"           # must match acm_dr_hub_setup_policies_namespace
+acm_dr_hub_cleanup_gitops_repo_secret_name: "repo-acm-ocp-creds"
+
+# Resource names created by acm_dr_hub_setup - must match to allow cleanup to find them.
+# Override both acm_dr_hub_setup_* and acm_dr_hub_cleanup_* if you customized the setup defaults.
+acm_dr_hub_cleanup_appset_policies_name: "governance-policies"  # must match acm_dr_hub_setup_appset_policies_name
+acm_dr_hub_cleanup_placement_name: "hub-governance-placement"   # must match acm_dr_hub_setup_placement_name
+acm_dr_hub_cleanup_gitops_cluster_name: "hub-governance-gitops" # must match acm_dr_hub_setup_gitops_cluster_name
+acm_dr_hub_cleanup_appset_demo_name: "demo-workloads"           # must match acm_dr_hub_setup_appset_demo_name
+acm_dr_hub_cleanup_demo_app1_name: "demo-app-01"                # must match acm_dr_hub_setup_demo_app1_name
+acm_dr_hub_cleanup_demo_app2_name: "demo-app-02"                # must match acm_dr_hub_setup_demo_app2_name
+
+# -----------------------------------------------------------------------------
+# 7. ZERO-TRUST AUTOMATION (DR ORCHESTRATION RBAC)
+# -----------------------------------------------------------------------------
+acm_dr_hub_cleanup_automation_namespace: "ansible-automation"
+acm_dr_hub_cleanup_automation_sa_name: "ansible-dr-orchestrator"
+acm_dr_hub_cleanup_automation_secret_name: "ansible-dr-orchestrator-token"
+
+# -----------------------------------------------------------------------------
+# 8. CLOUD STORAGE CREDENTIALS (ONLY REQUIRED WHEN PURGE IS ENABLED)
+# -----------------------------------------------------------------------------
+
+# 8a. AZURE CREDENTIALS (required when purge_azure_storage=true and cloud_provider=azure)
+
+# Optional shorthand identifier from Red Hat Open Environment provisioning.
+# When provided, constructs the Storage Account name as 'acmsa<guid>' and the
+# Resource Group fallback as 'openenv-<guid>'. Not needed when providing
+# acm_dr_hub_cleanup_azure_storage_account_name and
+# acm_dr_hub_cleanup_azure_resource_group directly.
+acm_dr_hub_cleanup_guid: "{{ lookup('ansible.builtin.env', 'GUID') | default('', true) }}"
+
+# AAP's built-in "Microsoft Azure Resource Manager" credential type injects
+# AZURE_SUBSCRIPTION_ID, AZURE_TENANT, AZURE_CLIENT_ID, AZURE_SECRET.
+# The local env-setup.sh script exports SUBSCRIPTION, TENANT, CLIENT_ID, PASSWORD.
+# Each default tries the AAP name first, then the legacy name, then empty.
+acm_dr_hub_cleanup_azure_subscription_id: "{{ lookup('ansible.builtin.env', 'AZURE_SUBSCRIPTION_ID') | default(lookup('ansible.builtin.env', 'SUBSCRIPTION'), true) | default('', true) }}"
+acm_dr_hub_cleanup_azure_tenant_id: "{{ lookup('ansible.builtin.env', 'AZURE_TENANT') | default(lookup('ansible.builtin.env', 'TENANT'), true) | default('', true) }}"
+acm_dr_hub_cleanup_azure_client_id: "{{ lookup('ansible.builtin.env', 'AZURE_CLIENT_ID') | default(lookup('ansible.builtin.env', 'CLIENT_ID'), true) | default('', true) }}"
+acm_dr_hub_cleanup_azure_client_secret: "{{ lookup('ansible.builtin.env', 'AZURE_SECRET') | default(lookup('ansible.builtin.env', 'PASSWORD'), true) | default('', true) }}"
+
+# Azure Resource Group. Resolution: RESOURCEGROUP env → AZURE_RESOURCE_GROUP
+# env → openenv-<guid> fallback.
+acm_dr_hub_cleanup_azure_resource_group: >-
+  {{ lookup('ansible.builtin.env', 'RESOURCEGROUP')
+     | default(lookup('ansible.builtin.env', 'AZURE_RESOURCE_GROUP'), true)
+     | default('openenv-' ~ acm_dr_hub_cleanup_guid, true) }}
+
+# Azure Storage Account name. Resolution: AZURE_STORAGE_ACCOUNT env →
+# acmsa<guid> fallback.
+acm_dr_hub_cleanup_azure_storage_account_name: >-
+  {{ lookup('ansible.builtin.env', 'AZURE_STORAGE_ACCOUNT')
+     | default('acmsa' ~ acm_dr_hub_cleanup_guid, true) }}
+
+# 8b. AWS CREDENTIALS (required when purge_aws_storage=true and cloud_provider=aws)
+acm_dr_hub_cleanup_purge_aws_storage: false  # bool - delete the S3 buckets (irreversible)
+
+acm_dr_hub_cleanup_aws_access_key_id: "{{ lookup('ansible.builtin.env', 'AWS_ACCESS_KEY_ID') | default('', true) }}"
+acm_dr_hub_cleanup_aws_secret_access_key: "{{ lookup('ansible.builtin.env', 'AWS_SECRET_ACCESS_KEY') | default('', true) }}"
+acm_dr_hub_cleanup_aws_region: "{{ lookup('ansible.builtin.env', 'AWS_DEFAULT_REGION') | default('us-east-1', true) }}"
+
+# S3 bucket names to purge. Must match what acm_dr_hub_setup created.
+acm_dr_hub_cleanup_aws_s3_bucket_backup: ""  # string - S3 bucket for OADP backups
+acm_dr_hub_cleanup_aws_s3_bucket_observability: ""  # string - S3 bucket for Thanos observability
+
+# -----------------------------------------------------------------------------
+# 9. WAIT TIMEOUTS FOR FINALIZER TEARDOWN (IN SECONDS)
+# -----------------------------------------------------------------------------
+# MultiClusterHub removal can take 10 to 20 minutes (the ACM operator
+# dismantles submariner, search, policy-engine, etc. before releasing the finalizer).
+acm_dr_hub_cleanup_mch_delete_timeout: 1800  # seconds (30 minutes)
+acm_dr_hub_cleanup_mco_delete_timeout: 600  # seconds (10 minutes)
+acm_dr_hub_cleanup_namespace_delete_timeout: 600  # seconds (10 minutes)
+acm_dr_hub_cleanup_argocd_delete_timeout: 300  # seconds (5 minutes)
+
+# Stage 02: how long to wait for ACM Restore CRs to disappear after deletion
+# before force-removing their finalizers (seconds).
+acm_dr_hub_cleanup_restore_cr_wait_timeout: 120  # seconds (2 minutes)
+
+# Stage 04 MCH remediation: retries and delay for the D.8 re-wait loop after
+# inline break-glass. D.6c clears stuck ManagedCluster finalizers and D.6d
+# re-triggers the MCH delete. ACM then needs 10-20 minutes to dismount all
+# components; D.9 force-removes the MCH finalizer if D.8 exhausts its retries.
+acm_dr_hub_cleanup_mch_remediation_retries: 20  # count - post-remediation wait retries (1200s = 20 min)
+acm_dr_hub_cleanup_mch_remediation_delay: 60  # seconds - delay between post-remediation retries
+...

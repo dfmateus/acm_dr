@@ -1,0 +1,180 @@
+---
+# roles/acm_dr_failover_manager/tasks/05_msa_verify_spokes.yml
+# =============================================================================
+# STAGE 07b - MSA SPOKE VERIFIER (OPT-IN)
+# =============================================================================
+# Reads MSA tokens from the passive Hub (now the new leader, post-Stage 07
+# sanitize) and probes each reachable Spoke API server directly from the
+# Execution Environment. Detects NSG-level EE→Spoke network asymmetry that
+# Stage 05 (Hub-side ManagedCluster.status check only) cannot see.
+#
+# Opt-in: enable with acm_dr_failover_manager_enable_msa_verification: true.
+# Requires acm_dr_msa_provisioner to have run during Spoke onboarding.
+#
+# Failures are non-blocking per Spoke. The stage produces a diagnostic report
+# and does NOT abort the failover pipeline.
+# =============================================================================
+
+- name: "[STAGE 07b - MSA Verifier] | Display Stage 07b metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🔎 STAGE 07b - MSA Spoke Verifier (EE→Spoke network probe)"
+    acm_dr_failover_manager_banner_lines:
+      - "✅ NEW HUB:    {{ passive_hub }}"
+      - "🌐  MSA NAME:  {{ acm_dr_failover_manager_msa_name }}"
+      - "🔒  VALIDATE_SSL: {{ acm_dr_failover_manager_msa_validate_ssl }}"
+      - "📋  SPOKES:    {{ (acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list)) | length }} to probe"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+# =============================================================================
+# STEP 1: READ MSA TOKEN SECRETS FROM PASSIVE HUB
+# =============================================================================
+# Each MSA token Secret lives in the Spoke's namespace on the Hub and shares
+# the same name as the ManagedServiceAccount CR (ansible-dr-orchestrator-msa).
+# failed_when: false - a missing Secret means the MSA was never provisioned
+# for that Spoke; the verify step reports it instead of aborting.
+
+- name: "[STAGE 07b - MSA Verifier] | 7b.1.1) Read MSA token Secrets from passive Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ item }}"
+    name: "{{ acm_dr_failover_manager_msa_name }}"
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_msa_secrets_info
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  failed_when: false
+
+# =============================================================================
+# STEP 2: READ SPOKE API URLS FROM MANAGEDCLUSTER STATUS
+# =============================================================================
+
+- name: "[STAGE 07b - MSA Verifier] | 7b.1.2) Read ManagedCluster API URLs from passive Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_msa_mc_info
+  failed_when: false
+
+# =============================================================================
+# STEP 3: BUILD PER-SPOKE PROBE LIST
+# =============================================================================
+# Pairs MSA token + Spoke URL. Spokes that are missing a token or URL are
+# included with empty fields so the report step can flag them correctly.
+
+- name: "[STAGE 07b - MSA Verifier] | 7b.1.3) Build per-Spoke probe list (token + URL pairs)"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_msa_probe_list: >-
+      {% set ns = namespace(probes=[]) %}
+      {% set spoke_list = acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) %}
+      {% for i in range(spoke_list | length) %}
+        {% set spoke = spoke_list[i] %}
+        {% set secret_result = (acm_dr_failover_manager_msa_secrets_info.results | default([]))[i] | default({}) %}
+        {% set mc_result = (acm_dr_failover_manager_msa_mc_info.results | default([]))[i] | default({}) %}
+        {% set token = '' %}
+        {% set url = '' %}
+        {% if (secret_result.resources | default([]) | length) > 0 %}
+          {% set token = secret_result.resources[0].data.token | default('') %}
+          {% if token | length > 0 %}
+            {% set token = token | b64decode %}
+          {% endif %}
+        {% endif %}
+        {% if (mc_result.resources | default([]) | length) > 0 %}
+          {% set cfgs = mc_result.resources[0].spec.managedClusterClientConfigs | default([]) %}
+          {% if cfgs | length > 0 %}
+            {% set url = cfgs[0].url | default('') %}
+          {% endif %}
+        {% endif %}
+        {% set _ = ns.probes.append({'spoke': spoke, 'token': token, 'url': url}) %}
+      {% endfor %}
+      {{ ns.probes | to_json }}
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+
+# =============================================================================
+# STEP 4: PROBE EACH SPOKE API SERVER FROM THE EE
+# =============================================================================
+# GET /apis from each Spoke using the MSA Bearer token. HTTP 200 confirms the
+# EE can reach the Spoke API server over the network. failed_when: false makes
+# each probe non-blocking; the summary step (7b.1.5) consolidates results.
+
+# Launch all Spoke API probes simultaneously. With N spokes the old serial loop cost
+# N × 15s worst-case (all unreachable). This implementation costs max(probe-times) instead.
+# async = 20s (15s HTTP timeout + 5s buffer); poll = 0 fires all probes concurrently.
+- name: "[STAGE 07b - MSA Verifier] | 7b.1.4a) Launch parallel Spoke API probes via MSA token"
+  ansible.builtin.uri:
+    url: "{{ probe_entry.url }}/apis"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ probe_entry.token }}"
+    validate_certs: "{{ acm_dr_failover_manager_msa_validate_ssl | bool }}"
+    status_code: [200]
+    timeout: 15  # seconds - fast timeout; if the Spoke is unreachable this fails quickly
+  loop: "{{ acm_dr_failover_manager_msa_probe_list | from_json }}"
+  loop_control:
+    loop_var: probe_entry
+    label: "{{ probe_entry.spoke }}"
+  register: acm_dr_failover_manager_msa_probe_jobs
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  failed_when: false
+  # Skip when token or URL are empty - the summary step reports the gap.
+  when:
+    - probe_entry.token | length > 0
+    - probe_entry.url | length > 0
+  async: 20   # HTTP timeout (15s) + 5s startup buffer
+  poll: 0     # fire-and-forget: all probes run simultaneously
+
+# Collect async probe results. The summary step (7b.1.5) reads acm_dr_failover_manager_msa_probe_results,
+# so we map the collected results into that variable name for backward compatibility.
+- name: "[STAGE 07b - MSA Verifier] | 7b.1.4b) Collect parallel Spoke API probe results"
+  ansible.builtin.async_status:
+    jid: "{{ probe_entry.ansible_job_id }}"
+  loop: "{{ acm_dr_failover_manager_msa_probe_jobs.results | default([]) }}"
+  loop_control:
+    loop_var: probe_entry
+    label: "{{ probe_entry.probe_entry.spoke | default('unknown') }}"  # probe_entry from the launch loop
+  register: acm_dr_failover_manager_msa_probe_results
+  until: acm_dr_failover_manager_msa_probe_results.finished
+  retries: 5    # 5 x 5s = 25s collector budget; slightly above the 20s async limit
+  delay: 5      # seconds between async_status checks
+  when:
+    - acm_dr_failover_manager_msa_probe_jobs is defined
+    - probe_entry.ansible_job_id is defined  # skipped entries (empty token/URL) have no job ID
+  ignore_errors: true
+
+# =============================================================================
+# STEP 5: CONSOLIDATED SUMMARY REPORT
+# =============================================================================
+
+- name: "[STAGE 07b - MSA Verifier] | 7b.1.5) Display per-Spoke MSA reachability result"
+  ansible.builtin.debug:
+    msg: >-
+      {% set probe_list = acm_dr_failover_manager_msa_probe_list | from_json %}
+      {% set probe_results = acm_dr_failover_manager_msa_probe_results.results | default([]) %}
+      {% for i in range(probe_list | length) %}
+        {% set entry = probe_list[i] %}
+        {% if entry.token | length == 0 %}
+          ⚠️ {{ entry.spoke }}: MSA token Secret absent - acm_dr_msa_provisioner never ran for this Spoke, or the Secret was deleted.
+        {% elif entry.url | length == 0 %}
+          ⚠️ {{ entry.spoke }}: ManagedCluster has no managedClusterClientConfigs URL - cannot probe.
+        {% else %}
+          {% set result = probe_results[i] | default({}) %}
+          {% if result.status is defined and result.status == 200 %}
+            ✅ {{ entry.spoke }}: EE→Spoke API reachable (HTTP {{ result.status }}).
+          {% else %}
+            ❌ {{ entry.spoke }}: EE→Spoke API NOT reachable via MSA token. URL: {{ entry.url }}.
+               Check NSG rules between the AAP EE network and port 6443 on the Spoke.
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+  run_once: true
+...

@@ -1,0 +1,646 @@
+---
+# roles/acm_dr_failover_manager/tasks/08_postflight_check.yml
+
+- name: "[STAGE 08 - Verification] | Display post-failover audit metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "📊 STAGE 08 - Post-Failover Verification & Deep Anomaly Analysis"
+    acm_dr_failover_manager_banner_lines:
+      - "⚠️  OLD HUB: {{ active_hub }}"
+      - "✅ NEW HUB: {{ passive_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+# In dry-run mode no mutations ran before this point, so all k8s_info queries
+# below reflect the PRE-failover cluster state - not a post-failover snapshot.
+# The compliance report is useful as a baseline but must not be read as validation.
+- name: "[STAGE 08 - Verification] | 🔎 [DRY-RUN] Compliance report reflects pre-failover baseline state"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 [DRY-RUN] No cluster mutations ran before this stage. The compliance report
+      generated here reflects the CURRENT (pre-failover) cluster state, not a post-failover
+      snapshot. Use this report as a baseline, not as failover validation.
+  when: acm_dr_failover_manager_dry_run | default(false) | bool
+  run_once: true
+
+# =============================================================================
+# STEP 8.1: DATA COLLECTION
+# Single-hub queries (8.1.2, 8.1.4, 8.1.4b-i) fire with async:60/poll:0 so
+# all 10 API calls run in parallel. Per-spoke loop queries (8.1.1, 8.1.3,
+# 8.1.4j, 8.1.4k) run serially while the async tasks are in flight. Task
+# 8.1.4z collects all async results; 8.1.4z+1 restores the original variable
+# names so the set_fact at 8.1.5 requires no changes.
+# =============================================================================
+
+# --- 10 single-hub queries: fire simultaneously via async ---
+
+- name: "[STAGE 08 - Verification] | 8.1.2) Collect BackupSchedule state on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_schedule_name }}"
+  register: acm_dr_failover_manager_new_hub_schedule_info
+  async: 60   # fire-and-forget; collected at 8.1.4z
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4) Collect BackupSchedule state on the Old Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_schedule_name }}"
+  register: acm_dr_failover_manager_old_hub_schedule_info
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4b) Collect Governance Policies on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: policy.open-cluster-management.io/v1
+    kind: Policy
+  register: acm_dr_failover_manager_new_hub_policies_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4c) Collect ArgoCD (GitOps) Applications on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+  register: acm_dr_failover_manager_new_hub_gitops_apps_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4d) Collect PlacementDecisions on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: PlacementDecision
+  register: acm_dr_failover_manager_new_hub_placement_decisions_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4e) Collect custom Grafana Dashboards on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ acm_dr_failover_manager_observability_ns }}"
+    label_selectors:
+      - "{{ acm_dr_failover_manager_custom_dashboard_label }}"
+  register: acm_dr_failover_manager_new_hub_dashboards_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4f) Collect MCH status on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+  register: acm_dr_failover_manager_postflight_mch_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4g) Collect MCE status on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: multicluster.openshift.io/v1
+    kind: MultiClusterEngine
+  register: acm_dr_failover_manager_postflight_mce_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4h) Collect ACM CSV status on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ acm_dr_failover_manager_acm_namespace }}"
+    label_selectors:
+      - "operators.coreos.com/advanced-cluster-management.open-cluster-management="
+  register: acm_dr_failover_manager_postflight_csv_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+- name: "[STAGE 08 - Verification] | 8.1.4i) Collect OADP/Velero pod status on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    field_selectors:
+      - "status.phase!=Succeeded"
+  register: acm_dr_failover_manager_postflight_oadp_pods_info
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+
+# --- Per-spoke and multi-hub loop queries: run serially while async tasks are in flight ---
+
+- name: "[STAGE 08 - Verification] | 8.1.1) Collect Spoke Add-on status on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: "{{ acm_dr_failover_manager_addon_api_version }}"
+    kind: ManagedClusterAddOn
+    namespace: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_hub_addons_info
+  check_mode: false  # read-only; must run in dry-run mode for postflight report
+
+- name: "[STAGE 08 - Verification] | 8.1.3) Check for residual Spoke existence on the Old Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_old_hub_spokes_info
+  check_mode: false
+
+# Query BackupSchedule on each additional passive hub to detect split-brain
+# across the full topology, not just the source/destination pair.
+- name: "[STAGE 08 - Verification] | 8.1.4j) Collect BackupSchedule state on additional passive hubs"
+  kubernetes.core.k8s_info:
+    context: "{{ item }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_schedule_name }}"
+  register: acm_dr_failover_manager_peer_hub_schedule_info
+  loop: >-
+    {{ (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+        if acm_dr_failover_manager_additional_passive_hubs is string
+        else acm_dr_failover_manager_additional_passive_hubs)
+       | default([], true) }}
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+     if acm_dr_failover_manager_additional_passive_hubs is string
+     else acm_dr_failover_manager_additional_passive_hubs)
+    | default([], true) | length > 0
+  failed_when: false
+  check_mode: false
+
+# After OADP restore, ManagedCluster objects arrive on the new hub with the
+# auto-import-account token that was current at backup time. If that token had
+# already expired, the klusterlet cannot reconnect and the spoke shows
+# ManagedClusterImportSucceeded=False with Available=Unknown.
+# Re-run the Spoke Onboarding JT (action=onboard) for each affected spoke to
+# issue a fresh auto-import Secret and re-push the klusterlet manifest.
+# See docs/runbook/acm-38215-auto-import-account.md#spoke-available-unknown.
+- name: "[STAGE 08 - Verification] | 8.1.4k) Collect ManagedCluster import conditions on New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"
+  register: acm_dr_failover_manager_new_hub_import_info
+  failed_when: false
+  check_mode: false
+
+# --- Collect all 10 async results (they should all be done by now) ---
+
+# Collect results in the same order the tasks were fired above. Each
+# results[N] maps back to its original variable name in task 8.1.4z+1.
+# Index map:  0=new_hub_schedule  1=old_hub_schedule  2=policies
+#             3=gitops_apps  4=placement_decisions  5=dashboards
+#             6=mch  7=mce  8=csv  9=oadp_pods
+- name: "[STAGE 08 - Verification] | 8.1.4z) Wait for parallel single-hub queries to complete"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop:
+    - "{{ acm_dr_failover_manager_new_hub_schedule_info }}"
+    - "{{ acm_dr_failover_manager_old_hub_schedule_info }}"
+    - "{{ acm_dr_failover_manager_new_hub_policies_info }}"
+    - "{{ acm_dr_failover_manager_new_hub_gitops_apps_info }}"
+    - "{{ acm_dr_failover_manager_new_hub_placement_decisions_info }}"
+    - "{{ acm_dr_failover_manager_new_hub_dashboards_info }}"
+    - "{{ acm_dr_failover_manager_postflight_mch_info }}"
+    - "{{ acm_dr_failover_manager_postflight_mce_info }}"
+    - "{{ acm_dr_failover_manager_postflight_csv_info }}"
+    - "{{ acm_dr_failover_manager_postflight_oadp_pods_info }}"
+  register: acm_dr_failover_manager_08_async_collector
+  until: acm_dr_failover_manager_08_async_collector.finished
+  retries: 20   # 20 x 3s = 60s max; all calls should finish in < 5s
+  delay: 3
+  loop_control:
+    label: "{{ item.ansible_job_id | default('unknown') }}"
+  check_mode: false
+
+# Restore original variable names from the async collector results.
+# The index order here MUST match the loop order in 8.1.4z above.
+# After this set_fact, all 10 variables expose .resources exactly as if the
+# tasks had run synchronously; no changes are needed in 8.1.5.
+- name: "[STAGE 08 - Verification] | 8.1.4z+1) Restore named k8s_info results from async collector"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_new_hub_schedule_info: "{{ acm_dr_failover_manager_08_async_collector.results[0] }}"
+    acm_dr_failover_manager_old_hub_schedule_info: "{{ acm_dr_failover_manager_08_async_collector.results[1] }}"
+    acm_dr_failover_manager_new_hub_policies_info: "{{ acm_dr_failover_manager_08_async_collector.results[2] }}"
+    acm_dr_failover_manager_new_hub_gitops_apps_info: "{{ acm_dr_failover_manager_08_async_collector.results[3] }}"
+    acm_dr_failover_manager_new_hub_placement_decisions_info: "{{ acm_dr_failover_manager_08_async_collector.results[4] }}"
+    acm_dr_failover_manager_new_hub_dashboards_info: "{{ acm_dr_failover_manager_08_async_collector.results[5] }}"
+    acm_dr_failover_manager_postflight_mch_info: "{{ acm_dr_failover_manager_08_async_collector.results[6] }}"
+    acm_dr_failover_manager_postflight_mce_info: "{{ acm_dr_failover_manager_08_async_collector.results[7] }}"
+    acm_dr_failover_manager_postflight_csv_info: "{{ acm_dr_failover_manager_08_async_collector.results[8] }}"
+    acm_dr_failover_manager_postflight_oadp_pods_info: "{{ acm_dr_failover_manager_08_async_collector.results[9] }}"
+
+- name: "[STAGE 08 - Verification] | 8.1.5) Calculate Risk Matrices and Compliance Alignment"
+  ansible.builtin.set_fact:
+    # Uses epoch integer (stored in Stage 00) instead of datetime subtraction,
+    # because set_fact stringifies datetime objects and datetime-minus-string fails
+    acm_dr_failover_manager_elapsed_seconds: >-
+      {{
+        (('%s' | strftime | int) - (acm_dr_failover_manager_start_epoch | int))
+        if (acm_dr_failover_manager_start_epoch is defined)
+        else 0
+      }}
+    # Build per-hub BackupSchedule state for the full topology (source, dest,
+    # plus any additional passive hubs). Each entry has: context name, whether
+    # a BackupSchedule exists, whether it is paused, and whether the hub counts
+    # as "active" (schedule exists AND is not paused).
+    acm_dr_failover_manager_topology_hub_schedules: >-
+      {% set ns = namespace(hubs=[]) %}
+      {% set old_res = acm_dr_failover_manager_old_hub_schedule_info.resources | default([]) %}
+      {% set old_exists = old_res | length > 0 %}
+      {% set old_paused = old_res[0].spec.paused | default(false) | bool if old_exists else true %}
+      {% set _ = ns.hubs.append({'context': active_hub, 'schedule_exists': old_exists, 'schedule_paused': old_paused, 'is_active': old_exists and not old_paused}) %}
+      {% set new_res = acm_dr_failover_manager_new_hub_schedule_info.resources | default([]) %}
+      {% set new_exists = new_res | length > 0 %}
+      {% set new_paused = new_res[0].spec.paused | default(false) | bool if new_exists else true %}
+      {% set _ = ns.hubs.append({'context': passive_hub, 'schedule_exists': new_exists, 'schedule_paused': new_paused, 'is_active': new_exists and not new_paused}) %}
+      {% for result in (acm_dr_failover_manager_peer_hub_schedule_info.results | default([])) %}
+        {% set peer_res = result.resources | default([]) %}
+        {% set peer_exists = peer_res | length > 0 %}
+        {% set peer_paused = peer_res[0].spec.paused | default(false) | bool if peer_exists else true %}
+        {% set _ = ns.hubs.append({'context': result.item, 'schedule_exists': peer_exists, 'schedule_paused': peer_paused, 'is_active': peer_exists and not peer_paused}) %}
+      {% endfor %}
+      {{ ns.hubs | to_json }}
+    # Count of hubs with an active (unpaused) BackupSchedule across the full
+    # topology. Exactly 1 is the expected healthy state after a failover.
+    acm_dr_failover_manager_active_hub_count: >-
+      {% set ns = namespace(count=0) %}
+      {% set old_res = acm_dr_failover_manager_old_hub_schedule_info.resources | default([]) %}
+      {% if old_res | length > 0 and not (old_res[0].spec.paused | default(false) | bool) %}{% set ns.count = ns.count + 1 %}{% endif %}
+      {% set new_res = acm_dr_failover_manager_new_hub_schedule_info.resources | default([]) %}
+      {% if new_res | length > 0 and not (new_res[0].spec.paused | default(false) | bool) %}{% set ns.count = ns.count + 1 %}{% endif %}
+      {% for result in (acm_dr_failover_manager_peer_hub_schedule_info.results | default([])) %}
+        {% set peer_res = result.resources | default([]) %}
+        {% if peer_res | length > 0 and not (peer_res[0].spec.paused | default(false) | bool) %}{% set ns.count = ns.count + 1 %}{% endif %}
+      {% endfor %}
+      {{ ns.count }}
+    # List of context names where the BackupSchedule is active (for reporting)
+    acm_dr_failover_manager_active_hub_list: >-
+      {% set ns = namespace(items=[]) %}
+      {% set old_res = acm_dr_failover_manager_old_hub_schedule_info.resources | default([]) %}
+      {% if old_res | length > 0 and not (old_res[0].spec.paused | default(false) | bool) %}{% set _ = ns.items.append(active_hub) %}{% endif %}
+      {% set new_res = acm_dr_failover_manager_new_hub_schedule_info.resources | default([]) %}
+      {% if new_res | length > 0 and not (new_res[0].spec.paused | default(false) | bool) %}{% set _ = ns.items.append(passive_hub) %}{% endif %}
+      {% for result in (acm_dr_failover_manager_peer_hub_schedule_info.results | default([])) %}
+        {% set peer_res = result.resources | default([]) %}
+        {% if peer_res | length > 0 and not (peer_res[0].spec.paused | default(false) | bool) %}{% set _ = ns.items.append(result.item) %}{% endif %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+    # Split-brain: more than one hub has an active BackupSchedule. In 2-hub
+    # mode this is equivalent to the old "both active" check; in 3+ hub mode
+    # it catches rogue schedules on any peer hub.
+    acm_dr_failover_manager_is_split_brain_detected: >-
+      {% set ns = namespace(count=0) %}
+      {% set old_res = acm_dr_failover_manager_old_hub_schedule_info.resources | default([]) %}
+      {% if old_res | length > 0 and not (old_res[0].spec.paused | default(false) | bool) %}{% set ns.count = ns.count + 1 %}{% endif %}
+      {% set new_res = acm_dr_failover_manager_new_hub_schedule_info.resources | default([]) %}
+      {% if new_res | length > 0 and not (new_res[0].spec.paused | default(false) | bool) %}{% set ns.count = ns.count + 1 %}{% endif %}
+      {% for result in (acm_dr_failover_manager_peer_hub_schedule_info.results | default([])) %}
+        {% set peer_res = result.resources | default([]) %}
+        {% if peer_res | length > 0 and not (peer_res[0].spec.paused | default(false) | bool) %}{% set ns.count = ns.count + 1 %}{% endif %}
+      {% endfor %}
+      {{ ns.count > 1 }}
+    acm_dr_failover_manager_residual_spokes: >-
+      {{
+        acm_dr_failover_manager_old_hub_spokes_info.results | default([])
+        | selectattr('resources', 'defined')
+        | selectattr('resources', 'truthy')
+        | map(attribute='item')
+        | select('truthy')
+        | reject('equalto', '')
+        | list | to_json
+      }}
+    acm_dr_failover_manager_degraded_addons_list: >-
+      {% set ns = namespace(items=[]) %}
+      {% for result in (acm_dr_failover_manager_hub_addons_info.results | default([])) %}
+        {% set spoke_name = result.item | default('') %}
+        {% for addon in (result.resources | default([])) %}
+          {% set conds = addon.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') %}
+          {% set a_status = conds | map(attribute='status') | first | default('False') %}
+          {% if a_status != 'True' and spoke_name != '' and addon.metadata.name is defined %}
+            {% set _ = ns.items.append(spoke_name ~ ':' ~ addon.metadata.name) %}
+          {% endif %}
+        {% endfor %}
+      {% endfor %}
+      {{ ns.items | select('truthy') | reject('equalto', '') | list | to_json }}
+    # Per-Spoke breakdown of degraded addons: list of {spoke, addons, count,
+    # total} dicts for readable per-Spoke warnings and detailed compliance
+    # report rendering. Built from the raw addon collection (task 8.1.1),
+    # grouping by Spoke namespace.
+    acm_dr_failover_manager_degraded_addons_by_spoke: >-
+      {% set ns = namespace(items=[]) %}
+      {% for result in (acm_dr_failover_manager_hub_addons_info.results | default([])) %}
+        {% set spoke_name = result.item | default('') %}
+        {% if spoke_name != '' %}
+          {% set total_addons = result.resources | default([]) | length %}
+          {% set degraded = namespace(addons=[]) %}
+          {% for addon in (result.resources | default([])) %}
+            {% set conds = addon.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') %}
+            {% set a_status = conds | map(attribute='status') | first | default('False') %}
+            {% if a_status != 'True' and addon.metadata.name is defined %}
+              {% set _ = degraded.addons.append(addon.metadata.name) %}
+            {% endif %}
+          {% endfor %}
+          {% if degraded.addons | length > 0 %}
+            {% set _ = ns.items.append({'spoke': spoke_name, 'addons': degraded.addons, 'count': degraded.addons | length, 'total': total_addons}) %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+    acm_dr_failover_manager_policy_summary: >-
+      {% set ns = namespace(total=0, noncompliant=[]) %}
+      {% for pol in (acm_dr_failover_manager_new_hub_policies_info.resources | default([])) %}
+        {% set labels = pol.metadata.labels | default({}) %}
+        {% if not labels.get('policy.open-cluster-management.io/root-policy') %}
+          {% set ns.total = ns.total + 1 %}
+          {% set compliant = pol.status.compliant | default('Pending') %}
+          {% if compliant != 'Compliant' %}
+            {% set _ = ns.noncompliant.append(pol.metadata.namespace ~ '/' ~ pol.metadata.name ~ ' (' ~ compliant ~ ')') %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ {'total': ns.total, 'noncompliant': ns.noncompliant} | to_json }}
+    acm_dr_failover_manager_gitops_summary: >-
+      {% set ns = namespace(total=0, unhealthy=[]) %}
+      {% for app in (acm_dr_failover_manager_new_hub_gitops_apps_info.resources | default([])) %}
+        {% set ns.total = ns.total + 1 %}
+        {% set sync_status = app.status.sync.status | default('Unknown') %}
+        {% set health_status = app.status.health.status | default('Unknown') %}
+        {% if sync_status != 'Synced' or health_status != 'Healthy' %}
+          {% set _ = ns.unhealthy.append(app.metadata.namespace ~ '/' ~ app.metadata.name ~ ' (sync=' ~ sync_status ~ ', health=' ~ health_status ~ ')') %}
+        {% endif %}
+      {% endfor %}
+      {{ {'total': ns.total, 'unhealthy': ns.unhealthy} | to_json }}
+    acm_dr_failover_manager_placement_summary: >-
+      {% set ns = namespace(total=0, empty=[]) %}
+      {% for pd in (acm_dr_failover_manager_new_hub_placement_decisions_info.resources | default([])) %}
+        {% set ns.total = ns.total + 1 %}
+        {% set decisions = pd.status.decisions | default([]) %}
+        {% if decisions | length == 0 %}
+          {% set _ = ns.empty.append(pd.metadata.namespace ~ '/' ~ pd.metadata.name) %}
+        {% endif %}
+      {% endfor %}
+      {{ {'total': ns.total, 'empty': ns.empty} | to_json }}
+    acm_dr_failover_manager_dashboard_summary: >-
+      {% set ns = namespace(total=0, unprotected=[]) %}
+      {% for cm in (acm_dr_failover_manager_new_hub_dashboards_info.resources | default([])) %}
+        {% set ns.total = ns.total + 1 %}
+        {% set labels = cm.metadata.labels | default({}) %}
+        {% if labels.get('cluster.open-cluster-management.io/backup', '') == '' %}
+          {% set _ = ns.unprotected.append(cm.metadata.name) %}
+        {% endif %}
+      {% endfor %}
+      {{ {'total': ns.total, 'unprotected': ns.unprotected} | to_json }}
+    acm_dr_failover_manager_new_hub_health: >-
+      {% set mch_res = (acm_dr_failover_manager_postflight_mch_info.resources | default([])) %}
+      {% set mce_res = (acm_dr_failover_manager_postflight_mce_info.resources | default([])) %}
+      {% set csv_res = (acm_dr_failover_manager_postflight_csv_info.resources | default([])) %}
+      {% set oadp_pods = (acm_dr_failover_manager_postflight_oadp_pods_info.resources | default([])) %}
+      {% set oadp_running = oadp_pods | selectattr('status.phase', 'equalto', 'Running') | list %}
+      {% set oadp_not_running = oadp_pods | rejectattr('status.phase', 'equalto', 'Running') | list %}
+      {{
+        {
+          'mch_version': mch_res[0].status.currentVersion | default('Unknown') if mch_res | length > 0 else 'Unknown',
+          'mch_phase': mch_res[0].status.phase | default('Unknown') if mch_res | length > 0 else 'Unknown',
+          'mce_version': mce_res[0].status.currentVersion | default('Unknown') if mce_res | length > 0 else 'Unknown',
+          'mce_phase': mce_res[0].status.phase | default('Unknown') if mce_res | length > 0 else 'Unknown',
+          'csv_name': csv_res[0].metadata.name | default('Unknown') if csv_res | length > 0 else 'Unknown',
+          'csv_phase': csv_res[0].status.phase | default('Unknown') if csv_res | length > 0 else 'Unknown',
+          'oadp_total': oadp_pods | length,
+          'oadp_running': oadp_running | length,
+          'oadp_not_running': oadp_not_running | map(attribute='metadata.name') | list
+        } | to_json
+      }}
+
+- name: "[STAGE 08 - Verification] | 8.1.5.1) Identify spokes with failed auto-import on New Hub"
+  ansible.builtin.set_fact:
+    # Spokes where ManagedClusterImportSucceeded != True on the new hub.
+    # Root cause: the auto-import-account token restored by OADP was already
+    # expired at backup time. Re-run the Spoke Onboarding JT for each spoke in
+    # this list to issue a fresh token and reinstall the klusterlet.
+    acm_dr_failover_manager_import_failed_spokes: >-
+      {% set ns = namespace(items=[]) %}
+      {% for result in (acm_dr_failover_manager_new_hub_import_info.results | default([])) %}
+        {% set res = result.resources | default([]) %}
+        {% if res | length > 0 %}
+          {% set conds = res[0].status.conditions | default([])
+             | selectattr('type', 'equalto', 'ManagedClusterImportSucceeded') | list %}
+          {% set import_status = conds | map(attribute='status') | first | default('Unknown') %}
+          {% if import_status != 'True' %}
+            {% set reason = conds | map(attribute='reason') | first | default('Unknown') %}
+            {% set _ = ns.items.append({'spoke': result.item, 'status': import_status, 'reason': reason}) %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+
+# =============================================================================
+# STEP 8.1.5a: MULTI-HUB TOPOLOGY VERIFICATION (ADDITIONAL PASSIVE HUBS)
+# =============================================================================
+# When additional passive hubs were recycled in Stage 06a, verify that their
+# passive sync Restore CRs were successfully recreated.
+
+- name: "[STAGE 08 - Verification] | 8.1.5a.1) Verify recycled Restore CR on additional passive hubs"
+  kubernetes.core.k8s_info:
+    context: "{{ item }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_passive_restore_name }}"
+  register: acm_dr_failover_manager_postflight_passive_restores
+  loop: "{{ acm_dr_failover_manager_reachable_passive_hubs | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+     if acm_dr_failover_manager_additional_passive_hubs is string
+     else acm_dr_failover_manager_additional_passive_hubs)
+    | default([], true) | length > 0
+  failed_when: false
+
+- name: "[STAGE 08 - Verification] | 8.1.5a.2) Build multi-hub topology verification data"
+  ansible.builtin.set_fact:
+    # Build a list of dicts with each passive hub's recycling and schedule status.
+    # Includes Restore CR presence (from 8.1.5a.1) and BackupSchedule state
+    # (from 8.1.4j) so the compliance report can show both per peer hub.
+    acm_dr_failover_manager_passive_hub_status: >-
+      {% set ns = namespace(hubs=[]) %}
+      {% for hub in (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+                     if acm_dr_failover_manager_additional_passive_hubs is string
+                     else acm_dr_failover_manager_additional_passive_hubs)
+                    | default([], true) %}
+        {% set reachable = hub in (acm_dr_failover_manager_reachable_passive_hubs | default([])) %}
+        {# Use selectattr instead of an inner for-loop to avoid Jinja2 scoping:
+           set inside a for-block creates a new scope, so the outer variable
+           stays false even when the inner set runs. selectattr resolves in a
+           single expression within the outer loop's scope. #}
+        {% set restore_matches = (acm_dr_failover_manager_postflight_passive_restores.results | default([])
+           | selectattr('item', 'equalto', hub) | list)
+           if (reachable and acm_dr_failover_manager_postflight_passive_restores is defined)
+           else [] %}
+        {% set restore_found = restore_matches | length > 0
+           and restore_matches[0].resources | default([]) | length > 0 %}
+        {% set schedule_matches = (acm_dr_failover_manager_peer_hub_schedule_info.results | default([])
+           | selectattr('item', 'equalto', hub) | list)
+           if (reachable and acm_dr_failover_manager_peer_hub_schedule_info is defined)
+           else [] %}
+        {% set schedule_active = schedule_matches | length > 0
+           and schedule_matches[0].resources | default([]) | length > 0
+           and not (schedule_matches[0].resources[0].spec.paused | default(false) | bool) %}
+        {% set _ = ns.hubs.append({'context': hub, 'reachable': reachable, 'restore_found': restore_found, 'schedule_active': schedule_active}) %}
+      {% endfor %}
+      {{ ns.hubs | to_json }}
+  when: >-
+    (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+     if acm_dr_failover_manager_additional_passive_hubs is string
+     else acm_dr_failover_manager_additional_passive_hubs)
+    | default([], true) | length > 0
+
+# =============================================================================
+# STEP 8.1.5b: MANAGED CLUSTER ADD-ON HEALTH CHECK
+# =============================================================================
+# Surfaces degraded ManagedClusterAddons as a visible warning in the job
+# stdout so operators see which Spokes have subsystem issues (scheduling
+# failures, expired leases, resource exhaustion) without having to parse
+# the full compliance report.
+
+- name: "[STAGE 08 - Verification] | 8.1.5b.1) ⚠️ Warn on Spokes with degraded ManagedClusterAddons"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [ADDON HEALTH] Spoke '{{ item.spoke }}' has {{ item.count }}/{{ item.total }} addon(s) degraded:
+      {{ item.addons | join(', ') }}.
+      Check ManagedClusterAddon status on the Hub (namespace '{{ item.spoke }}')
+      and verify addon pod scheduling / resource availability on the Spoke.
+  loop: "{{ _degraded_by_spoke }}"
+  loop_control:
+    label: "{{ item.spoke }}"
+  vars:
+    # Parse the JSON string from set_fact (8.1.5) back to a list for the loop
+    _degraded_by_spoke: >-
+      {{ (acm_dr_failover_manager_degraded_addons_by_spoke | from_json
+          if acm_dr_failover_manager_degraded_addons_by_spoke is string
+          else acm_dr_failover_manager_degraded_addons_by_spoke) | default([]) }}
+  when:
+    - acm_dr_failover_manager_warn_on_degraded_addons | default(true) | bool
+    - _degraded_by_spoke | length > 0
+
+- name: "[STAGE 08 - Verification] | 8.1.5b.2) 🛡️ ASSERT - Fail on degraded addons (optional gate)"
+  ansible.builtin.assert:
+    that:
+      - _degraded_flat | length == 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => {{ _degraded_flat | length }} degraded ManagedClusterAddon(s) found
+      across {{ _degraded_by_spoke | length }} Spoke(s): {{ _degraded_flat | join(', ') }}.
+      Set acm_dr_failover_manager_fail_on_degraded_addons=false to downgrade to a warning.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => All ManagedClusterAddons report Available: True across the fleet.
+  vars:
+    _degraded_flat: >-
+      {{ (acm_dr_failover_manager_degraded_addons_list | from_json
+          if acm_dr_failover_manager_degraded_addons_list is string
+          else acm_dr_failover_manager_degraded_addons_list)
+         | default([]) | select('truthy') | reject('equalto', '') | list }}
+    _degraded_by_spoke: >-
+      {{ (acm_dr_failover_manager_degraded_addons_by_spoke | from_json
+          if acm_dr_failover_manager_degraded_addons_by_spoke is string
+          else acm_dr_failover_manager_degraded_addons_by_spoke) | default([]) }}
+  when:
+    - acm_dr_failover_manager_fail_on_degraded_addons | default(false) | bool
+  run_once: true
+
+# =============================================================================
+# STEP 8.1.5c: SPOKE AUTO-IMPORT HEALTH CHECK
+# =============================================================================
+# Surfaces spokes with ManagedClusterImportSucceeded=False so the operator
+# sees which spokes need re-onboarding without parsing the full compliance
+# report. Each listed spoke requires the Spoke Onboarding JT (action=onboard)
+# to issue a fresh auto-import Secret and reinstall the klusterlet.
+
+- name: "[STAGE 08 - Verification] | 8.1.5c.1) ⚠️ Warn on spokes with failed auto-import on New Hub"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [SPOKE IMPORT] Spoke '{{ item.spoke }}' reports
+      ManagedClusterImportSucceeded={{ item.status }} (reason: {{ item.reason }})
+      on the new Hub ({{ passive_hub }}). The auto-import-account token was likely expired
+      at OADP backup time. Run the Spoke Onboarding JT (action=onboard) for this spoke to
+      issue a fresh token and reinstall the klusterlet.
+      Runbook: docs/runbook/acm-38215-auto-import-account.md
+  loop: "{{ _import_failed }}"
+  loop_control:
+    label: "{{ item.spoke }}"
+  vars:
+    _import_failed: >-
+      {{ (acm_dr_failover_manager_import_failed_spokes | from_json
+          if acm_dr_failover_manager_import_failed_spokes is string
+          else acm_dr_failover_manager_import_failed_spokes) | default([]) }}
+  when:
+    - _import_failed | length > 0
+
+- name: "[STAGE 08 - Verification] | 8.1.6) Display Consolidated Compliance Report"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/dr_compliance_report.j2').split('\n') }}"
+  run_once: true
+
+- name: "[STAGE 08 - Verification] | 8.1.7) 🛡️ ASSERT - Block Pipeline on Confirmed Split-Brain"
+  ansible.builtin.assert:
+    that:
+      # trim strips leading whitespace produced by the >- block scalar indentation
+      # in the set_fact at 8.1.5; without trim, "      True" | bool returns None
+      # (Ansible bool filter matches exact lowercase strings without strip).
+      - not (acm_dr_failover_manager_is_split_brain_detected | trim | bool)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [MISSION CRITICAL FAILURE]: {{ acm_dr_failover_manager_active_hub_count | int }} hub(s)
+      have an active BackupSchedule ({{ acm_dr_failover_manager_active_hub_list | from_json | join(', ') }}).
+      Exactly 1 is expected. Imminent risk of Storage corruption from concurrent writes.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Topology check passed. {{ acm_dr_failover_manager_active_hub_count | int }} active hub(s)
+      across {{ (2 + ((acm_dr_failover_manager_additional_passive_hubs | from_yaml
+                       if acm_dr_failover_manager_additional_passive_hubs is string
+                       else acm_dr_failover_manager_additional_passive_hubs)
+                      | default([], true) | length)) }} total.
+      Only the new leader ({{ passive_hub }}) is writing backups.
+  run_once: true
+...

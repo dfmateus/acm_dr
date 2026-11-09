@@ -1,0 +1,33 @@
+apiVersion: observability.open-cluster-management.io/v1beta2
+kind: MultiClusterObservability
+metadata:
+  name: observability
+spec:
+  advanced:
+    query:
+      replicas: 2
+    receive:
+      replicas: 3
+    retentionConfig:
+      retentionInLocal: 24h
+      retentionResolutionRaw: 30d
+      retentionResolution5m: 180d
+      retentionResolution1h: 1y
+  enableDownsampling: true
+  observabilityAddonSpec:
+    enableMetrics: true
+    interval: 300
+    scrapeSizeLimitBytes: 1073741824
+    workers: 1
+  storageConfig:
+    alertmanagerStorageSize: 1Gi
+    compactStorageSize: 100Gi
+    metricObjectStorage:
+      key: thanos.yaml
+      name: thanos-object-storage
+    receiveStorageSize: 100Gi
+    ruleStorageSize: 1Gi
+{% if acm_dr_hub_setup_observability_storage_class is defined and acm_dr_hub_setup_observability_storage_class | length > 0 %}
+    storageClass: "{{ acm_dr_hub_setup_observability_storage_class }}"
+{% endif %}
+    storeStorageSize: 70Gi

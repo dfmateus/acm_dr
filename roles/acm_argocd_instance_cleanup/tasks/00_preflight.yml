@@ -1,0 +1,63 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/00_preflight.yml
+# =============================================================================
+# STAGE 00: PARAMETER VALIDATION AND SAFETY GATE
+# =============================================================================
+
+- name: "[PREFLIGHT] | 0.1) Assert required parameters"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.name) | default('') | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => The variable '{{ item.name }}' is required to remove
+      an ArgoCD instance. Example: -e acm_argocd_instance_cleanup_name="my-instance"
+      -e acm_argocd_instance_cleanup_namespace="my-argocd-namespace".
+    success_msg: "✅ PASSED! Oh. Yes! => '{{ item.name }}' validated."
+  loop:
+    - { name: "acm_argocd_instance_cleanup_name" }
+    - { name: "acm_argocd_instance_cleanup_namespace" }
+    - { name: "k8s_target_context" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "[PREFLIGHT] | 0.2) 🛡️ SAFETY LOCK - Require explicit confirmation for destructive operation"
+  ansible.builtin.assert:
+    that:
+      - acm_argocd_instance_cleanup_confirm | default(false) | bool
+    fail_msg:
+      - "❌ FAILED! Oh. No! => This role PERMANENTLY removes the ArgoCD instance"
+      - "   '{{ acm_argocd_instance_cleanup_name }}' (namespace '{{ acm_argocd_instance_cleanup_namespace }}')"
+      - "   on context '{{ k8s_target_context }}', including Applications/ApplicationSet,"
+      - "   cluster-scoped RBAC, ConsoleLink and (if configured) the managed namespaces."
+      - "---------------------------------------------------------------------------------"
+      - " To confirm, re-run adding: -e acm_argocd_instance_cleanup_confirm=true"
+      - " 💡 Tip: run first with '-e acm_argocd_instance_cleanup_dry_run=true' to see"
+      - "    exactly what would be removed, without applying any actual changes."
+      - "---------------------------------------------------------------------------------"
+    success_msg: "✅ PASSED! Oh. Yes! => Explicit confirmation received. Proceeding with removal."
+
+- name: "[PREFLIGHT] | 0.3) Validate cluster connectivity - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ acm_argocd_instance_cleanup_namespace }}"
+  register: acm_argocd_instance_cleanup_ns_check
+  ignore_errors: true
+
+- name: "[PREFLIGHT] | 0.4) Assert connectivity - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - not acm_argocd_instance_cleanup_ns_check.failed | default(false)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Access to context '{{ k8s_target_context }}' failed.
+      Run 'oc login'/renew the token and try again.
+    success_msg: "✅ PASSED! Oh. Yes! => Connectivity with '{{ k8s_target_context }}' validated."
+
+- name: "[PREFLIGHT] | 0.5) ℹ️ Inform if the instance no longer exists (idempotency)"
+  ansible.builtin.debug:
+    msg: >-
+      ℹ️  [IDEMPOTENT]: the namespace '{{ acm_argocd_instance_cleanup_namespace }}' no longer exists
+      on context '{{ k8s_target_context }}'. The next stages will be no-op.
+  when: acm_argocd_instance_cleanup_ns_check.resources | default([]) | length == 0
+...

@@ -1,0 +1,17 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 04 - MULTI-INSTANCE GITOPS FULLY DEPLOYED & READY
+{{ _sep }}
+ 🎯 TARGET CONTEXT:         {{ k8s_target_context }}
+ 📂 GITOPS OPERATOR NS:    {{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}
+ 🌐 URL ARGOCD GOVERNANCE: https://{{ acm_dr_hub_setup_route_acm.resources[0].spec.host | default('N/A') }}
+ 🌐 URL ARGOCD APPDEMO:    https://{{ acm_dr_hub_setup_route_demo.resources[0].spec.host | default('N/A') }}
+ 🔌 CONSOLE PLUGIN:        ENABLED (gitops-plugin)
+{{ _sep }}
+ ⚠️  UI NOTE (Transparency):
+ Please note that whenever this automation runs on a cluster
+ for the first time, administrators logged into Red Hat OpenShift
+ will see a small yellow banner requesting a screen refresh
+ to load the new GitOps module. No service disruption
+ occurs on the cluster during this process.
+{{ _sep }}

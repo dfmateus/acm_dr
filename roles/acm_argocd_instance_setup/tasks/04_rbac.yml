@@ -1,0 +1,28 @@
+---
+# roles/acm_argocd_instance/tasks/04_rbac.yml
+# =============================================================================
+# STAGE 04: CLUSTER-SCOPED RBAC (CONDITIONAL)
+# =============================================================================
+# Field Finding (inherited from acm_dr_hub_setup): without this binding, the
+# application-controller can only manage NAMESPACED resources within the
+# instance's own namespace -- any Application with a destination.namespace
+# different from the instance's namespace fails due to insufficient permissions.
+
+- name: "[RBAC] | 4.1) Apply cluster-admin ClusterRoleBinding for the application-controller - {{ acm_argocd_instance_setup_name }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "argo-admin-{{ acm_argocd_instance_setup_name }}-{{ k8s_target_context }}"
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ acm_argocd_instance_setup_name }}-argocd-application-controller"
+          namespace: "{{ acm_argocd_instance_setup_namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+...

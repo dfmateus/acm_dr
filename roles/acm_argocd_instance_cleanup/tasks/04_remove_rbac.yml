@@ -1,0 +1,19 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/04_remove_rbac.yml
+# =============================================================================
+# STAGE 04: REMOVE CLUSTER-SCOPED RBAC (CLUSTER-SCOPED RESOURCE)
+# =============================================================================
+# Runs AFTER Application removal (Stage 01) on purpose: the
+# application-controller still needed cluster-admin to be able to prune
+# resources outside the instance's own namespace during the prune.
+
+- name: "[REMOVE RBAC] | 4.1) Remove cluster-admin ClusterRoleBinding - {{ acm_argocd_instance_cleanup_name }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: "argo-admin-{{ acm_argocd_instance_cleanup_name }}-{{ k8s_target_context }}"
+  check_mode: "{{ acm_argocd_instance_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+...

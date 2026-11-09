@@ -1,0 +1,326 @@
+---
+# roles/acm_dr_hub_setup/defaults/main.yml
+# =============================================================================
+# DEFAULT VARIABLES FILE FOR THE ACM_DR_LAB_SETUP ROLE
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. AESTHETIC PARAMETERS, LOGGING, AND HUB CONTROL (CONSOLE / AWX UX)
+# -----------------------------------------------------------------------------
+acm_dr_hub_setup_separator_char: "="
+acm_dr_hub_setup_default_message_padding: 4
+acm_dr_hub_setup_primary_hub_context: "acm-primary-hub"
+
+# Suppresses task output for security-sensitive operations (tokens, secrets,
+# kubeconfig content). Override via ACM_DR_DEBUG_NO_LOG=false in env-setup.sh
+# or with -e acm_dr_hub_setup_debug_no_log=false for a one-off run.
+# WARNING: setting false exposes secrets in logs - lab/troubleshooting only.
+acm_dr_hub_setup_debug_no_log: >-
+  {{ lookup('ansible.builtin.env', 'ACM_DR_DEBUG_NO_LOG')
+     | default('true', true) | bool }}
+
+# Generic Primary Hub flag - defaults to false (PASSIVE) so a new hub joining
+# an existing topology never accidentally becomes a second active primary.
+# Set -e is_primary_hub=true explicitly only for the first hub in the topology.
+is_primary_hub: false # noqa var-naming[no-role-prefix]
+
+# Role-namespaced variable for Primary/Active Hub identification
+acm_dr_hub_setup_is_primary_hub: "{{ is_primary_hub | default(false) | bool }}"
+
+# DR Topology Detection: queries BackupSchedule, Restore CRs, DPA, and BSL
+# on the target cluster at preflight to determine its current DR role before
+# provisioning. Disable only on truly fresh clusters where ACM CRDs may not
+# exist yet (the queries use failed_when: false, so missing CRDs are safe).
+acm_dr_hub_setup_topology_detection: true  # bool -- enable DR artifact discovery at preflight
+
+# When true, allows acm_dr_hub_setup to proceed even if the target cluster
+# already has DR artifacts (BackupSchedule, passive sync Restore, DPA).
+# Default false: fails with a diagnostic message requiring the user to
+# acknowledge the existing DR state before re-provisioning or adding a new
+# passive hub to the topology.
+acm_dr_hub_setup_allow_existing_dr: false  # bool -- force flag for existing DR topology
+
+# -----------------------------------------------------------------------------
+# 1. CLOUD PROVIDER SELECTOR
+# -----------------------------------------------------------------------------
+# Determines which cloud storage backend is provisioned for OADP backups and
+# Thanos observability. Azure provisions a Storage Account with Blob containers;
+# AWS provisions S3 buckets. The provider controls which Stage 01 task file runs,
+# which OADP/Thanos templates are rendered, and which credential assertions fire
+# at preflight. On OCP clusters the topology resolver (acm_dr_kubeconfig_resolver)
+# can auto-detect the platform from Infrastructure.status.platform, but the
+# cloud_provider variable must still be set explicitly because a Hub running on
+# Azure could back up to S3 (or vice versa).
+acm_dr_hub_setup_cloud_provider: "azure"  # string - "azure" or "aws"
+
+# -----------------------------------------------------------------------------
+# 1a. AZURE CREDENTIALS AND RESOURCE IDENTIFICATION
+# -----------------------------------------------------------------------------
+
+# Optional shorthand identifier from Red Hat Open Environment provisioning.
+# When provided, constructs the Storage Account name as 'acmsa<guid>' and the
+# Resource Group fallback as 'openenv-<guid>'. Not needed when providing
+# acm_dr_hub_setup_azure_storage_account_name and
+# acm_dr_hub_setup_azure_resource_group directly (via extra-var, AAP survey,
+# or AZURE_STORAGE_ACCOUNT / RESOURCEGROUP env vars).
+acm_dr_hub_setup_guid: "{{ lookup('ansible.builtin.env', 'GUID') | default('', true) }}"
+
+# AAP's built-in "Microsoft Azure Resource Manager" credential type injects
+# AZURE_SUBSCRIPTION_ID, AZURE_TENANT, AZURE_CLIENT_ID, AZURE_SECRET.
+# The local env-setup.sh script exports SUBSCRIPTION, TENANT, CLIENT_ID, PASSWORD.
+# Each default tries the AAP name first, then the legacy name, then placeholder.
+acm_dr_hub_setup_azure_subscription_id: >-
+  {{ lookup('ansible.builtin.env', 'AZURE_SUBSCRIPTION_ID')
+     | default(lookup('ansible.builtin.env', 'SUBSCRIPTION'), true)
+     | default('00000000-0000-0000-0000-000000000000', true) }}
+acm_dr_hub_setup_azure_tenant_id: >-
+  {{ lookup('ansible.builtin.env', 'AZURE_TENANT')
+     | default(lookup('ansible.builtin.env', 'TENANT'), true)
+     | default('00000000-0000-0000-0000-000000000000', true) }}
+acm_dr_hub_setup_azure_client_id: >-
+  {{ lookup('ansible.builtin.env', 'AZURE_CLIENT_ID')
+     | default(lookup('ansible.builtin.env', 'CLIENT_ID'), true)
+     | default('00000000-0000-0000-0000-000000000000', true) }}
+acm_dr_hub_setup_azure_client_secret: >-
+  {{ lookup('ansible.builtin.env', 'AZURE_SECRET')
+     | default(lookup('ansible.builtin.env', 'PASSWORD'), true)
+     | default('', true) }}
+acm_dr_hub_setup_azure_storage_account_key: "{{ lookup('ansible.builtin.env', 'AZURE_STORAGE_KEY') | default('', true) }}"
+
+# Azure Resource Group for storage resources. Resolution order:
+# 1. Extra-var: -e acm_dr_hub_setup_azure_resource_group=my-rg
+# 2. RESOURCEGROUP env var (env-setup.sh)
+# 3. AZURE_RESOURCE_GROUP env var (AAP or custom credential types)
+# 4. Constructed from GUID: openenv-<guid> (backward compatible)
+acm_dr_hub_setup_azure_resource_group: >-
+  {{ lookup('ansible.builtin.env', 'RESOURCEGROUP')
+     | default(lookup('ansible.builtin.env', 'AZURE_RESOURCE_GROUP'), true)
+     | default('openenv-' ~ acm_dr_hub_setup_guid, true) }}
+# string - Azure region for storage account deployment
+acm_dr_hub_setup_azure_location: >-
+  {{ lookup('ansible.builtin.env', 'AZURE_LOCATION')
+     | default('eastus', true) }}
+
+# -----------------------------------------------------------------------------
+# 2. AZURE BLOB STORAGE AND CONTAINER SETTINGS
+# -----------------------------------------------------------------------------
+acm_dr_hub_setup_azure_storage_allow_reuse: false
+
+# Azure Storage Account name (globally unique across Azure, 3-24 chars,
+# lowercase letters + digits only). Shared between BOTH Hubs in the DR pair -
+# do NOT encode a hub role (primary/secondary) or hub number in this name.
+# Convention: <project><env><region>oadp (e.g., acmdrlabeastusoadp for the lab).
+# Resolution order:
+# 1. AZURE_STORAGE_ACCOUNT env var - injected by the Azure SP AAP credential
+# 2. acmsa<GUID> - RHDP labs always have GUID set in the environment
+# 3. acmdrlabeastusoadp - lab static fallback when neither source is available
+acm_dr_hub_setup_azure_storage_account_name: >-
+  {{ lookup('ansible.builtin.env', 'AZURE_STORAGE_ACCOUNT')
+     | default(('acmsa' ~ acm_dr_hub_setup_guid)
+               if acm_dr_hub_setup_guid | length > 0
+               else 'acmdrlabeastusoadp', true) }}
+acm_dr_hub_setup_computed_storage_account: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+acm_dr_hub_setup_azure_container_backup: "acm-backup"
+acm_dr_hub_setup_azure_container_observability: "acm-observability"
+
+# NOTE: Azure Storage Service Encryption (SSE) encrypts all data at rest by
+# default using Microsoft-managed keys. Customer-managed keys (CMK) via Azure
+# Key Vault can be configured at the storage account level if required by
+# organizational policy. No additional OADP/Velero configuration is needed.
+# https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index
+
+# -----------------------------------------------------------------------------
+# 1c. AWS CREDENTIALS AND S3 STORAGE (ONLY WHEN cloud_provider=aws)
+# -----------------------------------------------------------------------------
+# IAM credentials for S3 bucket provisioning and Thanos/OADP access.
+# Injected by AAP's custom "ACM DR - AWS IAM Credentials" credential type
+# or exported from the local shell (export AWS_ACCESS_KEY_ID=...).
+acm_dr_hub_setup_aws_access_key_id: "{{ lookup('ansible.builtin.env', 'AWS_ACCESS_KEY_ID') | default('', true) }}"
+acm_dr_hub_setup_aws_secret_access_key: "{{ lookup('ansible.builtin.env', 'AWS_SECRET_ACCESS_KEY') | default('', true) }}"
+acm_dr_hub_setup_aws_region: "{{ lookup('ansible.builtin.env', 'AWS_DEFAULT_REGION') | default('us-east-1', true) }}"
+
+# S3 bucket names (globally unique across all AWS accounts). Both Hubs in a DR
+# pair must share the same buckets. Separate buckets for OADP backups and Thanos
+# metrics keep lifecycle policies and access patterns independent.
+acm_dr_hub_setup_aws_s3_bucket_backup: ""  # string - S3 bucket for OADP/Velero backups (must be globally unique)
+acm_dr_hub_setup_aws_s3_bucket_observability: ""  # string - S3 bucket for Thanos observability history
+acm_dr_hub_setup_aws_s3_bucket_prefix: "hub"  # string - key prefix inside the backup bucket (partitions by Hub)
+
+# Safety lock for existing S3 resources (same pattern as Azure)
+acm_dr_hub_setup_aws_storage_allow_reuse: false  # bool - allow reuse of pre-existing S3 buckets
+
+# Optional: KMS key ID for S3 server-side encryption. When empty, AWS uses the
+# default SSE-S3 encryption (AES-256). Set to a KMS key ARN to use SSE-KMS.
+# https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index
+acm_dr_hub_setup_aws_kms_key_id: ""  # string - KMS key ARN for S3 server-side encryption (optional)
+
+# -----------------------------------------------------------------------------
+# 3. RED HAT ACM & MULTICLUSTERHUB SETTINGS
+# -----------------------------------------------------------------------------
+acm_dr_hub_setup_mch_channel: "{{ lookup('ansible.builtin.env', 'ACM_CHANNEL') | default('release-2.14', true) }}"
+acm_dr_hub_setup_mch_namespace: "open-cluster-management"
+acm_dr_hub_setup_mch_name: "multiclusterhub"
+acm_dr_hub_setup_mch_pull_secret: "rhacm-pull-secret"
+
+# -----------------------------------------------------------------------------
+# 4. GITOPS CREDENTIALS AND REPOSITORIES (GITHUB / ARGOCD)
+# -----------------------------------------------------------------------------
+# Set false to skip Stage 04 (OpenShift GitOps / ArgoCD install and repo Secret creation).
+# When false, the GitHub PAT credential is not required at launch.
+# When true, GITHUB_USER / GITHUB_PAT / GITHUB_REPO must be set (via credential or env var).
+acm_dr_hub_setup_enable_gitops: true
+
+# Optional when enable_gitops=false - set GITHUB_REPO env var or pass via extra-vars
+acm_dr_hub_setup_github_repo_url: "{{ lookup('ansible.builtin.env', 'GITHUB_REPO') | default('', true) }}"
+# Optional when enable_gitops=false - set GITHUB_USER env var or pass via extra-vars
+acm_dr_hub_setup_github_username: "{{ lookup('ansible.builtin.env', 'GITHUB_USER') | default('', true) }}"
+acm_dr_hub_setup_github_pat: "{{ lookup('ansible.builtin.env', 'GITHUB_PAT') | default('', true) }}"
+
+# -----------------------------------------------------------------------------
+# RED HAT OPENSHIFT GITOPS SETTINGS (ARGOCD MULTI-INSTANCE)
+# -----------------------------------------------------------------------------
+acm_dr_hub_setup_gitops_operator_namespace: "openshift-gitops-operator"
+acm_dr_hub_setup_gitops_channel: "auto"
+acm_dr_hub_setup_gitops_approval: "Automatic"
+acm_dr_hub_setup_gitops_starting_csv: ""
+acm_dr_hub_setup_gitops_namespace_acm: "openshift-gitops-acm"
+acm_dr_hub_setup_policies_namespace: "acm-policies"          # namespace for ACM governance policies
+acm_dr_hub_setup_github_policies_path: "policies"             # git repository directory containing governance policies
+acm_dr_hub_setup_gitops_namespace_appdemo: "openshift-gitops-appdemo"
+acm_dr_hub_setup_github_target_revision: "main"
+
+# RHACM integration object names for the Governance ArgoCD instance
+acm_dr_hub_setup_appset_policies_name: "governance-policies"    # ApplicationSet name for ACM governance policies
+acm_dr_hub_setup_placement_name: "hub-governance-placement"     # Placement name for RHACM hub registration (local-cluster)
+acm_dr_hub_setup_gitops_cluster_name: "hub-governance-gitops"   # GitOpsCluster name linking the Governance ArgoCD instance to RHACM
+
+# Demo workload names for the AppDemo ArgoCD instance (set acm_dr_hub_setup_enable_gitops_appdemo=false to skip)
+acm_dr_hub_setup_appset_demo_name: "demo-workloads"    # ApplicationSet name for demo workloads
+acm_dr_hub_setup_demo_app1_name: "demo-app-01"         # namespace and appName for the first demo application
+acm_dr_hub_setup_demo_app1_path: "demo-app-01"         # git repository directory for the first demo application
+acm_dr_hub_setup_demo_app2_name: "demo-app-02"         # namespace and appName for the second demo application
+acm_dr_hub_setup_demo_app2_path: "demo-app-02"         # git repository directory for the second demo application
+
+# -----------------------------------------------------------------------------
+# 5. OADP SETTINGS (VELERO / BACKUP & DR)
+# -----------------------------------------------------------------------------
+acm_dr_hub_setup_oadp_namespace: "open-cluster-management-backup"
+acm_dr_hub_setup_acm_backup_namespace: "open-cluster-management-backup"
+acm_dr_hub_setup_oadp_dpa_name: "dpa-hub"
+
+# Maximum allowed length for the DPA name. The DPA name becomes part of
+# a Kubernetes Route (Velero/OADP BSL access), which enforces a 63-character
+# limit on the name field per RFC 1123. Validated at preflight (Stage 00).
+acm_dr_hub_setup_dpa_name_max_length: 63  # int -- Route name character limit
+
+# OADP credential Secret name. Used in the DPA credential reference and cleanup.
+# OADP 1.4.x (MCH 2.14 / ACM 2.14) for Azure requires the literal name
+# "cloud-credentials-azure" - the Velero Azure plugin resolves credentials by
+# this name regardless of the DPA credential.name field. For AWS / OADP 1.6+,
+# "cloud-credentials" is correct. The default here is provider-conditional so
+# both paths work without callers needing to set this explicitly.
+acm_dr_hub_setup_oadp_cloud_secret_name: >-
+  {{ 'cloud-credentials-azure'
+     if (acm_dr_hub_setup_cloud_provider | default('azure')) == 'azure'
+     else 'cloud-credentials' }}
+
+# ACM-managed backup schedule name (Aligned with acm_dr_failover_manager)
+acm_dr_hub_setup_schedule_name: "schedule-acm-hub"
+acm_dr_hub_setup_backup_cron_schedule: "0 */2 * * *"
+acm_dr_hub_setup_backup_ttl: "120h"
+
+# Suppress the immediate first backup that ACM fires on BackupSchedule creation.
+# When true, the first backup waits for the next cron interval instead of firing
+# at T+0. Useful during maintenance windows where an immediate backup is undesirable.
+acm_dr_hub_setup_backup_no_backup_on_start: false  # bool - suppress immediate first backup
+
+# ManagedServiceAccount token rotation interval for the BackupSchedule.
+# Controls how often MSA tokens are rotated. Empty string means ACM default.
+# Requires RHACM 2.16+. Example: "720h0m0s" (30 days).
+acm_dr_hub_setup_managed_service_account_ttl: ""  # duration - MSA token rotation interval, empty = ACM default
+
+# Standardized OADP Operator Subscription name and OLM channel. On non-STS
+# clusters (e.g. ARO), the MCH cluster-backup component auto-provisions the
+# OADP Subscription. On AWS/STS clusters (e.g. ROSA HCP), the operator must
+# be installed manually before enabling cluster-backup. The channel must match
+# what MCH would install so OLM does not see a conflicting Subscription.
+# Determined from a live ARO Hub: oc get subscription.operators.coreos.com
+#   -n open-cluster-management-backup --context your-hub-01-sa
+acm_dr_hub_setup_oadp_subscription_name: "redhat-oadp-operator"
+# Fallback OLM channel; task 5.1.1b resolves the actual channel from PackageManifest
+# defaultChannel (varies by OCP version: "stable-1.4" on 4.18, "stable" on 4.22+)
+acm_dr_hub_setup_oadp_channel: "stable-1.4"
+acm_dr_hub_setup_oadp_source: "redhat-operators"  # string - CatalogSource name for the OADP Subscription
+acm_dr_hub_setup_oadp_operatorgroup_name: "redhat-oadp-operator-group"  # string - OperatorGroup name in the backup namespace
+acm_dr_hub_setup_oadp_subscription_cr_name: "redhat-oadp-operator-subscription"  # string - Subscription CR metadata.name (matches MCH-generated name)
+
+# Passive sync Restore: continuously pulls credentials and resources from shared
+# storage on passive/DR hubs (syncRestoreWithNewBackups: true). Keeps the passive
+# hub pre-positioned for faster failover activation. Per RHACM 2.17 official docs:
+# https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index#active-passive-config
+acm_dr_hub_setup_passive_restore_enabled: true  # bool - create passive sync Restore CR on non-primary hubs (set false to disable)
+acm_dr_hub_setup_passive_restore_name: "restore-passive-sync"  # string - Restore CR metadata.name on passive hubs
+acm_dr_hub_setup_passive_restore_sync_interval: "30m"  # duration - how often to check for new backups (maps to Restore.spec.restoreSyncInterval)
+
+# DPA Velero pod resource limits for large fleets. Per RHACM 2.17 official docs:
+# - 2000+ managed clusters: requests cpu 2, memory 4Gi
+# - 3500+ managed clusters: limits cpu 4, memory 8Gi
+# Set to empty dict {} to use Kubernetes default resource allocations (sufficient
+# for most deployments under 2000 managed clusters).
+# https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index
+acm_dr_hub_setup_dpa_resource_requests: {}  # dict - minimum guaranteed CPU/memory for Velero pod (e.g. { cpu: "2", memory: "4Gi" })
+acm_dr_hub_setup_dpa_resource_limits: {}    # dict - maximum CPU/memory ceiling for Velero pod (e.g. { cpu: "4", memory: "8Gi" })
+
+# --- BACKUP HEALTH MONITORING (PROMETHEUSRULE) ---
+# Optional PrometheusRule that monitors the ACM backup pipeline health via
+# two alerts. Disabled by default to avoid breaking existing deployments
+# that lack the monitoring.coreos.com CRD or Prometheus Operator.
+
+# Deploy the backup health PrometheusRule on this Hub.
+acm_dr_hub_setup_prometheusrule_enabled: false  # bool - deploy backup health PrometheusRule
+
+# Name of the PrometheusRule CR in the backup namespace.
+acm_dr_hub_setup_prometheusrule_name: "acm-dr-backup-health"  # string - PrometheusRule CR name
+
+# How long the backup-restore-enabled Policy must be NonCompliant before
+# the ACMBackupPolicyNonCompliant alert fires.
+acm_dr_hub_setup_policy_noncompliant_threshold: "15m"  # duration - policy non-compliance alert threshold
+
+# Maximum age of the last successful validation backup before the
+# VeleroBackupStale alert fires. Human-readable form for documentation.
+acm_dr_hub_setup_backup_stale_threshold: "7h"  # duration - stale backup alert threshold (human-readable)
+
+# Same threshold in seconds for the PromQL expression. Must match
+# backup_stale_threshold. 7h = 25200 seconds.
+acm_dr_hub_setup_backup_stale_seconds: 25200  # seconds (7 hours) - stale backup alert threshold for PromQL
+
+# Lookback window for counting Velero backup failures (VeleroBackupFailed alert).
+acm_dr_hub_setup_backup_failure_lookback: "1h"  # duration - PromQL lookback for velero_backup_failure_total
+
+# Lookback window for counting partial backup failures (VeleroBackupPartiallyFailed alert).
+acm_dr_hub_setup_backup_partial_failure_lookback: "1h"  # duration - PromQL lookback for partial failures
+
+# How long the Velero pod must be absent/not-running before the VeleroPodNotReady alert fires.
+acm_dr_hub_setup_velero_pod_unhealthy_threshold: "5m"  # duration - tolerable Velero pod restart window
+
+# Number of NonCompliant policy templates (policy_governance_info metric) that triggers the
+# ACMBackupPolicySevereDegradation alert. The existing ACMBackupPolicyNonCompliant alert fires
+# at > 0; this alert targets severe systemic failures where 4+ templates fail simultaneously.
+acm_dr_hub_setup_policy_severe_threshold: 3  # count - NonCompliant template count for severe alert
+
+# -----------------------------------------------------------------------------
+# 6. OBSERVABILITY SETTINGS (THANOS / MULTICLUSTEROBSERVABILITY)
+# -----------------------------------------------------------------------------
+acm_dr_hub_setup_observability_namespace: "open-cluster-management-observability"
+# Empty string triggers auto-discovery: 03_observability.yml queries the cluster's
+# StorageClass resources and picks the one annotated as default. Works across
+# ARO Classic (managed-csi), ARO HCP (managed-csi), and any future distribution.
+acm_dr_hub_setup_observability_storage_class: ""
+
+# -----------------------------------------------------------------------------
+# 7. AUTOMATION SETTINGS (IDENTITY AND ZEROTRUST RBAC)
+# -----------------------------------------------------------------------------
+acm_dr_hub_setup_automation_namespace: "ansible-automation"
+acm_dr_hub_setup_automation_sa_name: "ansible-dr-orchestrator"
+acm_dr_hub_setup_automation_secret_name: "ansible-dr-orchestrator-token"
+...

@@ -1,0 +1,148 @@
+---
+# CI pipeline for dfmateus.acm_dr collection.
+# Runs on every PR targeting main and on pushes to main.
+# Gates: yamllint, markdownlint, ansible-lint, shellcheck, ansible-test sanity,
+# playbook syntax-check, molecule, collection build.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install ansible-core ansible-lint yamllint molecule molecule-plugins
+          ansible-galaxy collection install -r collections/requirements.yml
+
+      - name: yamllint
+        run: yamllint .
+
+      - name: markdownlint
+        run: npx markdownlint-cli2 "**/*.md"
+
+      - name: ansible-lint
+        run: ansible-lint .
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get install -y shellcheck
+          find examples/scripts/ -name '*.sh' -exec shellcheck {} +
+
+  sanity:
+    name: Sanity (ansible-core ${{ matrix.ansible }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible:
+          - "2.18"
+          - "2.19"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: ansible_collections/dfmateus/acm_dr
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core
+        run: pip install "ansible-core~=${{ matrix.ansible }}.0"
+
+      - name: Install collection dependencies
+        run: ansible-galaxy collection install -r collections/requirements.yml
+        working-directory: ansible_collections/dfmateus/acm_dr
+
+      - name: Run ansible-test sanity
+        run: ansible-test sanity --docker -v --color
+        working-directory: ansible_collections/dfmateus/acm_dr
+
+  syntax-check:
+    name: Syntax check
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install ansible-core
+          ansible-galaxy collection install -r collections/requirements.yml
+
+      - name: Syntax-check all playbooks
+        run: |
+          for pb in playbooks/*.yml; do
+            echo "--- Checking ${pb} ---"
+            ansible-playbook "${pb}" --syntax-check
+          done
+
+  molecule:
+    name: Molecule
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install ansible-core molecule molecule-plugins
+          ansible-galaxy collection install -r collections/requirements.yml
+
+      - name: Run molecule default scenario
+        run: molecule test
+
+  collection-build:
+    name: Build collection
+    needs: [syntax-check, molecule, sanity]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core
+        run: pip install ansible-core
+
+      - name: Build collection tarball
+        run: ansible-galaxy collection build --output-path dist/
+
+      - name: Upload collection artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collection-tarball
+          path: dist/*.tar.gz
+          retention-days: 30

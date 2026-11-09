@@ -1,0 +1,243 @@
+---
+# =============================================================================
+# STEP 0.5b: DR TOPOLOGY DETECTION ON TARGET CLUSTER
+# =============================================================================
+# Queries the target cluster for existing DR artifacts (BackupSchedule, Restore
+# CRs, DPA, BSL) to determine whether it already participates in a DR topology.
+# This prevents accidental re-provisioning and validates that the declared hub
+# type (is_primary_hub) matches the actual cluster state.
+#
+# All k8s_info queries use failed_when: false because the CRDs may not exist on
+# a fresh cluster where ACM has never been installed. A failed query produces an
+# empty result, which is classified as "none" (no DR artifacts).
+
+# =============================================================================
+# STEP 0.5b.1: DISCOVER DR ARTIFACTS ON TARGET CLUSTER
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.5b.1.1) Discover BackupSchedule on target cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+    name: "{{ acm_dr_hub_setup_schedule_name | default('schedule-acm-hub') }}"
+  register: acm_dr_hub_setup_detected_schedule
+  # CRD may not exist on a fresh cluster -- treat as "no schedule found"
+  failed_when: false
+
+- name: "[STAGE 00 - Preflight] | 0.5b.1.2) Discover Restore CRs on target cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_detected_restores
+  # CRD may not exist on a fresh cluster -- treat as "no restores found"
+  failed_when: false
+
+- name: "[STAGE 00 - Preflight] | 0.5b.1.3) Discover DataProtectionApplication on target cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: oadp.openshift.io/v1alpha1
+    kind: DataProtectionApplication
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+    name: "{{ acm_dr_hub_setup_oadp_dpa_name | default('dpa-hub') }}"
+  register: acm_dr_hub_setup_detected_dpa
+  # CRD may not exist on a fresh cluster -- treat as "no DPA found"
+  failed_when: false
+
+- name: "[STAGE 00 - Preflight] | 0.5b.1.4) Discover BackupStorageLocations on target cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: velero.io/v1
+    kind: BackupStorageLocation
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_detected_bsl
+  # CRD may not exist on a fresh cluster -- treat as "no BSL found"
+  failed_when: false
+
+# =============================================================================
+# STEP 0.5b.2: CLASSIFY DETECTED DR ROLE
+# =============================================================================
+# Derives the cluster's current DR role from the detected artifacts:
+#   - "active"  : BackupSchedule exists AND is NOT paused (this is the leader)
+#   - "passive" : a Restore CR with syncRestoreWithNewBackups=true exists
+#   - "fenced"  : BackupSchedule exists AND IS paused (post-failover state)
+#   - "partial" : DPA exists but no BackupSchedule and no sync Restore
+#   - "none"    : no DR artifacts found (fresh cluster)
+
+- name: "[STAGE 00 - Preflight] | 0.5b.2.1) Classify detected DR role from discovered artifacts - {{ k8s_target_context }}"
+  ansible.builtin.set_fact:
+    # Whether a BackupSchedule was found on the target cluster
+    acm_dr_hub_setup_detected_schedule_exists: >-
+      {{ (acm_dr_hub_setup_detected_schedule.resources | default([]) | length > 0) }}
+    # Whether the detected BackupSchedule is paused (fenced state after failover)
+    acm_dr_hub_setup_detected_schedule_paused: >-
+      {{
+        (acm_dr_hub_setup_detected_schedule.resources | default([]) | length > 0) and
+        (acm_dr_hub_setup_detected_schedule.resources[0].spec.paused | default(false) | bool)
+      }}
+    # Count of Restore CRs with syncRestoreWithNewBackups=true (passive sync)
+    acm_dr_hub_setup_detected_sync_restore_count: >-
+      {{
+        acm_dr_hub_setup_detected_restores.resources | default([])
+        | selectattr('spec.syncRestoreWithNewBackups', 'defined')
+        | selectattr('spec.syncRestoreWithNewBackups', 'equalto', true)
+        | list | length
+      }}
+    # Whether a DataProtectionApplication was found
+    acm_dr_hub_setup_detected_dpa_exists: >-
+      {{ (acm_dr_hub_setup_detected_dpa.resources | default([]) | length > 0) }}
+    # Whether any BackupStorageLocation was found with Available phase
+    acm_dr_hub_setup_detected_bsl_available: >-
+      {{
+        acm_dr_hub_setup_detected_bsl.resources | default([])
+        | selectattr('status.phase', 'defined')
+        | selectattr('status.phase', 'equalto', 'Available')
+        | list | length > 0
+      }}
+
+- name: "[STAGE 00 - Preflight] | 0.5b.2.2) Derive DR role classification - {{ k8s_target_context }}"
+  ansible.builtin.set_fact:
+    # Classify the cluster's DR role based on detected artifacts
+    acm_dr_hub_setup_detected_dr_role: >-
+      {% if acm_dr_hub_setup_detected_schedule_exists | bool and not acm_dr_hub_setup_detected_schedule_paused | bool %}active
+      {% elif acm_dr_hub_setup_detected_sync_restore_count | int > 0 %}passive
+      {% elif acm_dr_hub_setup_detected_schedule_exists | bool and acm_dr_hub_setup_detected_schedule_paused | bool %}fenced
+      {% elif acm_dr_hub_setup_detected_dpa_exists | bool %}partial
+      {% else %}none
+      {% endif %}
+    # True if any DR-relevant artifact exists on the target cluster
+    acm_dr_hub_setup_detected_has_dr_artifacts: >-
+      {{
+        (acm_dr_hub_setup_detected_schedule_exists | bool) or
+        (acm_dr_hub_setup_detected_sync_restore_count | int > 0) or
+        (acm_dr_hub_setup_detected_dpa_exists | bool)
+      }}
+
+# =============================================================================
+# STEP 0.5b.3: HUB TYPE vs ACTUAL STATE MISMATCH WARNING (NON-BLOCKING)
+# =============================================================================
+# Warns (but does not block) when the declared hub type conflicts with what
+# was actually detected on the cluster. This catches operator errors such as
+# running with is_primary_hub=true on a cluster that is already serving as a
+# passive DR hub (has a sync Restore), or vice versa.
+
+- name: "[STAGE 00 - Preflight] | 0.5b.3.1) 🛡️ TOPOLOGY GUARD - declared PRIMARY but detected PASSIVE"
+  # Blocks setup when the operator passes is_primary_hub=true on a cluster that
+  # is already serving as a passive DR hub. Prevents creating a second active
+  # primary in a shared-storage topology (the exact scenario that caused
+  # Hub-03 to silently become a competing primary alongside Hub-01/Hub-02).
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_allow_existing_dr | default(false) | bool
+    fail_msg:
+      - "❌ FAILED! Oh. No! => [TOPOLOGY CONFLICT]: You declared this cluster as PRIMARY (is_primary_hub=true),"
+      - "   but it is already operating as a PASSIVE hub in an existing DR topology."
+      - "   Detected artifacts:"
+      - "     - BackupSchedule '{{ acm_dr_hub_setup_schedule_name }}': {{ acm_dr_hub_setup_detected_schedule_exists | bool | ternary('PRESENT', 'ABSENT') }}"
+      - "     - Passive sync Restore CRs: {{ acm_dr_hub_setup_detected_sync_restore_count }} found"
+      - >-
+        {{
+          "     - DataProtectionApplication '" ~ acm_dr_hub_setup_oadp_dpa_name ~
+          "': " ~ (acm_dr_hub_setup_detected_dpa_exists | bool | ternary('PRESENT', 'ABSENT'))
+        }}
+      - "   🛡️ Promoting a passive hub to active without first failing over the current primary"
+      - "      creates two competing active hubs writing to the same shared storage."
+      - "   🔧 If this is intentional (e.g., post-failover promotion), re-run with:"
+      - "     -e acm_dr_hub_setup_allow_existing_dr=true"
+    success_msg: "✅ PASSED! Oh. Yes! => Topology conflict override acknowledged (acm_dr_hub_setup_allow_existing_dr=true)."
+  when:
+    - acm_dr_hub_setup_is_primary_hub | bool
+    - acm_dr_hub_setup_detected_dr_role | trim == 'passive'
+
+- name: "[STAGE 00 - Preflight] | 0.5b.3.2) 🛡️ TOPOLOGY GUARD - declared PASSIVE but detected ACTIVE"
+  # Blocks setup when the operator passes is_primary_hub=false on a cluster that
+  # is already serving as the active primary. Prevents accidental demotion that
+  # would leave the topology without a leader (no BackupSchedule writing).
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_allow_existing_dr | default(false) | bool
+    fail_msg:
+      - "❌ FAILED! Oh. No! => [TOPOLOGY CONFLICT]: You declared this cluster as PASSIVE (is_primary_hub=false),"
+      - "   but it is currently operating as the ACTIVE primary hub in the DR topology."
+      - "   Detected artifacts:"
+      - >-
+        {{
+          "     - BackupSchedule '" ~ acm_dr_hub_setup_schedule_name ~
+          "': PRESENT (paused: " ~ (acm_dr_hub_setup_detected_schedule_paused | bool | ternary('YES', 'NO')) ~ ")"
+        }}
+      - "     - Passive sync Restore CRs: {{ acm_dr_hub_setup_detected_sync_restore_count }} found"
+      - >-
+        {{
+          "     - DataProtectionApplication '" ~ acm_dr_hub_setup_oadp_dpa_name ~
+          "': " ~ (acm_dr_hub_setup_detected_dpa_exists | bool | ternary('PRESENT', 'ABSENT'))
+        }}
+      - "   🛡️ Demoting the active primary without first promoting another hub leaves"
+      - "      the topology without a backup writer."
+      - "   🔧 If this is intentional (e.g., decommissioning this primary), re-run with:"
+      - "     -e acm_dr_hub_setup_allow_existing_dr=true"
+    success_msg: "✅ PASSED! Oh. Yes! => Topology conflict override acknowledged (acm_dr_hub_setup_allow_existing_dr=true)."
+  when:
+    - not (acm_dr_hub_setup_is_primary_hub | bool)
+    - acm_dr_hub_setup_detected_dr_role | trim == 'active'
+
+# =============================================================================
+# STEP 0.5b.4: 🛡️ SAFETY GATE - BLOCK IF EXISTING DR ARTIFACTS DETECTED
+# =============================================================================
+# Prevents accidental re-provisioning of a cluster that already participates in
+# a DR topology. The user must explicitly acknowledge the existing state by
+# passing -e acm_dr_hub_setup_allow_existing_dr=true to proceed.
+
+- name: "[STAGE 00 - Preflight] | 0.5b.4.1) 🛡️ TOPOLOGY GATE - Block if cluster already participates in a DR topology"
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (acm_dr_hub_setup_detected_has_dr_artifacts | bool) or
+        (acm_dr_hub_setup_allow_existing_dr | default(false) | bool)
+    fail_msg:
+      - "❌ FAILED! Oh. No! => [EXISTING DR TOPOLOGY DETECTED]: This cluster ({{ k8s_target_context }})"
+      - "   already has DR artifacts and appears to be operating as a {{ acm_dr_hub_setup_detected_dr_role | upper | trim }} hub"
+      - "   in an existing DR topology."
+      - ""
+      - "   🔎 DETECTED ARTIFACTS:"
+      - >-
+        {% set _sched_status = acm_dr_hub_setup_detected_schedule_exists | bool | ternary('PRESENT', 'ABSENT') %}
+        {% set _paused = acm_dr_hub_setup_detected_schedule_paused | bool | ternary('YES', 'NO') %}
+            - BackupSchedule '{{ acm_dr_hub_setup_schedule_name }}': {{
+              _sched_status ~
+              ((acm_dr_hub_setup_detected_schedule_exists | bool) | ternary(' (paused: ' ~ _paused ~ ')', ''))
+            }}
+      - "     - Passive sync Restore CRs: {{ acm_dr_hub_setup_detected_sync_restore_count }} found"
+      - >-
+        {{
+          "     - DataProtectionApplication '" ~ acm_dr_hub_setup_oadp_dpa_name ~
+          "': " ~ (acm_dr_hub_setup_detected_dpa_exists | bool | ternary('PRESENT', 'ABSENT'))
+        }}
+      - "     - BackupStorageLocation: {{ acm_dr_hub_setup_detected_bsl_available | bool | ternary('AVAILABLE', 'NOT FOUND') }}"
+      - ""
+      - "   🛡️ Re-running acm_dr_hub_setup on a cluster that already participates in a DR topology"
+      - "      could overwrite existing configuration, create conflicting BackupSchedules, or"
+      - "      produce duplicate passive sync Restores."
+      - ""
+      - "   🔧 TO PROCEED: If you intentionally want to re-provision or add this cluster as"
+      - "      an additional passive hub, re-run with:"
+      - "        -e acm_dr_hub_setup_allow_existing_dr=true"
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => {{
+        'No existing DR artifacts detected on context (' ~ k8s_target_context ~ ') -- safe to provision.'
+        if not acm_dr_hub_setup_detected_has_dr_artifacts | bool
+        else 'Existing DR artifacts detected (role: ' ~ acm_dr_hub_setup_detected_dr_role | upper | trim ~
+             '), but force flag is set (acm_dr_hub_setup_allow_existing_dr=true). Proceeding.'
+      }}
+
+# =============================================================================
+# STEP 0.5b.5: TOPOLOGY STATUS REPORT
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.5b.5.1) Display DR topology detection results - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/00a_topology_detection_summary.j2').split('\n') }}"
+  run_once: true
+...

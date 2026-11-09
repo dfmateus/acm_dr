@@ -1,0 +1,114 @@
+---
+# playbooks/manage-argocd-instance.yml
+# =============================================================================
+# GENERIC ARGOCD INSTANCE PROVISIONING (roles/acm_argocd_instance_setup)
+# =============================================================================
+# Unlike acm_dr_hub_setup (Stage 04), which assumes exactly 2 fixed
+# instances (Governance + AppDemo), this playbook creates AS MANY instances as
+# the client defines in the 'acm_argocd_instances' list. Each item is 100%
+# configurable (name, namespace, repository, Applications generator,
+# RBAC, ConsoleLink). See roles/acm_argocd_instance_setup/README.md for the
+# complete variable dictionary per item.
+#
+# Example (a simple instance, without repository/ApplicationSet):
+#   ansible-playbook playbooks/manage-argocd-instance.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e '{"acm_argocd_instances": [{"name": "meu-argocd", "namespace": "meu-argocd-ns"}]}'
+#
+# Example (instance with list ApplicationSet + ConsoleLink):
+#   ansible-playbook playbooks/manage-argocd-instance.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e @my-instances.yml   # YAML file with the complete list
+#
+# Variables (required):
+#   k8s_target_context  - Hub SA context. Injected via ACM DR Target Cluster AAP credential.
+#   acm_argocd_instances - list of instance definition objects. Cannot be expressed as a survey
+#                          question; pass via @vars_file.yml or the AAP Extra Variables field.
+#                          See roles/acm_argocd_instance_setup/README.md for the full schema.
+#
+# Dependencies:
+#   collections: kubernetes.core
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+#                acm_argocd_instance_setup (loops over acm_argocd_instances)
+#
+# Expected outcome:
+#   Exit 0 - All instances created: namespaces provisioned, ArgoCD CR healthy,
+#             ApplicationSet applied, RBAC and ConsoleLink in place.
+#   Exit 1 - An instance failed to provision (bad variable, namespace conflict,
+#             RBAC error). Check the task name and namespace in the ❌ message.
+# =============================================================================
+
+- name: "[ARGOCD INSTANCES] | Generic ArgoCD instance provisioning"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Uses the runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster
+      # credentials from AAP or scripts/lib/load_cluster_env.sh), falling back to the legacy
+      # monolithic K8S_AUTH_KUBECONFIG / KUBECONFIG env var when no per-cluster vars exist.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]  # propagate to tasks inside the role so they also run
+      tags: [always]  # ensures the include itself runs regardless of --tags filtering
+
+    # Derive k8s_target_context from per-cluster credentials when not passed
+    # as extra var. ACM_DR_TARGET_CONTEXT is injected by the "ACM DR Target
+    # Cluster" credential type or exported via load_cluster_env.sh.
+    - name: "[PRE-FLIGHT] | Derive target context from per-cluster credentials"
+      ansible.builtin.set_fact:
+        k8s_target_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') }}"  # noqa var-naming[no-role-prefix]
+      when:
+        - k8s_target_context is not defined
+        - lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') | length > 0
+
+    - name: "ARGOCD INSTANCES PLAYBOOK | Validate required parameters"
+      ansible.builtin.assert:
+        that:
+          - k8s_target_context is defined and k8s_target_context | length > 0
+          - acm_argocd_instances is defined and acm_argocd_instances | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => provide '-e k8s_target_context=...' and a list
+          'acm_argocd_instances' with at least one item. See
+          roles/acm_argocd_instance_setup/README.md for the complete variable dictionary.
+        success_msg: "✅ PASSED! Oh. Yes! => {{ acm_argocd_instances | length }} ArgoCD instance(s) to process."
+
+  tasks:
+    - name: "[ARGOCD INSTANCES] | Provision each instance defined in the list"
+      ansible.builtin.include_role:
+        name: acm_argocd_instance_setup
+      loop: "{{ acm_argocd_instances }}"
+      loop_control:
+        loop_var: acm_argocd_instance_setup_item
+        label: "{{ acm_argocd_instance_setup_item.name | default('unnamed') }}"
+      vars:
+        acm_argocd_instance_setup_name: "{{ acm_argocd_instance_setup_item.name }}"
+        acm_argocd_instance_setup_namespace: "{{ acm_argocd_instance_setup_item.namespace }}"
+        acm_argocd_instance_setup_manage_operator: "{{ acm_argocd_instance_setup_item.manage_operator | default(true) }}"
+        acm_argocd_instance_setup_cluster_admin_rbac: "{{ acm_argocd_instance_setup_item.cluster_admin_rbac | default(false) }}"
+        acm_argocd_instance_setup_repo_url: "{{ acm_argocd_instance_setup_item.repo_url | default('') }}"
+        acm_argocd_instance_setup_repo_username: "{{ acm_argocd_instance_setup_item.repo_username | default('') }}"
+        acm_argocd_instance_setup_repo_pat: "{{ acm_argocd_instance_setup_item.repo_pat | default('') }}"
+        acm_argocd_instance_setup_repo_target_revision: "{{ acm_argocd_instance_setup_item.repo_target_revision | default('main') }}"
+        acm_argocd_instance_setup_managed_namespaces: "{{ acm_argocd_instance_setup_item.managed_namespaces | default([]) }}"
+        acm_argocd_instance_setup_resource_exclusions: "{{ acm_argocd_instance_setup_item.resource_exclusions | default([]) }}"
+        acm_argocd_instance_setup_generator_type: "{{ acm_argocd_instance_setup_item.generator_type | default('none') }}"
+        acm_argocd_instance_setup_applications: "{{ acm_argocd_instance_setup_item.applications | default([]) }}"
+        acm_argocd_instance_setup_placement_name: "{{ acm_argocd_instance_setup_item.placement_name | default('') }}"
+        acm_argocd_instance_setup_placement_configmap: "{{ acm_argocd_instance_setup_item.placement_configmap | default('acm-placement') }}"
+        acm_argocd_instance_setup_cluster_decision_path: "{{ acm_argocd_instance_setup_item.cluster_decision_path | default('') }}"
+        acm_argocd_instance_setup_cluster_decision_destination_namespace: "{{ acm_argocd_instance_setup_item.cluster_decision_destination_namespace | default('') }}"
+        acm_argocd_instance_setup_wire_rhacm_integration: "{{ acm_argocd_instance_setup_item.wire_rhacm_integration | default(false) }}"
+        acm_argocd_instance_setup_cluster_set: "{{ acm_argocd_instance_setup_item.cluster_set | default('default') }}"
+        acm_argocd_instance_setup_console_link_enabled: "{{ acm_argocd_instance_setup_item.console_link_enabled | default(false) }}"
+        acm_argocd_instance_setup_console_link_text: "{{ acm_argocd_instance_setup_item.console_link_text | default('') }}"
+        acm_argocd_instance_setup_console_link_section: "{{ acm_argocd_instance_setup_item.console_link_section | default('OpenShift GitOps') }}"
+...

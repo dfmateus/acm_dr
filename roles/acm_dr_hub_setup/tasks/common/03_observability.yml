@@ -1,0 +1,371 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 03 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 03 - Observability] | Display Thanos configuration metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "📈 STAGE 03 - Observability & Thanos Storage Integration"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT:  {{ k8s_target_context }}"
+      - "📂 NAMESPACE OBS:   {{ acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability') }}"
+      - "☁️ CLOUD PROVIDER:  {{ acm_dr_hub_setup_cloud_provider }}"
+      - >-
+        {{
+          (acm_dr_hub_setup_cloud_provider == 'aws')
+          | ternary(
+              '🪣 OBS BUCKET:       ' ~ (acm_dr_hub_setup_aws_s3_bucket_observability | default('NOT DEFINED')),
+              '💾 STORAGE ACCOUNT: ' ~ acm_dr_hub_setup_azure_storage_account_name
+            )
+        }}
+  run_once: true
+
+# =============================================================================
+# STEP 3.1: ENVIRONMENT PREPARATION, NAMESPACES AND CREDENTIALS
+# =============================================================================
+
+- name: "[STAGE 03 - Observability] | 3.1.1) Create Observability Namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability') }}"
+
+- name: "[STAGE 03 - Observability] | 3.1.2) Retrieve pull-secret from openshift-config - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Secret
+    name: pull-secret
+    namespace: openshift-config
+  register: acm_dr_hub_setup_openshift_pull_secret
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when:
+    - acm_dr_hub_setup_openshift_pull_secret is undefined or acm_dr_hub_setup_openshift_pull_secret.resources is undefined or acm_dr_hub_setup_openshift_pull_secret.resources | length == 0 # noqa yaml[line-length]
+
+- name: "[STAGE 03 - Observability] | 3.1.3) Replicate multiclusterhub-operator-pull-secret - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: multiclusterhub-operator-pull-secret
+        namespace: "{{ acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability') }}"
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: "{{ acm_dr_hub_setup_openshift_pull_secret.resources[0].data['.dockerconfigjson'] }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 03 - Observability] | 3.1.4a) Retrieve Storage Account Access Key via azure_rm_storageaccount_info - {{ k8s_target_context }}"
+  # show_connection_string: true makes the module call list_keys() on the
+  # storage account, returning the primary key at
+  # .storageaccounts[0].primary_endpoints.key
+  azure.azcollection.azure_rm_storageaccount_info:
+    resource_group: "{{ acm_dr_hub_setup_azure_resource_group }}"
+    name: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+    show_connection_string: true
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_azure_sa_key_info
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when:
+    - acm_dr_hub_setup_cloud_provider == 'azure'
+    - acm_dr_hub_setup_azure_storage_account_key is not defined or acm_dr_hub_setup_azure_storage_account_key | length == 0
+
+- name: "[STAGE 03 - Observability] | 3.1.4b) Set fact for acm_dr_hub_setup_azure_storage_account_key - {{ k8s_target_context }}"
+  ansible.builtin.set_fact:
+    # The primary access key is at storageaccounts[0].primary_endpoints.key
+    # when show_connection_string: true was used in the info query.
+    acm_dr_hub_setup_azure_storage_account_key: "{{ acm_dr_hub_setup_azure_sa_key_info.storageaccounts[0].primary_endpoints.key }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when:
+    - acm_dr_hub_setup_cloud_provider == 'azure'
+    - acm_dr_hub_setup_azure_sa_key_info is defined
+    - acm_dr_hub_setup_azure_sa_key_info.storageaccounts | default([]) | length > 0
+    - acm_dr_hub_setup_azure_sa_key_info.storageaccounts[0].primary_endpoints.key | default('') | length > 0
+
+# Provider-specific Thanos object storage Secret: Azure uses storage_account_key
+# and a blob.core.windows.net endpoint; AWS uses access_key/secret_key with an
+# S3 regional endpoint. Template lives under observability/<provider>/.
+- name: "[STAGE 03 - Observability] | 3.1.5) Create thanos-object-storage Secret - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: "observability/{{ acm_dr_hub_setup_cloud_provider }}/thanos_secret.yml.j2"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# =============================================================================
+# STEP 3.2: STORAGECLASS AUTO-DISCOVERY AND DEFENSIVE SANITIZATION
+# =============================================================================
+
+- name: "[STAGE 03 - Observability] | 3.2.1) SMART BLOCK: Default StorageClass Auto-Discovery - {{ k8s_target_context }}"
+  when: acm_dr_hub_setup_observability_storage_class is not defined or acm_dr_hub_setup_observability_storage_class | length == 0
+  block:
+    - name: "[STAGE 03 - Observability] | 3.2.1a) Retrieve StorageClass list from cluster"
+      kubernetes.core.k8s_info:
+        context: "{{ k8s_target_context }}"
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: acm_dr_hub_setup_storageclasses
+
+    - name: "[STAGE 03 - Observability] | 3.2.1b) Extract and set the default StorageClass"
+      ansible.builtin.set_fact:
+        acm_dr_hub_setup_observability_storage_class: "{{ item.metadata.name }}"
+      loop: "{{ acm_dr_hub_setup_storageclasses.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when:
+        - item.metadata.annotations is defined
+        - item.metadata.annotations['storageclass.kubernetes.io/is-default-class'] | default('false') | string | lower == 'true'
+
+    - name: "[STAGE 03 - Observability] | 3.2.1c) Display mapped dynamic StorageClass"
+      ansible.builtin.debug:
+        msg: "✅ Auto-Discovery: Default StorageClass set to '{{ acm_dr_hub_setup_observability_storage_class }}'"
+
+- name: "[STAGE 03 - Observability] | 3.2.2) DEFENSIVE HANDLING: Check and purge legacy CR with divergent StorageClass - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: observability.open-cluster-management.io/v1beta2
+    kind: MultiClusterObservability
+    name: observability
+  register: acm_dr_hub_setup_existing_mco
+
+- name: "[STAGE 03 - Observability] | 3.2.3) Clean up MCO and obsolete PVCs on StorageClass incompatibility - {{ k8s_target_context }}"
+  when:
+    - acm_dr_hub_setup_existing_mco.resources is defined
+    - acm_dr_hub_setup_existing_mco.resources | length > 0
+    - acm_dr_hub_setup_existing_mco.resources[0].spec.storageConfig.storageClass is defined
+    - acm_dr_hub_setup_existing_mco.resources[0].spec.storageConfig.storageClass != acm_dr_hub_setup_observability_storage_class
+  block:
+    - name: "[STAGE 03 - Observability] | 3.2.3a) Remove MCO Custom Resource with old StorageClass"
+      kubernetes.core.k8s:
+        context: "{{ k8s_target_context }}"
+        state: absent
+        api_version: observability.open-cluster-management.io/v1beta2
+        kind: MultiClusterObservability
+        name: observability
+        wait: true
+        wait_timeout: 120
+
+    - name: "[STAGE 03 - Observability] | 3.2.3b) Purge legacy PVCs in the Observability Namespace"
+      kubernetes.core.k8s:
+        context: "{{ k8s_target_context }}"
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability') }}"
+        label_selectors:
+          - observability.open-cluster-management.io/name
+
+# =============================================================================
+# STEP 3.3: MULTICLUSTEROBSERVABILITY PROVISIONING (THANOS STACK)
+# =============================================================================
+
+- name: "[STAGE 03 - Observability] | 3.3.1) Create MultiClusterObservability CR (mco_multiclusterobservability.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: observability/mco_multiclusterobservability.yml.j2
+
+# =============================================================================
+# STEP 3.4: MCO OPERATOR RECONCILIATION AND READINESS ASSESSMENT
+# =============================================================================
+
+- name: "[STAGE 03 - Observability] | 3.4.1) ⏳ WARNING: MultiClusterObservability reconciliation in progress (3-5 MINUTES) - DO NOT CANCEL"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/03_mco_reconciling.j2').split('\n') }}"
+
+- name: "[STAGE 03 - Observability] | 3.4.2) ⏳ WAIT (3-5 MINUTES) - Validate Ready condition on MultiClusterObservability - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: observability.open-cluster-management.io/v1beta2
+    kind: MultiClusterObservability
+    name: observability
+  register: acm_dr_hub_setup_mco_status
+  until: >-
+    (acm_dr_hub_setup_mco_status.resources | default([])) | length > 0 and
+    (acm_dr_hub_setup_mco_status.resources[0].status.conditions | default([]) |
+      selectattr('type', 'equalto', 'Ready') |
+      selectattr('status', 'equalto', 'True') | list | length > 0)
+  retries: 40
+  delay: 15
+  ignore_errors: true
+
+# =============================================================================
+# STEP 3.5: POD READINESS VALIDATION AND FINAL SUMMARY
+# =============================================================================
+
+- name: "[STAGE 03 - Observability] | 3.5.1) ⏳ WARNING: Waiting for Observability Pods initialization - DO NOT CANCEL"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/03_mco_pods_waiting.j2').split('\n') }}"
+  when: acm_dr_hub_setup_mco_status is not failed
+
+- name: "[STAGE 03 - Observability] | 3.5.2) ⏳ WAIT - Validate Pod readiness state in the Observability Namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Pod
+    namespace: "{{ acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability') }}"
+  register: acm_dr_hub_setup_mco_pods
+  until: >-
+    (acm_dr_hub_setup_mco_pods.resources | default([])) | length > 0 and
+    (acm_dr_hub_setup_mco_pods.resources | default([]) |
+      rejectattr('status.phase', 'in', ['Running', 'Succeeded']) | list | length) == 0
+  retries: 40
+  delay: 10
+  when: acm_dr_hub_setup_mco_status is not failed
+  ignore_errors: true
+
+# =============================================================================
+# MCO/OBSERVABILITY GROUPED DIAGNOSTIC SECTION
+# =============================================================================
+# Runs if either MCO Ready poll (3.4.2) or Pod readiness poll (3.5.2) failed.
+# Identifies which checkpoint failed first and gathers evidence.
+
+# D.1) Identify which observability checkpoint failed first.
+- name: "[STAGE 03 - Observability DIAGNOSTIC] | D.1) Identify failed observability checkpoint"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_obs_failed_step: >-
+      {% if acm_dr_hub_setup_mco_status is failed
+      %}MCO Ready condition (3.4.2){% elif acm_dr_hub_setup_mco_pods is defined
+      and acm_dr_hub_setup_mco_pods is failed
+      %}Pod readiness (3.5.2){% else %}unknown{% endif %}
+  when: >-
+    acm_dr_hub_setup_mco_status is failed or
+    (acm_dr_hub_setup_mco_pods is defined and acm_dr_hub_setup_mco_pods is failed)
+
+# D.2) Read MCO status conditions to see what component is stuck.
+- name: "[STAGE 03 - Observability DIAGNOSTIC] | D.2) Read MCO status conditions"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_obs_mco_conditions: >-
+      {% set mco = acm_dr_hub_setup_mco_status.resources | default([]) %}
+      {% if mco | length > 0 and mco[0].status is defined %}
+      {% for c in mco[0].status.conditions | default([]) %}
+      {{ c.type }}: {{ c.status
+      }}{%- if c.status != 'True' %} ({{ c.message | default('no message') }}){% endif %};
+      {% endfor %}
+      {% else %}MCO CR not found or has no status.{% endif %}
+  when: >-
+    acm_dr_hub_setup_mco_status is failed or
+    (acm_dr_hub_setup_mco_pods is defined and acm_dr_hub_setup_mco_pods is failed)
+
+# D.3) List pods not in Running/Succeeded state with wait reasons.
+- name: "[STAGE 03 - Observability DIAGNOSTIC] | D.3) List unhealthy pods in observability namespace"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_obs_bad_pods: >-
+      {% set pods = acm_dr_hub_setup_mco_pods.resources | default([]) %}
+      {% set bad = pods | rejectattr('status.phase', 'in', ['Running', 'Succeeded']) | list %}
+      {% if bad | length == 0 %}(all pods healthy or none found)
+      {% else %}{% for pod in bad %}{{ pod.metadata.name
+      }}={{ pod.status.phase | default('Unknown')
+      }}{%- for cs in pod.status.containerStatuses | default([])
+      %}{%- if cs.state.waiting is defined %} ({{ cs.name
+      }}: {{ cs.state.waiting.reason | default('Waiting') }}){% endif
+      %}{%- endfor %}; {% endfor %}{% endif %}
+  when:
+    - acm_dr_hub_setup_mco_pods is defined
+    - acm_dr_hub_setup_mco_pods is failed
+
+# D.4) Build troubleshooting hints based on the failed checkpoint.
+- name: "[STAGE 03 - Observability DIAGNOSTIC] | D.4) Build observability diagnostic hints"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_obs_hints: >-
+      {% set step = acm_dr_hub_setup_diag_obs_failed_step | default('') | trim %}
+      {% set conds = acm_dr_hub_setup_diag_obs_mco_conditions | default('') %}
+      {% set pods_text = acm_dr_hub_setup_diag_obs_bad_pods | default('') %}
+      {% set hints = [] %}
+      {% if 'MCO Ready' in step %}
+      {%   set _ = hints.append(
+             'MCO NOT READY: The MultiClusterObservability CR did not reach Ready=True '
+             ~ 'within 10 minutes. Check MCO conditions above. Common causes: '
+             ~ '(1) Thanos object storage credentials are wrong (thanos-object-storage Secret), '
+             ~ '(2) the storage '
+             ~ ((acm_dr_hub_setup_cloud_provider == 'aws') | ternary('S3 bucket', 'Azure Blob container'))
+             ~ ' does not exist, '
+             ~ '(3) StorageClass cannot provision PVCs.') %}
+      {% endif %}
+      {% if 'Pod readiness' in step %}
+      {%   if 'ImagePullBackOff' in pods_text %}
+      {%     set _ = hints.append(
+               'IMAGE PULL FAILURE: One or more pods cannot pull their images. '
+               ~ 'Check the multiclusterhub-operator-pull-secret in the observability namespace '
+               ~ 'and verify it has a valid .dockerconfigjson for registry.redhat.io.') %}
+      {%   elif 'CrashLoopBackOff' in pods_text %}
+      {%     set _ = hints.append(
+               'POD CRASH LOOP: One or more observability pods are crashing. '
+               ~ 'Check pod logs: oc logs -n '
+               ~ (acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability'))
+               ~ ' <pod-name> --context ' ~ k8s_target_context ~ '.') %}
+      {%   else %}
+      {%     set _ = hints.append(
+               'PODS NOT READY: Observability pods did not all reach Running within '
+               ~ '6.7 minutes. Check pod events: oc describe pod -n '
+               ~ (acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability'))
+               ~ ' --context ' ~ k8s_target_context ~ '.') %}
+      {%   endif %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append(
+             'No specific pattern matched. Check MCO status and pod status in '
+             ~ (acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability'))
+             ~ '.') %}
+      {% endif %}
+      {{ hints }}
+  when: >-
+    acm_dr_hub_setup_mco_status is failed or
+    (acm_dr_hub_setup_mco_pods is defined and acm_dr_hub_setup_mco_pods is failed)
+
+# D.5) Print the structured diagnostic report.
+- name: "[STAGE 03 - Observability DIAGNOSTIC] | D.5) ❌ OBSERVABILITY FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ OBSERVABILITY SETUP FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "FAILED CHECKPOINT:"
+      - "  {{ acm_dr_hub_setup_diag_obs_failed_step | default('unknown') | trim }}"
+      - ""
+      - "TARGET CLUSTER:"
+      - "  {{ k8s_target_context }}"
+      - ""
+      - "MCO CONDITIONS:"
+      - "{{ acm_dr_hub_setup_diag_obs_mco_conditions | default('  (could not read MCO status)') }}"
+      - ""
+      - "UNHEALTHY PODS:"
+      - "{{ acm_dr_hub_setup_diag_obs_bad_pods | default('  (pod check did not run)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_hub_setup_diag_obs_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: >-
+    acm_dr_hub_setup_mco_status is failed or
+    (acm_dr_hub_setup_mco_pods is defined and acm_dr_hub_setup_mco_pods is failed)
+
+# D.6) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 03 - Observability DIAGNOSTIC] | D.6) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Observability setup failed at checkpoint
+      '{{ acm_dr_hub_setup_diag_obs_failed_step | default('unknown') | trim }}'
+      on context '{{ k8s_target_context }}'.
+      See the diagnostic report above for MCO conditions, pod status,
+      and troubleshooting hints.
+  when: >-
+    acm_dr_hub_setup_mco_status is failed or
+    (acm_dr_hub_setup_mco_pods is defined and acm_dr_hub_setup_mco_pods is failed)
+
+- name: "[STAGE 03 - Observability] | 3.5.3) Display Red Hat ACM Observability & Thanos completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/03_observability_summary.j2').split('\n') }}"
+...

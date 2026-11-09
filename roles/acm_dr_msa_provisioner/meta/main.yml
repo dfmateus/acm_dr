@@ -1,0 +1,26 @@
+---
+galaxy_info:
+  role_name: acm_dr_msa_provisioner
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Provisions a ManagedServiceAccount CR and ManifestWork ClusterRoleBinding on a
+    Red Hat Advanced Cluster Management Hub for a named Spoke cluster. The klusterlet
+    creates the ServiceAccount on the Spoke and writes the auto-rotated token Secret
+    back to the Hub. Designed as an opt-in companion to acm_dr_spoke_manager onboarding.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - disasterrecovery
+    - openshift
+    - kubernetes
+
+dependencies: []
+...

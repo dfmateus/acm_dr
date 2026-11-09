@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: {{ acm_dr_hub_setup_appset_demo_name | default('demo-workloads') }}
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}
+spec:
+  generators:
+    - list:
+        elements:
+          - appName: {{ acm_dr_hub_setup_demo_app1_name | default('demo-app-01') }}
+            appPath: {{ acm_dr_hub_setup_demo_app1_path | default('demo-app-01') }}
+          - appName: {{ acm_dr_hub_setup_demo_app2_name | default('demo-app-02') }}
+            appPath: {{ acm_dr_hub_setup_demo_app2_path | default('demo-app-02') }}
+  template:
+    metadata:
+      name: '{{ '{{' }}appName{{ '}}' }}'
+    spec:
+      project: default
+      source:
+        repoURL: {{ acm_dr_hub_setup_github_repo_url }}
+        targetRevision: {{ acm_dr_hub_setup_github_target_revision | default('main') }}
+        path: '{{ '{{' }}appPath{{ '}}' }}'
+      destination:
+        server: 'https://kubernetes.default.svc'
+        namespace: '{{ '{{' }}appName{{ '}}' }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true

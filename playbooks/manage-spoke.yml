@@ -1,0 +1,120 @@
+---
+# playbooks/manage-spoke.yml
+# =============================================================================
+# SPOKE LIFECYCLE ORCHESTRATION (RHACM MANAGED CLUSTERS)
+# Supports any Kubernetes distribution: ARO, Azure Kubernetes Service (AKS),
+# Amazon Elastic Kubernetes Service (Amazon EKS), Google Kubernetes Engine (GKE),
+# IBM Cloud Kubernetes Service (IKS), vanilla K8s.
+#
+# Example 1 - OpenShift (ARO) Spoke Onboarding:
+#   ansible-playbook playbooks/manage-spoke.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e acm_dr_spoke_manager_spoke_k8s_context="aro-spoke-01-sa" \
+#     -e acm_dr_spoke_manager_cluster_name="aro-spoke-01" \
+#     --tags "spoke_prep"
+#
+# Example 2 - Native Kubernetes (Amazon EKS) Spoke Onboarding:
+#   ansible-playbook playbooks/manage-spoke.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e acm_dr_spoke_manager_spoke_k8s_context="eks-spoke-01-sa" \
+#     -e acm_dr_spoke_manager_cluster_name="eks-spoke-01" \
+#     --tags "spoke_prep"
+#
+# Example 3 - Graceful Detachment (any distribution, KCS 5950901):
+#   ansible-playbook playbooks/manage-spoke.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e acm_dr_spoke_manager_spoke_k8s_context="aks-spoke-01-sa" \
+#     -e acm_dr_spoke_manager_cluster_name="aks-spoke-01" \
+#     -e acm_dr_spoke_manager_action="detach" \
+#     --tags "spoke_detach"
+#
+# Example 4 - Full Onboarding (SA + fleet Secret + RHACM import):
+#   Per-cluster credentials (AAP or CLI):
+#     source scripts/lib/load_cluster_env.sh target ~/.kube/clusters/hub-01.env
+#     source scripts/lib/load_cluster_env.sh spoke ~/.kube/clusters/new-spoke-admin.env
+#     ansible-playbook playbooks/manage-spoke.yml \
+#       -e acm_dr_spoke_manager_cluster_name="new-spoke-01" \
+#       -e acm_dr_spoke_manager_action="onboard"
+#
+#   Monolithic kubeconfig:
+#     ansible-playbook playbooks/manage-spoke.yml \
+#       -e k8s_target_context="acm-primary-hub-sa" \
+#       -e acm_dr_spoke_manager_cluster_name="new-spoke-01" \
+#       -e acm_dr_spoke_manager_action="onboard"
+#     # Requires ACM_DR_SPOKE_HOST and ACM_DR_SPOKE_TOKEN env vars for the
+#     # Spoke admin credential (operator's kubeadmin or token with cluster-admin).
+#
+# Variables (required):
+#   k8s_target_context                        - Hub SA context. Injected via ACM DR Target
+#                                               Cluster AAP credential (ACM_DR_TARGET_CONTEXT).
+#   acm_dr_spoke_manager_cluster_name         - ManagedCluster object name in RHACM (e.g., aro-spoke-01).
+#   acm_dr_spoke_manager_action               - 'prep' | 'onboard' (register) or 'detach' (remove).
+#
+# Variables (commonly overridden):
+#   acm_dr_spoke_manager_spoke_k8s_context    - Spoke SA context for direct Spoke-side ops.
+#                                               Injected via ACM DR Spoke Cluster credential.
+#   acm_dr_spoke_manager_cluster_cloud        - Cloud provider label for non-OCP Spokes
+#                                               (Amazon, Azure, Google, IBMCloud, Other).
+#                                               Auto-detected for OpenShift Spokes.
+#
+# Dependencies:
+#   collections: kubernetes.core
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+#                acm_dr_spoke_manager (onboarding/detach stages)
+#
+# Expected outcome:
+#   Exit 0 - Spoke onboarded: ManagedCluster Available on Hub (prep/onboard), or
+#             agent namespace cleaned up and ManagedCluster deleted (detach).
+#   Exit 1 - SA provisioning fails on the Spoke, or Hub-side import times out.
+#             Check the ❌ message and verify Hub/Spoke connectivity.
+# =============================================================================
+
+- name: "[SPOKE MANAGEMENT] | Onboarding and Detachment of RHACM Managed Clusters"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Uses the runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster
+      # credentials from AAP or scripts/lib/load_cluster_env.sh), falling back to the legacy
+      # monolithic K8S_AUTH_KUBECONFIG / KUBECONFIG env var when no per-cluster vars exist.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]  # propagate to tasks inside the role so they also run
+      tags: [always]  # ensures the include itself runs regardless of --tags filtering
+
+    # Derive k8s_target_context from per-cluster credentials when not passed
+    # as extra var. ACM_DR_TARGET_CONTEXT is injected by the "ACM DR Target
+    # Cluster" credential type or exported via load_cluster_env.sh.
+    - name: "[PRE-FLIGHT] | Derive target context from per-cluster credentials"
+      ansible.builtin.set_fact:
+        k8s_target_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') }}"  # noqa var-naming[no-role-prefix]
+      when:
+        - k8s_target_context is not defined
+        - lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') | length > 0
+
+    - name: "SPOKE PLAYBOOK | Validate Hub context and required parameters"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (k8s_target_context is defined and k8s_target_context | length > 0) or
+            (acm_dr_spoke_manager_hub_context is defined and acm_dr_spoke_manager_hub_context | length > 0)
+          - acm_dr_spoke_manager_cluster_name is defined and acm_dr_spoke_manager_cluster_name | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Hub context and Spoke name are required!
+          Provide via -e k8s_target_context="hub-sa" or per-cluster credentials (ACM_DR_TARGET_CONTEXT).
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Hub context '{{ k8s_target_context | default(acm_dr_spoke_manager_hub_context) }}'
+          and Spoke '{{ acm_dr_spoke_manager_cluster_name }}' validated.
+
+  roles:
+    - role: "{{ playbook_dir }}/../roles/acm_dr_spoke_manager"
+...

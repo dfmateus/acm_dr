@@ -1,0 +1,246 @@
+---
+# roles/acm_dr_upgrade_manager/tasks/01_channel_upgrade.yml
+# =============================================================================
+# STAGE 01: PATCH ACM SUBSCRIPTION CHANNEL AND WAIT FOR MCH RUNNING
+# =============================================================================
+
+# Skips the entire stage in dry-run mode. The preflight already logged the
+# intended change so the operator can review without applying anything.
+- name: "[STAGE 01 - Channel Upgrade] | Skip stage in dry-run mode"
+  ansible.builtin.meta: end_play
+  when: acm_dr_upgrade_manager_dry_run | default(false) | bool
+
+# ---------------------------------------------------------------------------
+# STEP 1.1: PATCH THE SUBSCRIPTION CHANNEL
+# ---------------------------------------------------------------------------
+# OLM reconciles the channel change: finds the latest CSV in the new channel,
+# validates the upgrade graph, and installs the new operator version. The MCH
+# controller then begins reconciling the MultiClusterHub to the new version.
+# This can take 15-30 minutes for a minor version upgrade.
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.1.1) Patch ACM Subscription spec.channel to target channel"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ acm_dr_upgrade_manager_subscription_name }}"
+    namespace: "{{ acm_dr_upgrade_manager_acm_namespace }}"
+    state: patched
+    definition:
+      spec:
+        channel: "{{ acm_dr_upgrade_manager_target_channel | trim }}"
+  register: acm_dr_upgrade_manager_subscription_patch
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.1.2) Confirm Subscription channel patch applied"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ ACM Subscription '{{ acm_dr_upgrade_manager_subscription_name }}'
+      channel patched to '{{ acm_dr_upgrade_manager_target_channel | trim }}'
+      on context '{{ k8s_target_context }}'.
+      OLM will now install the latest CSV in '{{ acm_dr_upgrade_manager_target_channel | trim }}'.
+      Waiting for the MultiClusterHub to reach Running (up to
+      {{ acm_dr_upgrade_manager_mch_wait_retries * acm_dr_upgrade_manager_mch_wait_delay }}s).
+
+# ---------------------------------------------------------------------------
+# STEP 1.2: WAIT FOR MCH TO REACH RUNNING
+# ---------------------------------------------------------------------------
+# After OLM installs the new CSV, the ACM operator upgrades the MCH. The MCH
+# transitions through Updating -> Running. During this time, existing managed
+# clusters continue running - only Hub API operations are briefly unavailable.
+# Timeout: retries x delay seconds (default 60 x 30 = 30 minutes).
+# Lab observation: minor version upgrades (e.g. 2.15→2.16) took ~12 minutes
+# from channel patch to MCH Running. OLM resolution adds ~1-2 min before the
+# MCH enters Updating, then the operator rolling update takes the rest.
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.0) ℹ️ Upgrade timeline notice"
+  ansible.builtin.debug:
+    msg: >-
+      ⏳ Waiting for MultiClusterHub to reach Running at version
+      {{ (acm_dr_upgrade_manager_target_acm_version | trim).split('.')[:2] | join('.') }}
+      on context '{{ k8s_target_context }}'.
+      OLM takes 1-3 minutes to resolve the new CSV before the MCH enters Updating.
+      The full minor-version upgrade (OLM resolution + MCH rolling update) typically
+      takes 10-20 minutes in lab environments. Polling every
+      {{ acm_dr_upgrade_manager_mch_wait_delay }}s for up to
+      {{ acm_dr_upgrade_manager_mch_wait_retries * acm_dr_upgrade_manager_mch_wait_delay }}s total.
+      Current MCH version will be visible in subsequent poll log lines.
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.1) ⏳ Wait for MultiClusterHub to reach Running at target version"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_upgrade_manager_mch_name }}"
+    namespace: "{{ acm_dr_upgrade_manager_acm_namespace }}"
+  register: acm_dr_upgrade_manager_mch_poll
+  retries: "{{ acm_dr_upgrade_manager_mch_wait_retries }}"
+  delay: "{{ acm_dr_upgrade_manager_mch_wait_delay }}"
+  # Two conditions must both be true before the wait exits:
+  # 1. phase == 'Running'  - MCH finished reconciling
+  # 2. currentVersion >= target major.minor - OLM installed the new CSV and
+  #    the MCH controller upgraded to the target version.
+  # Without the version check the loop exits immediately after the channel patch
+  # because the MCH is still Running at the old version before OLM starts.
+  until: >-
+    acm_dr_upgrade_manager_mch_poll.resources | default([]) | length > 0 and
+    acm_dr_upgrade_manager_mch_poll.resources[0].status.phase | default('') == 'Running' and
+    acm_dr_upgrade_manager_mch_poll.resources[0].status.currentVersion | default('0.0.0')
+      is version(
+        (acm_dr_upgrade_manager_target_acm_version | trim).split('.')[:2] | join('.'),
+        '>='
+      )
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.2) ✅ Report final MCH version after upgrade"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ PASSED! Oh. Yes! => MultiClusterHub reached Running on context '{{ k8s_target_context }}'.
+      Upgraded version: {{ acm_dr_upgrade_manager_mch_poll.resources[0].status.currentVersion
+                          | default('unknown') }}
+      Channel: {{ acm_dr_upgrade_manager_target_channel | trim }}
+
+# ---------------------------------------------------------------------------
+# STEP 1.2.3: WAIT FOR COMPLETE=TRUE (ALL COMPONENTS STABLE)
+# ---------------------------------------------------------------------------
+# phase=Running is set as soon as OLM finishes the CSV install, but sub-components
+# (BackupStorageLocation, klusterlet-addon-controller, etc.) may still be
+# initializing for another 1-2 minutes. The Complete condition with
+# reason=ComponentsAvailable is the authoritative signal that all MCH-managed
+# components have settled. Polling up to acm_dr_upgrade_manager_stable_wait_retries
+# x acm_dr_upgrade_manager_stable_wait_delay seconds (default: 10 x 30s = 5 min).
+# Optimization: when 1.2.1 exits with Complete=True already set (common when the
+# operator finishes settling before the first 15s poll window closes), skip the
+# dedicated poll entirely. In lab runs, this saves one API call and 1-2 seconds.
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.3pre) ✅ MCH Complete=True already confirmed in Running poll"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ PASSED! Oh. Yes! => MCH Complete=True was already set when the Running poll (1.2.1) exited.
+      All components stable at version
+      {{ acm_dr_upgrade_manager_mch_poll.resources[0].status.currentVersion | default('unknown') }}
+      on context '{{ k8s_target_context }}'. Skipping stability poll.
+  when: >-
+    acm_dr_upgrade_manager_mch_poll.resources | default([]) | length > 0 and
+    (acm_dr_upgrade_manager_mch_poll.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Complete')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.3) ⏳ Wait for MCH Complete=True (all components stable)"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_upgrade_manager_mch_name }}"
+    namespace: "{{ acm_dr_upgrade_manager_acm_namespace }}"
+  register: acm_dr_upgrade_manager_mch_stable_poll
+  retries: "{{ acm_dr_upgrade_manager_stable_wait_retries }}"
+  delay: "{{ acm_dr_upgrade_manager_stable_wait_delay }}"
+  # Check that the Complete condition exists and has status=True. When all MCH
+  # sub-components are running the reason is 'ComponentsAvailable'. Any other
+  # reason (Reconciling, ComponentsUnavailable) means the hub is still settling.
+  until: >-
+    acm_dr_upgrade_manager_mch_stable_poll.resources | default([]) | length > 0 and
+    (acm_dr_upgrade_manager_mch_stable_poll.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Complete')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  # Skip when Complete=True was already present in the mch_poll result (task 1.2.1).
+  when: >-
+    acm_dr_upgrade_manager_mch_poll.resources | default([]) | length == 0 or
+    (acm_dr_upgrade_manager_mch_poll.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Complete')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) == 0
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.4) ✅ MCH Complete=True - hub fully stabilized"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ PASSED! Oh. Yes! => MCH Complete=True on context '{{ k8s_target_context }}'.
+      All components are available and stable at version
+      {{ acm_dr_upgrade_manager_mch_stable_poll.resources[0].status.currentVersion | default('unknown') }}.
+  when:
+    - acm_dr_upgrade_manager_mch_stable_poll is defined
+    - acm_dr_upgrade_manager_mch_stable_poll.resources | default([]) | length > 0
+    - (acm_dr_upgrade_manager_mch_stable_poll.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Complete')
+        | selectattr('status', 'equalto', 'True')
+        | list | length) > 0
+
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.5) ⚠️ MCH stabilization timeout - Complete not yet True"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ WARNING: MCH Complete condition did not reach True within
+      {{ acm_dr_upgrade_manager_stable_wait_retries * acm_dr_upgrade_manager_stable_wait_delay }}s.
+      Current conditions:
+      {{ acm_dr_upgrade_manager_mch_stable_poll.resources[0].status.conditions | default([])
+         | map(attribute='type') | zip(
+             acm_dr_upgrade_manager_mch_stable_poll.resources[0].status.conditions | default([])
+             | map(attribute='status')) | list }}
+      The hub upgrade completed (MCH=Running at target version) but sub-components may still
+      be initializing. Proceeding to fail task 1.2.6.
+  when: >-
+    acm_dr_upgrade_manager_mch_stable_poll is defined and
+    not (acm_dr_upgrade_manager_mch_stable_poll.skipped | default(false) | bool) and
+    (acm_dr_upgrade_manager_mch_stable_poll.resources | default([]) | length == 0 or
+    (acm_dr_upgrade_manager_mch_stable_poll.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Complete')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) == 0)
+
+# Hard fail when Complete=True was not reached within the stability window. This gate
+# prevents the failback stage from running against a hub whose sub-components have not
+# settled. Disable by setting acm_dr_upgrade_manager_fail_on_unstable=false when you
+# accept a partially-settled hub and intend to confirm stability manually before failback.
+# Guard: also skip when 1.2.3 was skipped (mch_stable_poll.skipped=true), which means
+# Complete=True was already confirmed in the mch_poll result (task 1.2.3pre).
+- name: "[STAGE 01 - Channel Upgrade] | 1.2.6) ❌ Fail: MCH did not stabilize within timeout"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => MCH Complete=True not reached on context '{{ k8s_target_context }}'
+      within {{ acm_dr_upgrade_manager_stable_wait_retries * acm_dr_upgrade_manager_stable_wait_delay }}s.
+      Hub sub-components may still be initializing. Do NOT proceed with failback before
+      Complete=True is confirmed manually. Run:
+        oc get mch {{ acm_dr_upgrade_manager_mch_name }}
+        -n {{ acm_dr_upgrade_manager_acm_namespace }}
+        -o jsonpath='{.status.conditions}' --context {{ k8s_target_context }}
+      Set acm_dr_upgrade_manager_fail_on_unstable=false to downgrade this to a warning.
+  when: >-
+    acm_dr_upgrade_manager_fail_on_unstable | default(true) | bool and
+    acm_dr_upgrade_manager_mch_stable_poll is defined and
+    not (acm_dr_upgrade_manager_mch_stable_poll.skipped | default(false) | bool) and
+    (acm_dr_upgrade_manager_mch_stable_poll.resources | default([]) | length == 0 or
+    (acm_dr_upgrade_manager_mch_stable_poll.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Complete')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) == 0)
+
+# Fail explicitly when the poll loop exits without Running - the until condition
+# returns the last value if retries are exhausted but the task itself does not
+# fail automatically in check_mode or when Ansible returns 0 retries remaining.
+- name: "[STAGE 01 - Channel Upgrade DIAGNOSTIC] | ❌ MCH did not reach Running at target version within timeout"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => MultiClusterHub '{{ acm_dr_upgrade_manager_mch_name }}'
+      did not reach Running at target version within
+      {{ acm_dr_upgrade_manager_mch_wait_retries * acm_dr_upgrade_manager_mch_wait_delay }}s
+      on context '{{ k8s_target_context }}'.
+      Target version   : {{ (acm_dr_upgrade_manager_target_acm_version | trim).split('.')[:2] | join('.') }}
+      Current phase    : {{ acm_dr_upgrade_manager_mch_poll.resources[0].status.phase | default('unknown') }}
+      Current version  : {{ acm_dr_upgrade_manager_mch_poll.resources[0].status.currentVersion | default('unknown') }}
+
+      Check OLM CSV status:
+        oc get csv -n {{ acm_dr_upgrade_manager_acm_namespace }} --context {{ k8s_target_context }}
+      Check MCH conditions:
+        oc get mch {{ acm_dr_upgrade_manager_mch_name }}
+        -n {{ acm_dr_upgrade_manager_acm_namespace }}
+        -o jsonpath='{.status.conditions}' --context {{ k8s_target_context }}
+  when: >-
+    acm_dr_upgrade_manager_mch_poll.resources | default([]) | length == 0 or
+    acm_dr_upgrade_manager_mch_poll.resources[0].status.phase | default('') != 'Running' or
+    not (
+      acm_dr_upgrade_manager_mch_poll.resources[0].status.currentVersion | default('0.0.0')
+        is version(
+          (acm_dr_upgrade_manager_target_acm_version | trim).split('.')[:2] | join('.'),
+          '>='
+        )
+    )
+...

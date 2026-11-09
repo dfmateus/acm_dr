@@ -1,0 +1,1201 @@
+---
+# aap/controller_job_templates.yml
+#
+# Machine-importable Job Template definitions for Red Hat Ansible Automation Platform.
+# Compatible with the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES: replace before importing:
+#   {{ aap_organization }}          → Your AAP Organization name (e.g., "Default")
+#   {{ aap_project }}               → Your AAP Project name (e.g., "ACM-DR-Orchestrator")
+#   {{ aap_inventory }}             → Your localhost Inventory name (e.g., "localhost Inventory")
+#   {{ aap_execution_environment }} → Your EE name (e.g., "acm-dr-orchestrator-ee")
+#   {{ aap_github_pat_credential }} → Name of your GitHub PAT credential in AAP
+#                                     (e.g., "GitHub myuser (PAT)"), used only by Hub Setup
+#
+# CREDENTIAL BINDING STRATEGY
+# ----------------------------
+# Every ACM DR template uses ask_credential_on_launch: true. Operators select the
+# cluster and cloud credentials at launch time; the template holds only credentials
+# that are required for EVERY run regardless of target or cloud provider.
+#
+# Hub Setup runs Stage 04 (ArgoCD) only when enable_gitops=true. When false,
+# no GitHub PAT credential is needed and Stage 04 is skipped entirely.
+# When enable_gitops=true, also attach ACM DR - GitHub PAT at launch.
+#
+# At launch, operators attach:
+#
+#   Hub Setup        → ACM DR Target Cluster + Azure RM or AWS IAM (cloud cred)
+#                      + ACM DR - GitHub PAT (only when enable_gitops=true)
+#   Hub Switchover  → ACM DR Source Hub + ACM DR Dest Hub
+#   Spoke Lifecycle  → ACM DR Target Cluster + ACM DR Spoke Cluster
+#   Hub Cleanup      → ACM DR Target Cluster + Azure RM or AWS IAM (cloud cred)
+#   Spoke Onboarding → ACM DR Target Cluster + ACM DR Spoke Cluster
+#
+# No per-cluster credentials are hardcoded on any template because every field
+# (Hub identity, Source/Dest pair, Spoke) changes on every job run.
+#
+# Usage:
+#   ansible-playbook -e @aap/controller_job_templates.yml \
+#     -e "controller_hostname=https://aap.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=changeme" \
+#     -e "aap_organization=Default" \
+#     -e "aap_project=ACM-DR-Orchestrator" \
+#     -e "aap_inventory=localhost Inventory" \
+#     -e "aap_execution_environment=acm-dr-orchestrator-ee" \
+#     -e "aap_github_pat_credential=GitHub myuser (PAT)" \
+#     infra.controller_configuration.job_templates
+
+controller_job_templates:
+
+  # ---------------------------------------------------------------------------
+  # 1. JT - ACM DR - LAB - Hub Switchover
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - Hub Switchover
+    description: >-
+      Multi-stage DR failover/failback pipeline for RHACM Hub clusters. Executes
+      9 sequential stages: preflight safety checks, fleet discovery, logical fencing
+      (BackupSchedule pause), OADP Restore activation, Spoke reconnection
+      (KCS 7039710: https://access.redhat.com/solutions/7039710
+      mitigation), verification, new
+      leader protection, old Hub detach, and postflight compliance audit. Supports
+      dry-run simulation and Planned Maintenance Switchover with target version validation.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/orchestrate-dr-failover.yml
+    verbosity: 1
+    # No permanent credential - Source Hub and Dest Hub change on every job.
+    # Operator attaches: ACM DR Source Hub + ACM DR Dest Hub at launch.
+    ask_credential_on_launch: true
+    # Extra vars must be accepted at launch time for advanced topology options.
+    # acm_dr_failover_manager_additional_passive_hubs is a complex list (3-hub topology)
+    # that cannot be expressed as a survey question and must arrive as a launch-time extra var.
+    # Without this flag, AAP silently discards any extra_vars passed at launch (AAP default: False).
+    ask_variables_on_launch: true
+    credentials: []
+    survey_enabled: true
+    survey_spec:
+      name: DR Failover Configuration
+      description: >-
+        Configure the failover direction, execution mode, and safety controls for
+        the RHACM DR pipeline.
+      spec:
+        # --- 1. FAILOVER ACTION ---
+        - variable: acm_dr_failover_action
+          type: multiplechoice
+          required: true
+          question_name: Failover Action (Required)
+          question_description: >-
+            The direction of the DR state transition. 'failover' treats the
+            Source Hub credential as the active hub. 'failback' reverses the mapping.
+            Requires per-cluster credentials (ACM DR - Source Hub + Destination Hub)
+            attached to this Job Template.
+          default: failover
+          choices:
+            - failover
+            - failback
+          new_question: true
+
+        # --- 2. SKIP INTERACTIVE GATES ---
+        # dry_run is controlled by the WF node extra_data (dry-run node: true, production node: false).
+        # When running JT-01 directly (not via WF), pass acm_dr_failover_manager_dry_run as extra var.
+        - variable: acm_dr_failover_manager_skip_gates
+          type: multiplechoice
+          required: true
+          question_name: Skip Interactive Confirmation Gates (Required)
+          question_description: >-
+            When 'true', bypasses the in-playbook 'Point of No Return' interactive
+            pause. Must be 'true' on AAP to prevent the job from hanging. Use AAP
+            Workflow Approval Nodes for human-in-the-loop control instead.
+          default: "true"
+          choices:
+            - "true"
+            - "false"
+          new_question: false
+
+        # --- 3. ALLOW FENCED ORIGIN (FAILBACK) ---
+        - variable: acm_dr_failover_manager_allow_fenced_origin
+          type: multiplechoice
+          required: true
+          question_name: Allow Fenced Origin (Required for Failback)
+          question_description: >-
+            When 'true', allows failover even when the source Hub is already in PASSIVE
+            mode (BackupSchedule paused). Required for failback operations or to
+            re-execute an interrupted failover. Leave 'false' for initial failover.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+        # --- 4. TARGET RHACM VERSION (PLANNED MAINTENANCE) ---
+        - variable: acm_dr_failover_manager_target_acm_version
+          type: text
+          required: false
+          question_name: Target RHACM Version for Upgrade Validation (Optional)
+          question_description: >-
+            For Planned Maintenance Switchover: specify the RHACM version you intend to
+            upgrade to (e.g., '2.17'). The preflight validates that the upgrade is
+            feasible: target not already installed, in the supported list, OCP compatible
+            on both Hubs, and all Spokes in range. Leave empty for standard DR failover
+            without upgrade validation.
+          default: ""
+          min: 0
+          max: 10
+          new_question: true
+
+        # skip_version_gate is an emergency escape not needed in the day-to-day survey.
+        # Pass acm_dr_failover_manager_skip_version_gate=true as an extra var at launch
+        # when you need to bypass the version gate (ask_variables_on_launch: true).
+
+  # ---------------------------------------------------------------------------
+  # 2. JT - ACM DR - LAB - Hub Setup
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - Hub Setup
+    description: >-
+      Provisions the Hub infrastructure for DR readiness: cloud storage
+      (Azure Storage Accounts or AWS S3 buckets), MultiClusterHub (RHACM operator),
+      OADP/Velero DataProtectionApplication, Thanos Observability, OpenShift
+      GitOps/ArgoCD instances, and the Zero-Trust automation RBAC. Supports Azure
+      (ARO) and AWS (ROSA HCP) Hubs via the cloud_provider survey variable.
+      Idempotent -- safe to re-run.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/setup-acm-dr-hub.yml
+    verbosity: 1
+    # GitHub PAT is the only permanent credential: Stage 04 (ArgoCD) always creates
+    # a repository Secret from GITHUB_USER/GITHUB_PAT regardless of cloud provider.
+    # Operator attaches at launch: ACM DR Target Cluster + cloud cred
+    # (Azure RM for ARO Hubs or Amazon Web Services for ROSA HCP Hubs).
+    ask_credential_on_launch: true
+    # Extra vars must be accepted at launch time for operator overrides not covered by the survey
+    # (e.g., acm_dr_hub_setup_allow_existing_dr for partial re-runs, acm_dr_hub_setup_mch_channel
+    # for non-default ACM versions). Without this flag, AAP silently discards them (default: False).
+    ask_variables_on_launch: true
+    # No permanent credentials set at CasC import time. Stage 04 (ArgoCD) requires a GitHub/GitLab
+    # PAT credential - add it to this JT via the AAP UI or a separate CasC pass after the credential
+    # exists in AAP. Operators can also select it at launch via ask_credential_on_launch above.
+    survey_enabled: true
+    survey_spec:
+      name: Lab Setup Configuration
+      description: >-
+        Configure the target cluster and Hub role for the DR lab provisioning.
+      spec:
+        # --- 1. TARGET CLUSTER ---
+        - variable: k8s_target_context
+          type: text
+          required: true
+          question_name: Target Cluster Kubeconfig Context (Required)
+          question_description: >-
+            The kubeconfig context name of the cluster to provision as a DR-ready Hub.
+            Must follow the '-sa' suffix convention (e.g., 'your-hub-01-sa').
+            When using per-cluster credentials (ACM DR - Target Cluster type),
+            this value is injected automatically via ACM_DR_TARGET_CONTEXT.
+          default: ""
+          min: 1
+          max: 128
+          new_question: true
+
+        # --- 2. PRIMARY HUB FLAG ---
+        - variable: is_primary_hub
+          type: multiplechoice
+          required: true
+          question_name: "Is this the Primary Hub? (Required)"
+          question_description: >-
+            When 'true', configures the cluster as the PRIMARY Hub (active leader with
+            BackupSchedule enabled). When 'false', configures it as the DR/PASSIVE Hub
+            (BackupSchedule paused, ready for failover activation).
+          default: "true"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+        # --- 2b. RHACM OPERATOR CHANNEL ---
+        - variable: acm_dr_hub_setup_mch_channel
+          type: text
+          required: false
+          question_name: "RHACM Operator Channel (Optional)"
+          question_description: >-
+            The OLM subscription channel for the Advanced Cluster Management
+            operator. Controls which RHACM version gets installed (e.g.,
+            'release-2.13' for ACM 2.13.x, 'release-2.14' for ACM 2.14.x).
+            Defaults to 'release-2.14' if left empty. Both Hubs in a DR pair
+            can run different channels during a Planned Maintenance Switchover
+            (rolling upgrade scenario).
+          default: "release-2.14"
+          min: 0
+          max: 64
+          new_question: true
+
+        # --- 3. CLOUD PROVIDER ---
+        - variable: acm_dr_hub_setup_cloud_provider
+          type: multiplechoice
+          required: true
+          question_name: "Cloud Storage Provider (Required)"
+          question_description: >-
+            Controls which storage backend is used for OADP backups and Thanos
+            observability. 'azure' uses Azure Storage Accounts/Containers (for
+            ARO Hubs). 'aws' uses S3 buckets (for ROSA HCP Hubs). Must match
+            across all Hubs in a DR pair.
+          default: "azure"
+          choices:
+            - azure
+            - aws
+          new_question: true
+
+        # --- 4. AZURE STORAGE ACCOUNT NAME ---
+        - variable: acm_dr_hub_setup_azure_storage_account_name
+          type: text
+          required: false
+          question_name: "Azure Storage Account Name (Required when cloud_provider = azure)"
+          question_description: >-
+            The globally unique Azure Storage Account name for OADP backups and
+            Thanos observability data. Must be 3-24 characters, lowercase letters
+            and digits only. Both Hubs in the DR pair share this account - do not
+            encode a hub role or hub number in the name. Convention:
+            <project><env><region>oadp (e.g., 'acmdrlabeastusoadp' for the lab).
+            Injected automatically via AZURE_STORAGE_ACCOUNT in the Azure SP
+            credential; leave blank only when that credential is not attached.
+          default: ""
+          min: 0
+          max: 24
+          new_question: true
+
+        # --- 5. AZURE RESOURCE GROUP ---
+        - variable: acm_dr_hub_setup_azure_resource_group
+          type: text
+          required: false
+          question_name: "Azure Resource Group (Required when cloud_provider = azure)"
+          question_description: >-
+            The Azure Resource Group that contains (or will contain) the Storage
+            Account. Must already exist in the Azure subscription attached to
+            this job's Azure credential. Only used when cloud_provider is 'azure'.
+          default: ""
+          min: 0
+          max: 90
+          new_question: true
+
+        # --- 6. ALLOW STORAGE REUSE ---
+        - variable: acm_dr_hub_setup_azure_storage_allow_reuse
+          type: multiplechoice
+          required: true
+          question_name: "Allow Reuse of Existing Storage (azure: Storage Account, aws: S3 bucket) (Required)"
+          question_description: >-
+            When 'true', proceeds even if the storage resource already exists.
+            Required when provisioning the secondary (passive) Hub that shares
+            the same storage with the primary. Leave 'false' for first-time
+            provisioning.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+        # --- 7. OPENSHIFT GITOPS / ARGOCD ---
+        - variable: acm_dr_hub_setup_enable_gitops
+          type: multiplechoice
+          required: true
+          question_name: "Enable OpenShift GitOps / ArgoCD setup (Required)"
+          question_description: >-
+            When 'true', installs OpenShift GitOps (ArgoCD) and creates a
+            repository Secret using the GitHub PAT credential attached at launch.
+            When 'false', Stage 04 is skipped entirely and no GitHub PAT
+            credential is needed. Choose 'false' when ArgoCD is already
+            configured or not required for this Hub.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+        # --- 8. AWS S3 BACKUP BUCKET ---
+        - variable: acm_dr_hub_setup_aws_s3_bucket_backup
+          type: text
+          required: false
+          question_name: "AWS S3 Backup Bucket Name (Required when cloud_provider = aws)"
+          question_description: >-
+            The S3 bucket name for OADP backups. Must be globally unique. Both
+            Hubs in a DR pair must share the same bucket. Only used when
+            cloud_provider is 'aws' (e.g., 'acmdr-rosa-lab-oadp-backup').
+          default: ""
+          min: 0
+          max: 63
+          new_question: true
+
+        # --- 8. AWS S3 OBSERVABILITY BUCKET ---
+        - variable: acm_dr_hub_setup_aws_s3_bucket_observability
+          type: text
+          required: false
+          question_name: "AWS S3 Observability Bucket Name (Required when cloud_provider = aws)"
+          question_description: >-
+            The S3 bucket name for Thanos observability data. Must be globally
+            unique. Both Hubs in a DR pair must share the same bucket. Only
+            used when cloud_provider is 'aws'
+            (e.g., 'acmdr-rosa-lab-thanos-obs').
+          default: ""
+          min: 0
+          max: 63
+          new_question: true
+
+  # ---------------------------------------------------------------------------
+  # 3. JT - ACM DR - LAB - Spoke Lifecycle
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - Spoke Lifecycle
+    description: >-
+      Lifecycle management for Spoke/Managed Clusters: onboarding (auto-import
+      secret injection, KCS 7039710: https://access.redhat.com/solutions/7039710
+      mitigation) and graceful detachment (KCS 5950901:
+      https://access.redhat.com/solutions/5950901). Supports any Kubernetes
+      distribution -- ARO, AKS, EKS, GKE, IKS, and vanilla Kubernetes 1.24+.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/manage-spoke.yml
+    verbosity: 1
+    # No permanent credential - Hub context and Spoke change on every job.
+    # Operator attaches: ACM DR Target Cluster + ACM DR Spoke Cluster at launch.
+    ask_credential_on_launch: true
+    # Extra vars must be accepted at launch time for overrides not covered by the survey
+    # (e.g., acm_dr_spoke_manager_context_map for custom context naming). AAP default: False.
+    ask_variables_on_launch: true
+    credentials: []
+    survey_enabled: true
+    survey_spec:
+      name: Spoke Manager Configuration
+      description: >-
+        Configure the Hub context, Spoke identity, action, and optional cloud
+        provider label for Spoke lifecycle management.
+      spec:
+        # --- 1. HUB CONTEXT ---
+        - variable: k8s_target_context
+          type: text
+          required: true
+          question_name: Hub Cluster Kubeconfig Context (Required)
+          question_description: >-
+            The kubeconfig context of the RHACM Hub that will manage this Spoke.
+            Must follow the '-sa' suffix convention (e.g., 'acm-primary-hub-sa').
+          default: ""
+          min: 1
+          max: 128
+          new_question: true
+
+        # --- 2. SPOKE NAME ---
+        - variable: acm_dr_spoke_manager_cluster_name
+          type: text
+          required: true
+          question_name: Spoke/Managed Cluster Name (Required)
+          question_description: >-
+            The name of the ManagedCluster object in RHACM. This becomes the namespace
+            on the Hub and the cluster identifier in the fleet (e.g., 'aro-spoke-01',
+            'aks-spoke-01', 'eks-spoke-01').
+          default: ""
+          min: 1
+          max: 128
+          new_question: true
+
+        # --- 3. ACTION ---
+        # NOTE: acm_dr_spoke_manager_spoke_k8s_context is intentionally NOT a survey
+        # question. The ACM DR - Spoke Cluster credential type injects ACM_DR_SPOKE_CONTEXT
+        # into the execution environment, and the role default reads from that env var.
+        # Sending an empty string via a survey extra_var would override the role default
+        # (extra_vars have the highest Ansible precedence), breaking context resolution.
+        # Operators who need to override the context for a specific run can add it as
+        # an explicit extra var at launch time.
+        - variable: acm_dr_spoke_manager_action
+          type: multiplechoice
+          required: true
+          question_name: Action to Perform (Required)
+          question_description: >-
+            'prep' = Onboard/re-import the Spoke (inject auto-import-secret, bootstrap
+            SA). 'detach' = Gracefully remove the Spoke from the Hub (KCS 5950901:
+            https://access.redhat.com/solutions/5950901 -- clean up agent namespace
+            and manifests before deletion).
+          default: prep
+          choices:
+            - prep
+            - detach
+          new_question: true
+
+        # --- 5. CLOUD PROVIDER LABEL ---
+        - variable: acm_dr_spoke_manager_cluster_cloud
+          type: multiplechoice
+          required: false
+          question_name: Cloud Provider Label (Optional)
+          question_description: >-
+            The cloud provider label applied to the ManagedCluster object. For OpenShift
+            Spokes this is auto-detected from Infrastructure.status.platform. For non-OCP
+            Spokes (AKS, EKS, GKE, IKS, vanilla K8s), select the matching provider.
+            Values match the canonical labels that RHACM uses in the console and
+            ClusterClaim 'platform.open-cluster-management.io'.
+          default: ""
+          choices:
+            - ""
+            - Amazon
+            - Azure
+            - Google
+            - IBMCloud
+            - VSphere
+            - BareMetal
+            - OpenStack
+            - Nutanix
+            - Alibaba
+            - Other
+          new_question: false
+
+  # ---------------------------------------------------------------------------
+  # 4. JT - ACM DR - LAB - Hub Cleanup
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - Hub Cleanup
+    description: >-
+      Decommissions a cluster that was elected as a DR node, removing only what
+      pertains to that role: full ACM/operator removal, DR-scoped GitOps/OADP config,
+      Observability. Preserves the generic GitOps/OADP operators and cloud backup data
+      (Azure Storage or AWS S3) by default. Supports Azure (ARO) and AWS (ROSA HCP)
+      Hubs via the cloud_provider survey variable. Has built-in safety gates to prevent
+      accidental teardown of an active production Hub.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/cleanup-acm-dr-hub.yml
+    verbosity: 1
+    # No permanent credential - target Hub changes on every job; cloud cred depends on provider.
+    # Operator attaches at launch: ACM DR Target Cluster + cloud cred
+    # (Azure RM for ARO Hubs or Amazon Web Services for ROSA HCP Hubs).
+    ask_credential_on_launch: true
+    # Extra vars must be accepted at launch time for overrides not in the survey
+    # (e.g., acm_dr_hub_cleanup_force for production Hubs). AAP default: False.
+    ask_variables_on_launch: true
+    credentials: []
+    survey_enabled: true
+    survey_spec:
+      name: Lab Cleanup Configuration
+      description: >-
+        Configure the target cluster and safety controls for the DR lab decommission.
+      spec:
+        # --- 1. TARGET CLUSTER ---
+        - variable: k8s_target_context
+          type: text
+          required: true
+          question_name: Target Cluster Kubeconfig Context (Required)
+          question_description: >-
+            The kubeconfig context of the cluster to decommission as a DR node.
+            Must follow the '-sa' suffix convention (e.g., 'your-hub-01-sa').
+            When using per-cluster credentials (ACM DR - Target Cluster type),
+            this value is injected automatically via ACM_DR_TARGET_CONTEXT.
+          default: ""
+          min: 1
+          max: 128
+          new_question: true
+
+        # --- 2. EXPLICIT CONFIRMATION ---
+        - variable: acm_dr_hub_cleanup_confirm
+          type: multiplechoice
+          required: true
+          question_name: "Explicit Cleanup Confirmation (Required)"
+          question_description: >-
+            SAFETY GATE: Must be set to 'true' to proceed. The playbook refuses to
+            execute without this explicit confirmation. This prevents accidental
+            teardown via misconfigured Job Templates or unintended launches.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+        # --- 3. DRY-RUN MODE ---
+        - variable: acm_dr_hub_cleanup_dry_run
+          type: multiplechoice
+          required: true
+          question_name: "Execution Mode - Dry-Run Simulation (Required)"
+          question_description: >-
+            When 'true', the entire cleanup pipeline runs in check_mode/diff -- changes
+            are validated by the API server but never persisted. Recommended for the
+            first run against a new cluster.
+          default: "true"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+        # --- 4. FORCE CLEANUP ---
+        - variable: acm_dr_hub_cleanup_force
+          type: multiplechoice
+          required: true
+          question_name: "Force Cleanup of Active Hub (Required)"
+          question_description: >-
+            DANGER: When 'true', allows cleanup even if the Hub appears to be ACTIVE in
+            production (BackupSchedule present and not paused). Only use when you are
+            certain the Hub should be decommissioned despite its active state.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: false
+
+        # --- 5. CLOUD PROVIDER ---
+        - variable: acm_dr_hub_cleanup_cloud_provider
+          type: multiplechoice
+          required: true
+          question_name: "Cloud Storage Provider (Required)"
+          question_description: >-
+            Must match the cloud_provider used during acm_dr_hub_setup. Controls
+            which storage cleanup tasks run. 'azure' for ARO Hubs, 'aws' for
+            ROSA HCP Hubs.
+          default: "azure"
+          choices:
+            - azure
+            - aws
+          new_question: true
+
+        # --- 6. PURGE AZURE STORAGE ---
+        - variable: acm_dr_hub_cleanup_purge_azure_storage
+          type: multiplechoice
+          required: true
+          question_name: "Purge Azure Storage (Required when cloud_provider = azure)"
+          question_description: >-
+            When 'true', also deletes the Azure Storage Account and Containers (backup
+            data). Disabled by default because the primary Hub typically still depends
+            on the same shared storage. Only enable after confirming no other Hub needs
+            these backups. Only used when cloud_provider is 'azure'.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: false
+
+        # --- 7. AZURE STORAGE ACCOUNT NAME ---
+        - variable: acm_dr_hub_cleanup_azure_storage_account_name
+          type: text
+          required: false
+          question_name: "Azure Storage Account Name (Required when purge_azure_storage = true)"
+          question_description: >-
+            The Azure Storage Account name to delete. Must match the account created
+            by acm_dr_hub_setup (e.g., 'acmdrlaboadp'). Only used when Purge Azure
+            Storage is 'true'. The role cannot determine the account name automatically
+            in AAP, so this field is required when purging storage.
+          default: ""
+          min: 0
+          max: 24
+          new_question: false
+
+        # --- 8. AZURE RESOURCE GROUP ---
+        - variable: acm_dr_hub_cleanup_azure_resource_group
+          type: text
+          required: false
+          question_name: "Azure Resource Group (Required when purge_azure_storage = true)"
+          question_description: >-
+            The Azure Resource Group that contains the Storage Account to purge
+            (e.g., 'acmdr-lab-rg'). Only used when Purge Azure Storage is 'true'.
+            The role cannot determine the resource group automatically in AAP,
+            so this field is required when purging storage.
+          default: ""
+          min: 0
+          max: 90
+          new_question: false
+
+        # --- 9. PURGE AWS S3 STORAGE ---
+        - variable: acm_dr_hub_cleanup_purge_aws_storage
+          type: multiplechoice
+          required: true
+          question_name: "Purge AWS S3 Storage (Required when cloud_provider = aws)"
+          question_description: >-
+            When 'true', deletes the S3 buckets used for OADP backups and Thanos
+            observability. Disabled by default because the primary Hub typically
+            still depends on the same shared buckets. Only enable after confirming
+            no other Hub needs these backups. Only used when cloud_provider is 'aws'.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: false
+
+        # --- 10. AWS S3 BACKUP BUCKET ---
+        - variable: acm_dr_hub_cleanup_aws_s3_bucket_backup
+          type: text
+          required: false
+          question_name: "AWS S3 Backup Bucket Name (Required when purge_aws_storage = true)"
+          question_description: >-
+            The S3 bucket name to delete. Must match the bucket created by
+            acm_dr_hub_setup. Only used when Purge AWS S3 Storage is 'true'
+            (e.g., 'acmdr-rosa-lab-oadp-backup').
+          default: ""
+          min: 0
+          max: 63
+          new_question: false
+
+  # ---------------------------------------------------------------------------
+  # 5. JT - ACM DR - LAB - ArgoCD Setup
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - ArgoCD Setup
+    description: >-
+      Provisions N parametric ArgoCD instances on a target cluster: namespace,
+      repository secret, ApplicationSet generator (static list or fan-out by
+      Placement), RBAC, and ConsoleLink. Additive -- coexists with acm_dr_hub_setup
+      Stage 04 ArgoCD instances. Requires complex list input via extra-vars (YAML),
+      not Survey.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/manage-argocd-instance.yml
+    verbosity: 1
+    # No permanent credential - target Hub changes on every job.
+    # Operator attaches: ACM DR Target Cluster at launch.
+    ask_credential_on_launch: true
+    # Extra vars must be accepted at launch time: acm_argocd_instances is a complex
+    # list that can't be expressed as a survey question, so operators pass it as YAML
+    # via the "Extra Variables" field in the launch dialog or API payload.
+    ask_variables_on_launch: true
+    credentials: []
+    survey_enabled: false
+
+  # ---------------------------------------------------------------------------
+  # 6. JT - ACM DR - LAB - ArgoCD Cleanup
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - ArgoCD Cleanup
+    description: >-
+      Removes ArgoCD instances and their managed namespaces without touching the shared
+      GitOps operator. Removes Applications/ApplicationSet, RBAC, ConsoleLink, and the
+      ArgoCD instance in the correct order to prevent orphaned finalizers. Has dry-run
+      support. Requires complex list input via extra-vars (YAML), not Survey.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/cleanup-argocd-instance.yml
+    verbosity: 1
+    # No permanent credential - target Hub changes on every job.
+    # Operator attaches: ACM DR Target Cluster at launch.
+    ask_credential_on_launch: true
+    # Extra vars must be accepted at launch time: acm_argocd_instances_cleanup is a
+    # complex list that can't be expressed as a survey question, so operators pass it
+    # as YAML via the "Extra Variables" field in the launch dialog or API payload.
+    ask_variables_on_launch: true
+    credentials: []
+    survey_enabled: false
+
+  # ---------------------------------------------------------------------------
+  # 7. JT - ACM DR - LAB - Spoke Onboarding
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - Spoke Onboarding
+    description: >-
+      Full Spoke onboarding pipeline: provisions the ansible-dr-orchestrator
+      ServiceAccount on the Spoke, updates the fleet Secret on the Hub, and runs
+      the Hub-side RHACM registration (ManagedCluster, KlusterletAddonConfig,
+      auto-import-secret). No permanent per-Spoke AAP credential is needed for
+      failover because the fleet Secret aggregates all Spoke SA tokens.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/manage-spoke.yml
+    verbosity: 1
+    # No permanent credential - Hub context and Spoke change on every job.
+    # Operator attaches: ACM DR Target Cluster + ACM DR Spoke Cluster at launch.
+    ask_credential_on_launch: true
+    # Extra vars must be accepted at launch time for overrides not in the survey
+    # (e.g., acm_dr_spoke_manager_context_map for custom context naming). AAP default: False.
+    ask_variables_on_launch: true
+    credentials: []
+    extra_vars:
+      acm_dr_spoke_manager_action: "onboard"
+      # Disables no_log on k8s_info calls so AAP job stdout shows full API
+      # responses during lab validation. Set to true for production use where
+      # kubeconfig tokens and SA secrets must stay masked in job logs.
+      acm_dr_spoke_manager_debug_no_log: true
+    survey_enabled: true
+    survey_spec:
+      name: Spoke Onboarding Survey
+      description: >-
+        Collects Spoke identification and labeling parameters for the
+        onboarding pipeline.
+      spec:
+        # --- 1. SPOKE CLUSTER NAME ---
+        - variable: acm_dr_spoke_manager_cluster_name
+          type: text
+          required: true
+          question_name: Spoke Cluster Name (Required)
+          question_description: >-
+            The name that identifies this Spoke in RHACM (ManagedCluster object name).
+            Use lowercase alphanumeric characters and hyphens only (e.g., aro-spoke-01,
+            eks-prod-us-east).
+          default: ""
+          min: 3
+          max: 63
+          new_question: true
+
+        # --- 2. ENVIRONMENT LABEL ---
+        - variable: acm_dr_spoke_manager_cluster_environment
+          type: multiplechoice
+          required: true
+          question_name: Environment Label (Required)
+          question_description: >-
+            The environment label applied to the ManagedCluster object in RHACM.
+            Controls policy placement and Spoke grouping in the ACM console.
+          default: lab
+          choices:
+            - lab
+            - dev
+            - hml
+            - prd
+          new_question: true
+
+        # --- 3. CLOUD PROVIDER ---
+        - variable: acm_dr_spoke_manager_cluster_cloud
+          type: multiplechoice
+          required: false
+          question_name: Cloud Provider (Optional)
+          question_description: >-
+            The cloud provider label applied to the ManagedCluster object. For OpenShift
+            Spokes this is auto-detected from Infrastructure.status.platform. For non-OCP
+            Spokes (AKS, EKS, GKE, IKS, vanilla K8s), select the matching provider.
+            Values match the canonical labels that RHACM uses in the console and
+            ClusterClaim 'platform.open-cluster-management.io'.
+          default: ""
+          choices:
+            - ""
+            - Amazon
+            - Azure
+            - Google
+            - IBMCloud
+            - VSphere
+            - BareMetal
+            - OpenStack
+            - Nutanix
+            - Alibaba
+            - Other
+          new_question: true
+
+  # ---------------------------------------------------------------------------
+  # JT 8: JT - ACM DR - LAB - DR Readiness Check
+  # Read-only health gate - runs before a failover or as scheduled monitoring.
+  # ---------------------------------------------------------------------------
+  - name: JT - ACM DR - LAB - DR Readiness Check
+    description: >-
+      Read-only health verification of both Hub clusters before a failover or DR drill.
+      Checks BackupSchedule active on Source Hub, BackupStorageLocation Available, latest
+      backup within RPO, passive sync Restore present on Destination Hub, and Spoke fleet
+      count. Produces a ✅/⚠️ summary per check. No cluster state is modified.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/check-dr-readiness.yml
+    verbosity: 1
+    ask_credential_on_launch: true
+    ask_variables_on_launch: true
+    credentials: []
+    extra_vars: {}
+    survey_enabled: true
+    survey_spec:
+      name: DR Readiness Check Survey
+      description: >-
+        Overrides for RPO threshold and minimum Spoke count. Source and Destination Hub
+        contexts are derived from the credentials attached at launch
+        (ACM_DR_SOURCE_CONTEXT and ACM_DR_DEST_CONTEXT env vars).
+      spec:
+        # --- 1. RPO THRESHOLD ---
+        - variable: acm_dr_readiness_check_rpo_seconds
+          type: integer
+          required: false
+          question_name: RPO Threshold in Seconds (Optional)
+          question_description: >-
+            Maximum acceptable age of the last successful backup, in seconds. The check
+            warns (or fails if Fail on Stale Backup is "true") when the backup is
+            older than this value. Default is 25200 (7 hours). Minimum 3600 (1 hour).
+          default: 25200
+          min: 3600
+          max: 86400
+          new_question: true
+
+        # --- 2. MINIMUM SPOKE COUNT ---
+        - variable: acm_dr_readiness_check_min_spoke_count
+          type: integer
+          required: false
+          question_name: Minimum Expected Spoke Count (Optional)
+          question_description: >-
+            Minimum number of Managed Clusters expected on the Source Hub, excluding
+            local-cluster. The check prints a warning when the actual count falls below
+            this value. Set to 0 to skip the count check (default).
+          default: 0
+          min: 0
+          max: 500
+          new_question: true
+
+        # --- 3. FAIL ON STALE BACKUP ---
+        - variable: acm_dr_readiness_check_fail_on_stale_backup
+          type: multiplechoice
+          required: false
+          question_name: Fail on Stale Backup (Optional)
+          question_description: >-
+            When "true", the job fails if the latest backup exceeds the RPO threshold
+            instead of issuing a non-blocking warning. Use "true" for pre-failover gates;
+            use "false" for routine monitoring where a warning is acceptable.
+          default: "false"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+        # --- 4. FAIL ON MISSING PASSIVE RESTORE ---
+        - variable: acm_dr_readiness_check_fail_on_missing_restore
+          type: multiplechoice
+          required: false
+          question_name: Fail on Missing Passive Restore (Optional)
+          question_description: >-
+            When "true", the job fails if no passive sync Restore CR
+            (syncRestoreWithNewBackups=true) is found on the Destination Hub. Default
+            is "true" because an absent passive Restore means the DR Hub is not
+            pre-positioned and failover will be slower or incomplete.
+          default: "true"
+          choices:
+            - "true"
+            - "false"
+          new_question: true
+
+# =============================================================================
+# JT - ACM DR - LAB - Cluster Bootstrap
+# =============================================================================
+# Creates the ansible-dr-orchestrator ServiceAccount, ClusterRoleBinding, and
+# non-expiring token Secret on a target cluster. Run once per cluster (Hub or
+# Spoke) before configuring permanent credentials in AAP.
+#
+# CREDENTIALS:
+#   - At launch: attach the built-in "OpenShift or Kubernetes API Bearer Token"
+#     with a temporary cluster-admin token (ask_credential_on_launch: true).
+#   - Permanent: "AAP Bootstrap Automation (API Token)" is pre-attached and provides
+#     CONTROLLER_HOST and CONTROLLER_OAUTH_TOKEN for automatic AAP credential
+#     self-registration at the end of bootstrap.
+#
+# After the job completes, the permanent "ACM DR - Target Cluster" credential is
+# created automatically in AAP. Delete the temporary cluster-admin credential.
+# Re-running with the same credential name rotates the stored SA token.
+# =============================================================================
+
+  - name: "JT - ACM DR - LAB - Cluster Bootstrap"
+    description: >-
+      Creates the ansible-dr-orchestrator ServiceAccount, ClusterRoleBinding, and
+      non-expiring token Secret on a target cluster. At the end of the job, the
+      permanent 'ACM DR - Target Cluster' credential is created or updated in AAP
+      automatically (requires 'AAP Bootstrap Automation (API Token)' credential, pre-attached).
+      Idempotent - safe to re-run; re-running rotates the stored SA token.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    playbook: playbooks/bootstrap-cluster.yml
+    execution_environment: "{{ aap_execution_environment }}"
+    job_type: run
+    ask_credential_on_launch: true
+    ask_variables_on_launch: true
+    # "AAP Bootstrap Automation (API Token)" is attached via setup-aap-from-casc.yml --tags credentials
+    # (step 6b, after the credential instance is created). On first import, credentials: [] so
+    # the JT import succeeds before the credential exists.
+    credentials: []
+    survey_enabled: true
+    survey_spec:
+      name: ""
+      description: ""
+      spec:
+        - variable: acm_dr_cluster_onboard_aap_credential_name
+          type: text
+          required: true
+          question_name: "Permanent Credential Name in AAP (Required)"
+          question_description: >-
+            The name of the permanent 'ACM DR - Target Cluster' credential to create or
+            update in AAP after bootstrap completes. Follow the naming convention:
+            '<Distro> <Role> <NN> (SA)' (e.g., 'ARO Hub 01 (SA)', 'ARO Spoke 01 (SA)').
+            Re-running with the same name rotates the stored SA token.
+          default: ""
+          new_question: true
+
+        - variable: acm_dr_cluster_onboard_cluster_name
+          type: text
+          required: false
+          question_name: "Cluster Display Name (Optional)"
+          question_description: >-
+            A short identifier for this cluster used as the kubeconfig context name in the
+            permanent credential (e.g., hub-01, hub-02, spoke-01). Also
+            shown in the job output message. If left empty, the Permanent Credential Name
+            is used as the context name.
+          default: ""
+          new_question: true
+
+        - variable: acm_dr_cluster_onboard_aap_organization
+          type: text
+          required: false
+          question_name: "AAP Organization (Optional)"
+          question_description: >-
+            The AAP organization under which to create the permanent credential. Defaults to
+            'Default'. Change only if your environment uses a dedicated organization for ACM DR.
+          default: "Default"
+          new_question: true
+
+        - variable: acm_dr_cluster_onboard_sa_name
+          type: text
+          required: false
+          question_name: "ServiceAccount Name (Optional)"
+          question_description: >-
+            Name of the ServiceAccount to create. Defaults to 'ansible-dr-orchestrator',
+            which all other ACM DR Job Templates expect. Change only if your organization
+            enforces a different SA naming convention and all other templates are updated
+            to match.
+          default: "ansible-dr-orchestrator"
+          new_question: true
+
+        - variable: acm_dr_cluster_onboard_namespace
+          type: text
+          required: false
+          question_name: "Automation Namespace (Optional)"
+          question_description: >-
+            Namespace where the ServiceAccount and token Secret are created on the target
+            cluster. Defaults to 'ansible-automation', a descriptive namespace that works
+            on any cluster regardless of whether AAP is installed there. Must match the
+            namespace used by the other ACM DR Job Templates for this cluster.
+          default: "ansible-automation"
+          new_question: true
+
+  # ---------------------------------------------------------------------------
+  # 10. JT - ACM DR - LAB - Check Approval Outcome
+  # ---------------------------------------------------------------------------
+  # Called from the failure path of WJT Approval Nodes to classify the outcome
+  # as explicit denial or timeout, then send a distinct notification.
+  #
+  # Credentials to attach permanently:
+  #   ACM DR - AAP Automation Token   - provides CONTROLLER_HOST, CONTROLLER_OAUTH_TOKEN,
+  #                                     CONTROLLER_VERIFY_SSL for the AAP REST API query
+  #   ACM DR - Notification Webhook   - provides NOTIF_WEBHOOK_URL, NOTIF_WEBHOOK_FORMAT
+  #
+  # Reusable in WF-01 (DR Failover), WF-02 (Planned Maintenance), and WF-05 (DR Drill).
+  - name: "JT - ACM DR - LAB - Check Approval Outcome"
+    description: >-
+      Called from WJT Approval Node failure paths to determine whether the gate was
+      explicitly denied by an operator or expired by timeout. Queries the AAP REST API
+      for the approval record (timed_out field) and sends a distinct notification via
+      the ACM DR - Notification Webhook credential. Always exits rc=0 so the WJT failure
+      path is not further complicated by an additional diagnostic failure. Reusable across
+      WF-01 (DR Failover), WF-02 (Planned Maintenance), and WF-05 (Full DR Drill).
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/check-approval-outcome.yml
+    job_type: run
+    verbosity: 1
+    ask_credential_on_launch: false
+    ask_variables_on_launch: true
+    # Attach permanently: ACM DR - AAP Automation Token + ACM DR - Notification Webhook.
+    # The playbook reads CONTROLLER_HOST, CONTROLLER_OAUTH_TOKEN, NOTIF_WEBHOOK_URL,
+    # and NOTIF_WEBHOOK_FORMAT from the EE environment set by these two credential types.
+    credentials: []
+    survey_enabled: true
+    survey_spec:
+      name: ""
+      description: ""
+      spec:
+        - variable: wf_name
+          type: text
+          required: false
+          question_name: "Workflow Name (Optional)"
+          question_description: >-
+            The display name of the parent workflow, included in the notification body
+            so operators can identify which workflow's approval gate fired. Use the
+            exact WJT name from AAP (e.g., 'WF - ACM DR - LAB - Hub Switchover').
+          default: "(unknown workflow)"
+          min: 0
+          max: 128
+          new_question: true
+
+  # ---------------------------------------------------------------------------
+  # 11. JT - ACM DR - LAB - Switchover State Diagnostics
+  # ---------------------------------------------------------------------------
+  # Called when the Hub Switchover JT fails in a WJT failure path. Probes both
+  # Hub clusters, classifies how far the failover progressed, and sends a
+  # structured diagnostic report. Never attempts remediation.
+  #
+  # Credentials to attach at WJT node level (same as Hub Switchover JT):
+  #   ACM DR - Source Hub             - provides ACM_DR_SOURCE_HOST, ACM_DR_SOURCE_TOKEN,
+  #                                     ACM_DR_SOURCE_CA_DATA, ACM_DR_SOURCE_CONTEXT
+  #   ACM DR - Destination Hub        - provides ACM_DR_DEST_HOST, ACM_DR_DEST_TOKEN,
+  #                                     ACM_DR_DEST_CA_DATA, ACM_DR_DEST_CONTEXT
+  #   ACM DR - Notification Webhook   - provides NOTIF_WEBHOOK_URL, NOTIF_WEBHOOK_FORMAT
+  - name: "JT - ACM DR - LAB - Switchover State Diagnostics"
+    description: >-
+      Called when the Hub Switchover JT fails. Probes both Hub clusters and classifies
+      the failure into one of five states: connectivity failure, partial connectivity,
+      failover not started, mid-flight (Source Hub fenced but no Restore completed on
+      Destination), or post-restore failure. Sends a structured diagnostic report via
+      the ACM DR - Notification Webhook credential. Does not attempt remediation.
+      Always exits rc=0. Attach Source Hub, Destination Hub, and Notification Webhook
+      credentials at the WJT node level. Reusable in WF-01 and WF-02 failure paths.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/diagnose-failover-state.yml
+    job_type: run
+    verbosity: 1
+    ask_credential_on_launch: true
+    ask_variables_on_launch: true
+    # Attach at WJT node level: Source Hub + Dest Hub + Notification Webhook.
+    # These change per-environment just like the Hub Switchover JT credentials do.
+    credentials: []
+    survey_enabled: true
+    survey_spec:
+      name: ""
+      description: ""
+      spec:
+        - variable: acm_dr_failover_action
+          type: multiplechoice
+          required: true
+          question_name: "Failover Action (Required)"
+          question_description: >-
+            The direction of the operation that failed. Controls how Source and Destination
+            Hub are labelled in the diagnostic report. Use 'failover' when the primary hub
+            was the source; use 'failback' when the secondary hub was the source.
+          default: "failover"
+          choices:
+            - failover
+            - failback
+          new_question: true
+
+        - variable: wf_name
+          type: text
+          required: false
+          question_name: "Workflow Name (Optional)"
+          question_description: >-
+            Display name of the failed workflow, included in the diagnostic notification
+            body (e.g., 'WF - ACM DR - LAB - Hub Switchover'). Helps operators correlate
+            the notification with the WJT run in AAP.
+          default: "(unknown workflow)"
+          min: 0
+          max: 128
+          new_question: true
+
+  # ---------------------------------------------------------------------------
+  # 12. JT - ACM DR - LAB - Notify Workflow Event
+  # ---------------------------------------------------------------------------
+  # Generic notification sender for WJT event nodes. Replaces the pattern of
+  # calling Hub Switchover JT with drill_summary_only=true just to fire a notification.
+  #
+  # Credentials to attach permanently:
+  #   ACM DR - Notification Webhook   - provides NOTIF_WEBHOOK_URL, NOTIF_WEBHOOK_FORMAT
+  #
+  # Used in: WF-05 (drill completed), WF-02 (upgrade window opened), WF-04 (onboarding done)
+  - name: "JT - ACM DR - LAB - Notify Workflow Event"
+    description: >-
+      Generic notification sender for WJT event nodes. Accepts notification_message,
+      notification_title, and notification_severity via Survey and sends a formatted
+      webhook notification. Payload format (Slack text, Teams Adaptive Card, or
+      generic-json) is controlled by the ACM DR - Notification Webhook credential.
+      Exits rc=0 only when the webhook returns HTTP 200/202/204 - use in WJT paths
+      where delivery confirmation matters. Replaces the drill_summary_only=true hack
+      on Hub Switchover JT in WF-05 and serves WF-02 and WF-04 event notifications.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/notify-workflow-event.yml
+    job_type: run
+    verbosity: 1
+    ask_credential_on_launch: false
+    ask_variables_on_launch: true
+    # Attach permanently: ACM DR - Notification Webhook.
+    credentials: []
+    survey_enabled: true
+    survey_spec:
+      name: ""
+      description: ""
+      spec:
+        - variable: notification_message
+          type: text
+          required: true
+          question_name: "Notification Message (Required)"
+          question_description: >-
+            The body text of the notification. Plain text; Markdown is supported in
+            Slack format (bold with *asterisks*, line breaks with \n). Keep it short
+            enough to be readable in a mobile notification (under 500 characters).
+          default: ""
+          min: 1
+          max: 1024
+          new_question: true
+
+        - variable: notification_title
+          type: text
+          required: false
+          question_name: "Notification Title (Optional)"
+          question_description: >-
+            A short title line shown as a heading in the notification. Defaults to
+            'ACM DR Notification' if not provided. Appears as the first line in Slack
+            format and as the card header in Teams Adaptive Card format.
+          default: "ACM DR Notification"
+          min: 0
+          max: 128
+          new_question: true
+
+        - variable: notification_severity
+          type: multiplechoice
+          required: false
+          question_name: "Notification Severity (Optional)"
+          question_description: >-
+            Severity level appended to the notification title and included in the
+            generic-json payload. Affects routing in ITSM integrations. Has no visual
+            effect on Slack or Teams beyond the label text. Defaults to 'info'.
+          default: "info"
+          choices:
+            - info
+            - warning
+            - critical
+          new_question: true
+
+  - name: "JT - ACM DR - LAB - Hub ACM Channel Upgrade"
+    description: >-
+      Patches the ACM operator Subscription to a new OLM channel on the target
+      Hub and waits for the MultiClusterHub to reach Running. Runs automatically
+      inside WF - ACM DR - LAB - Planned Maintenance Switchover after the approval
+      gate, while the Hub is idle (BackupSchedule paused). OLM resolves the latest
+      z-stream in the target channel automatically (e.g., release-2.15 installs the
+      latest 2.15.x). The target Hub must be idle and the MCH must be Running before
+      this JT runs.
+    organization: "{{ aap_organization }}"
+    project: "{{ aap_project }}"
+    inventory: "{{ aap_inventory }}"
+    execution_environment: "{{ aap_execution_environment }}"
+    playbook: playbooks/upgrade-hub-acm-channel.yml
+    job_type: run
+    verbosity: 1
+    ask_credential_on_launch: true   # WF nodes inject Primary or Secondary SA per node
+    ask_variables_on_launch: true
+    # Default covers direct launches (Primary Hub). WF node 32 overrides with Secondary SA.
+    credentials:
+      - "ARO Hub 01 (SA)"
+    survey_enabled: true
+    survey_spec:
+      name: "ACM Channel Upgrade Configuration"
+      description: >-
+        Controls which ACM version the idle Hub upgrades to. When launched from
+        WF - ACM DR - LAB - Planned Maintenance Switchover, the WF survey variable
+        acm_dr_failover_manager_target_acm_version is passed automatically and
+        the role accepts it as a fallback - no separate survey answer needed.
+      spec:
+        - variable: acm_dr_upgrade_manager_target_acm_version
+          type: text
+          required: false
+          question_name: "Target ACM Version (Optional - inherited from WF survey)"
+          question_description: >-
+            The target RHACM major.minor version to upgrade to (e.g., '2.15').
+            Leave empty when launching from WF - ACM DR - LAB - Planned Maintenance
+            Failover, which passes acm_dr_failover_manager_target_acm_version
+            automatically. Required only for direct launches outside the WF.
+          default: ""
+          min: 0
+          max: 10
+          new_question: true
+
+...

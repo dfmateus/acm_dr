@@ -1,0 +1,16 @@
+---
+# examples/scripts/testing/mock_data/dry_run.yml
+# Scenario 7: Dry-run mode. Residual Spokes are present but expected (the
+# old Hub was not actually purged). Expects "DRY-RUN" markers and no anomaly
+# flag for residual spokes.
+_scenario_name: "dry_run"
+
+acm_dr_failover_manager_dry_run: true
+
+# Residual spokes are present in dry-run but do NOT count as anomalies
+acm_dr_failover_manager_residual_spokes:
+  - "aro-spoke-01"
+  - "aro-spoke-02"
+  - "aro-spoke-03"
+
+...

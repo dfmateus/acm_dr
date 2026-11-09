@@ -1,0 +1,86 @@
+---
+# =============================================================================
+# INITIALIZATION TASK & OPERATIONAL METADATA
+# =============================================================================
+
+- name: "MAIN | Display role initialization status and operational metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    # acm_dr_hub_setup_is_primary_hub in defaults already resolves is_primary_hub | default(false) | bool,
+    # so it is always defined and carries the correct value without needing a fallback chain here.
+    acm_dr_hub_setup_is_primary: "{{ acm_dr_hub_setup_is_primary_hub }}"
+    _hub_type_desc: "{{ acm_dr_hub_setup_is_primary | ternary('PRIMARY HUB (ACTIVE)', 'SECONDARY / PASSIVE HUB (DR)') }}"
+    acm_dr_hub_setup_banner_title: "🚀 INITIALIZING: ACM DR LAB SETUP FRAMEWORK"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT (K8S):  {{ k8s_target_context | default('NOT DEFINED') }}"
+      - "🎛️  HUB TYPE:              {{ _hub_type_desc }}"
+      - "☁️ CLOUD PROVIDER:        {{ acm_dr_hub_setup_cloud_provider | default('azure') }}"
+      - >-
+        {{
+          (acm_dr_hub_setup_cloud_provider | default('azure') == 'aws')
+          | ternary(
+              '🌐 AWS REGION:            ' ~ (acm_dr_hub_setup_aws_region | default('NOT DEFINED')),
+              '📦 AZURE RESOURCE GROUP: ' ~ (acm_dr_hub_setup_azure_resource_group | default('NOT DEFINED'))
+            )
+        }}
+      - "🔗 GITOPS REPOSITORY:    {{ acm_dr_hub_setup_github_repo_url | default('NOT DEFINED') }}"
+  run_once: true
+  tags:
+    - always
+
+- name: "[SETUP LAB DR] | Execute Stage 00 - Preflight & Safety Validation"
+  ansible.builtin.import_tasks: common/00_preflight.yml
+  tags:
+    - preflight
+    - stage00
+
+# Provider-specific storage provisioning: include_tasks resolves the file
+# path at runtime based on cloud_provider (azure or aws). Each provider
+# has its own subfolder under tasks/. The apply block propagates tags to
+# child tasks; outer tags let --tags filtering reach this include itself.
+- name: "[SETUP LAB DR] | Execute Stage 01 - Provision Cloud Storage"
+  ansible.builtin.include_tasks:
+    file: "{{ acm_dr_hub_setup_cloud_provider }}/01_storage.yml"
+    apply:
+      tags:
+        - cloud_storage
+        - stage01
+  tags:
+    - cloud_storage
+    - azure_storage
+    - aws_storage
+    - stage01
+
+- name: "[SETUP LAB DR] | Execute Stage 02 - Install and Configure MultiClusterHub"
+  ansible.builtin.import_tasks: common/02_mch_install.yml
+  tags:
+    - mch_install
+    - stage02
+
+- name: "[SETUP LAB DR] | Execute Stage 03 - Install and Configure Observability (Thanos)"
+  ansible.builtin.import_tasks: common/03_observability.yml
+  tags:
+    - observability
+    - stage03
+
+- name: "[SETUP LAB DR] | Execute Stage 04 - Configure OpenShift GitOps & ArgoCD"
+  ansible.builtin.import_tasks: common/04_gitops_argocd.yml
+  # when: applied to import_tasks propagates to every imported task individually.
+  when: acm_dr_hub_setup_enable_gitops | default(true) | bool
+  tags:
+    - gitops
+    - stage04
+
+- name: "[SETUP LAB DR] | Execute Stage 05 - Configure OADP, DPA and BackupSchedule"
+  ansible.builtin.import_tasks: common/05_oadp_dpa.yml
+  tags:
+    - oadp
+    - stage05
+
+- name: "[SETUP LAB DR] | Execute Stage 06 - Hub Compliance Audit and Validation"
+  ansible.builtin.import_tasks: common/06_validate_hubs.yml
+  tags:
+    - validate
+    - stage06
+...

@@ -1,0 +1,126 @@
+---
+# roles/acm_argocd_instance/defaults/main.yml
+# =============================================================================
+# DEFAULT VARIABLES FILE - ARGOCD INSTANCE (GENERIC)
+# =============================================================================
+# This role does NOT assume any specific use case (Governance, AppDemo, etc.)
+# -- each instance is 100% defined by the variables below, typically passed
+# via a loop item from the 'acm_argocd_instances' list (see playbooks/manage-argocd-instance.yml).
+
+# -----------------------------------------------------------------------------
+# 1. COSMETIC AND LOGGING PARAMETERS
+# -----------------------------------------------------------------------------
+acm_argocd_instance_setup_separator_char: "="
+
+# Suppresses task output for security-sensitive operations (tokens, secrets,
+# kubeconfig content). Set to false (-e acm_argocd_instance_setup_debug_no_log=false)
+# to expose hidden output during troubleshooting sessions.
+acm_argocd_instance_setup_debug_no_log: true  # bool - set false to reveal no_log task output
+
+# -----------------------------------------------------------------------------
+# 2. INSTANCE IDENTITY (REQUIRED)
+# -----------------------------------------------------------------------------
+# No hardcoded example value on purpose: the mandatory assert in
+# tasks/00_validate.yml must fail loudly if the caller does not provide a name/namespace.
+acm_argocd_instance_setup_name: ""
+acm_argocd_instance_setup_namespace: ""
+
+# -----------------------------------------------------------------------------
+# 3. OPENSHIFT GITOPS OPERATOR (INSTALLED ONCE PER CLUSTER, IDEMPOTENT)
+# -----------------------------------------------------------------------------
+# The operator is cluster-wide: even with multiple ArgoCD instances, it only needs
+# to be installed once. The installation tasks are idempotent and can run again
+# without side effects in subsequent executions (for other instances).
+acm_argocd_instance_setup_manage_operator: true
+acm_argocd_instance_setup_gitops_operator_namespace: "openshift-gitops-operator"
+acm_argocd_instance_setup_gitops_channel: "auto"
+acm_argocd_instance_setup_gitops_approval: "Automatic"
+
+# -----------------------------------------------------------------------------
+# 4. INSTANCE RBAC/SSO (ARGOCD UI LOGIN)
+# -----------------------------------------------------------------------------
+acm_argocd_instance_setup_rbac_default_policy: ""
+acm_argocd_instance_setup_rbac_policy: |
+  g, system:cluster-admins, role:admin
+  g, cluster-admins, role:admin
+acm_argocd_instance_setup_rbac_scopes: "[groups]"
+acm_argocd_instance_setup_sso_enabled: true
+
+# -----------------------------------------------------------------------------
+# 5. CLUSTER-SCOPED RBAC (ALLOWS THE APPLICATION-CONTROLLER TO WRITE OUTSIDE
+#    THE INSTANCE'S OWN NAMESPACE -- REQUIRED IF THE APPLICATIONS' DESTINATION
+#    IS A NAMESPACE DIFFERENT FROM THE INSTANCE'S NAMESPACE)
+# -----------------------------------------------------------------------------
+# Field Finding (see roles/acm_dr_hub_setup#-field-finding): without this, the
+# application-controller can only manage resources within its own namespace.
+# Default 'false' -- the consumer decides whether it is needed, rather than
+# inheriting cluster-admin without a real requirement.
+acm_argocd_instance_setup_cluster_admin_rbac: false
+
+# -----------------------------------------------------------------------------
+# 6. GIT REPOSITORY (OPTIONAL -- ONLY CREATES THE SECRET IF 'repo_url' IS PROVIDED)
+# -----------------------------------------------------------------------------
+acm_argocd_instance_setup_repo_url: ""
+acm_argocd_instance_setup_repo_username: ""
+acm_argocd_instance_setup_repo_pat: ""
+acm_argocd_instance_setup_repo_target_revision: "main"
+
+# -----------------------------------------------------------------------------
+# 7. MANAGED NAMESPACES (APPLICATION DESTINATIONS, PRE-CREATED VIA ANSIBLE)
+# -----------------------------------------------------------------------------
+# Field Finding (see roles/acm_dr_hub_setup - Field Finding: Multi-Tenancy Gap
+# Chain): pre-creating the namespace via Ansible (instead of ArgoCD's own
+# CreateNamespace=true) avoids the gitops-engine "namespaced mode" lock for
+# cluster-scoped resources. Each item: {name: "...", managed_by_label: true|false}
+acm_argocd_instance_setup_managed_namespaces: []
+
+# -----------------------------------------------------------------------------
+# 8. RESOURCE EXCLUSIONS FROM THIS INSTANCE'S SCOPE
+# -----------------------------------------------------------------------------
+# Use when the customer's repository content declares a cluster-scoped resource
+# (e.g., Namespace) that this instance will never be able to manage anyway
+# (see Field Finding referenced above). Each item:
+# {api_groups: ["..."], kinds: ["..."]}
+acm_argocd_instance_setup_resource_exclusions: []
+
+# -----------------------------------------------------------------------------
+# 9. APPLICATION GENERATOR (ApplicationSet) -- CHOOSE THE MODEL PER USE CASE
+# -----------------------------------------------------------------------------
+# 'none'            : only creates the ArgoCD instance (no ApplicationSet at all).
+# 'list'            : static list of Applications (e.g., demo workloads).
+# 'cluster_decision' : fan-out via RHACM Placement (e.g., Governance Policies).
+acm_argocd_instance_setup_generator_type: "none"
+
+# --- generator_type: list ---
+# Each item: {name: "...", path: "...", destination_namespace: "...",
+#              destination_server: "https://kubernetes.default.svc"}
+acm_argocd_instance_setup_applications: []
+
+# --- generator_type: cluster_decision ---
+acm_argocd_instance_setup_placement_name: ""
+acm_argocd_instance_setup_placement_configmap: "acm-placement"
+acm_argocd_instance_setup_cluster_decision_path: ""
+acm_argocd_instance_setup_cluster_decision_destination_namespace: ""
+
+# -----------------------------------------------------------------------------
+# 10. RHACM INTEGRATION (GITOPSCLUSTER + LOCAL PLACEMENT + MANAGEDCLUSTERSETBINDING)
+# -----------------------------------------------------------------------------
+# Required once per instance whose ApplicationSet uses the 'cluster_decision'
+# generator -- registers ArgoCD as a valid GitOps destination in RHACM.
+acm_argocd_instance_setup_wire_rhacm_integration: false
+acm_argocd_instance_setup_cluster_set: "default"
+
+# -----------------------------------------------------------------------------
+# 11. SYNC POLICY FOR GENERATED APPLICATIONS
+# -----------------------------------------------------------------------------
+acm_argocd_instance_setup_sync_automated: true
+acm_argocd_instance_setup_sync_prune: true
+acm_argocd_instance_setup_sync_self_heal: true
+
+# -----------------------------------------------------------------------------
+# 12. CONSOLE LINK (OPTIONAL -- SHORTCUT IN THE OPENSHIFT APPLICATION MENU)
+# -----------------------------------------------------------------------------
+acm_argocd_instance_setup_console_link_enabled: false
+acm_argocd_instance_setup_console_link_text: ""
+acm_argocd_instance_setup_console_link_section: "OpenShift GitOps"
+...

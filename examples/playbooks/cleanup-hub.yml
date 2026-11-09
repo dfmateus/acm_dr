@@ -1,0 +1,36 @@
+---
+# examples/playbooks/cleanup-hub.yml
+# Decommission a Hub's DR configuration (dry-run by default).
+# Removes MCH, OADP config, Observability, and GitOps while preserving
+# the operators themselves and Azure backup data.
+#
+# Required extra vars:
+#   k8s_target_context          - kubeconfig context for the Hub to decommission
+#   acm_dr_hub_cleanup_confirm  - must be true (safety gate)
+#
+# Usage (dry-run, recommended first):
+#   ansible-playbook examples/playbooks/cleanup-hub.yml \
+#     -e k8s_target_context="acm-dr-hub-sa" \
+#     -e acm_dr_hub_cleanup_confirm=true
+#
+# Usage (live cleanup):
+#   ansible-playbook examples/playbooks/cleanup-hub.yml \
+#     -e k8s_target_context="acm-dr-hub-sa" \
+#     -e acm_dr_hub_cleanup_confirm=true \
+#     -e acm_dr_hub_cleanup_dry_run=false
+
+- name: Cleanup Hub DR configuration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    # Resolve kubeconfig from per-cluster credentials or fall back to KUBECONFIG env var
+    - role: dfmateus.acm_dr.acm_dr_kubeconfig_resolver
+
+    # Decommission the DR stack from the Hub
+    - role: dfmateus.acm_dr.acm_dr_hub_cleanup
+      vars:
+        k8s_target_context: "acm-dr-hub-sa"  # Hub to decommission
+        acm_dr_hub_cleanup_confirm: true  # mandatory safety gate
+        acm_dr_hub_cleanup_dry_run: true  # safe default, no mutations
+...

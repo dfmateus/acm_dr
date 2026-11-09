@@ -1,0 +1,433 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 02 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | Display Red Hat ACM installation metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "🚀 STAGE 02 - Red Hat ACM MultiClusterHub Deployment"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT: {{ k8s_target_context }}"
+      - "📡 ACM CHANNEL:    {{ acm_dr_hub_setup_mch_channel }}"
+      - "📂 NAMESPACE:     {{ acm_dr_hub_setup_mch_namespace }}"
+      - "⚙️ CR NAME:       {{ acm_dr_hub_setup_mch_name }}"
+  run_once: true
+
+# =============================================================================
+# STEP 2.1: IDEMPOTENCY EVALUATION AND PREREQUISITE CHECKS
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | 2.1.1) Check whether the MultiClusterHub resource already exists on the cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_setup_mch_name }}"
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+  register: acm_dr_hub_setup_existing_mch
+
+- name: "[STAGE 02 - MCH] | 2.1.2) Set ACM installation state fact - {{ k8s_target_context }}"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_already_installed: >-
+      {{
+        acm_dr_hub_setup_existing_mch.resources | length > 0 and
+        (acm_dr_hub_setup_existing_mch.resources[0].status.phase | default('')) == 'Running'
+      }}
+
+- name: "[STAGE 02 - MCH] | 2.1.3) Report ACM presence status on the cluster - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        '✅ [INFO]: Red Hat ACM is already installed and operational on context (' ~ k8s_target_context ~
+        '). MCH provisioning will be skipped.'
+        if acm_dr_hub_setup_already_installed
+        else '📢 [INFO]: Red Hat ACM not detected or in transition on context (' ~ k8s_target_context ~
+        '). Starting deployment via channel ' ~ acm_dr_hub_setup_mch_channel ~ '.'
+      }}
+
+# =============================================================================
+# STEP 2.2: NAMESPACES, REPOSITORY SECRETS, AND OLM STRUCTURE
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | 2.2.1) Ensure Namespace {{ acm_dr_hub_setup_mch_namespace }} is present - {{ k8s_target_context }}" # noqa name[template]
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    kind: Namespace
+    name: "{{ acm_dr_hub_setup_mch_namespace }}"
+    state: present
+  when: not acm_dr_hub_setup_already_installed
+
+- name: "[STAGE 02 - MCH] | 2.2.2) Retrieve the global-pull-secret from the openshift-config namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Secret
+    name: pull-secret
+    namespace: openshift-config
+  register: acm_dr_hub_setup_global_pull_secret
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not acm_dr_hub_setup_already_installed
+
+- name: "[STAGE 02 - MCH] | 2.2.3) Replicate rhacm-pull-secret to the ACM namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ acm_dr_hub_setup_mch_pull_secret }}"
+        namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: "{{ acm_dr_hub_setup_global_pull_secret.resources[0].data['.dockerconfigjson'] }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not acm_dr_hub_setup_already_installed
+
+- name: "[STAGE 02 - MCH] | 2.2.4) Create OperatorGroup for Red Hat ACM - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: open-cluster-management-group
+        namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+      spec:
+        targetNamespaces:
+          - "{{ acm_dr_hub_setup_mch_namespace }}"
+  when: not acm_dr_hub_setup_already_installed
+
+- name: "[STAGE 02 - MCH] | 2.2.5) Create Advanced Cluster Management operator Subscription - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: advanced-cluster-management
+        namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+      spec:
+        channel: "{{ acm_dr_hub_setup_mch_channel }}"
+        installPlanApproval: Automatic
+        name: advanced-cluster-management
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+  when: not acm_dr_hub_setup_already_installed
+
+# =============================================================================
+# STEP 2.3: OPERATOR AND ACM WEBHOOK READINESS WAIT
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | 2.3.1) ⏳ WAIT - MultiClusterHub CRD availability - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: CustomResourceDefinition
+    name: multiclusterhubs.operator.open-cluster-management.io
+  register: acm_dr_hub_setup_mch_crd_check
+  until: (acm_dr_hub_setup_mch_crd_check.resources | default([])) | length > 0
+  retries: 30
+  delay: 10
+  when: not acm_dr_hub_setup_already_installed
+  ignore_errors: true
+
+- name: "[STAGE 02 - MCH] | 2.3.2) ⏳ WAIT - multiclusterhub-operator Deployment readiness - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    name: multiclusterhub-operator
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+  register: acm_dr_hub_setup_mch_operator_deployment
+  until: >-
+    (acm_dr_hub_setup_mch_operator_deployment.resources | default([])) | length > 0 and
+    (acm_dr_hub_setup_mch_operator_deployment.resources[0].status.readyReplicas | default(0) | int) > 0
+  retries: 30
+  delay: 10
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_crd_check is not failed
+  ignore_errors: true
+
+- name: "[STAGE 02 - MCH] | 2.3.3) ⏳ WAIT - Active ACM Webhook Endpoints - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Endpoints
+    name: multiclusterhub-operator-webhook
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+  register: acm_dr_hub_setup_mch_webhook_endpoints
+  until: >-
+    (acm_dr_hub_setup_mch_webhook_endpoints.resources | default([])) | length > 0 and
+    (acm_dr_hub_setup_mch_webhook_endpoints.resources[0].subsets | default([]) | length > 0) and
+    (acm_dr_hub_setup_mch_webhook_endpoints.resources[0].subsets[0].addresses | default([]) | length > 0)
+  # 90 retries x 20s = 30 minutes; the MCH operator webhook on a fresh cluster can take
+  # 15-20 minutes to start on the first install (image pulls + CRD registration).
+  retries: 90
+  delay: 20
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_operator_deployment is not failed
+  ignore_errors: true
+
+# =============================================================================
+# STEP 2.4: MULTICLUSTERHUB RESOURCE DEPLOYMENT (MCH CR)
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | 2.4.1) Apply MultiClusterHub CR template with DR support - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: mch/mch_multiclusterhub.yml.j2
+  register: acm_dr_hub_setup_mch_cr_apply
+  until: acm_dr_hub_setup_mch_cr_apply is not failed
+  retries: 10
+  delay: 10
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_webhook_endpoints is not failed
+  ignore_errors: true
+
+# =============================================================================
+# STEP 2.5: RED HAT ACM RECONCILIATION AND READINESS EVALUATION
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | 2.5.1) ⏳ WARNING: MultiClusterHub reconciliation in progress (5-10 MINUTES) - DO NOT CANCEL"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/02_mch_reconciling.j2').split('\n') }}"
+  when: not acm_dr_hub_setup_already_installed
+
+- name: "[STAGE 02 - MCH] | 2.5.2) ⏳ WAIT (5-10 MINUTES) - Validate Running phase on MultiClusterHub - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_setup_mch_name }}"
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+  register: acm_dr_hub_setup_mch_status
+  until: >-
+    (acm_dr_hub_setup_mch_status.resources | default([])) | length > 0 and
+    (acm_dr_hub_setup_mch_status.resources[0].status.phase | default('')) == "Running"
+  retries: 40
+  delay: 15
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_cr_apply is not failed
+  ignore_errors: true
+
+# =============================================================================
+# MCH INSTALL GROUPED DIAGNOSTIC SECTION
+# =============================================================================
+# Runs if ANY of the 5 MCH install polls failed (2.3.1 through 2.5.2).
+# Identifies which checkpoint failed first and gathers evidence.
+
+# D.1) Identify which MCH readiness checkpoint failed first.
+- name: "[STAGE 02 - MCH DIAGNOSTIC] | D.1) Identify failed MCH install checkpoint"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_mch_failed_step: >-
+      {% if acm_dr_hub_setup_mch_crd_check is failed %}MCH CRD availability (2.3.1)
+      {% elif acm_dr_hub_setup_mch_operator_deployment is failed %}MCH operator Deployment readiness (2.3.2)
+      {% elif acm_dr_hub_setup_mch_webhook_endpoints is failed %}ACM Webhook Endpoints (2.3.3)
+      {% elif acm_dr_hub_setup_mch_cr_apply is failed %}MCH CR template apply (2.4.1)
+      {% elif acm_dr_hub_setup_mch_status is failed %}MCH Running phase (2.5.2)
+      {% else %}unknown{% endif %}
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_crd_check is failed or
+      acm_dr_hub_setup_mch_operator_deployment is failed or
+      acm_dr_hub_setup_mch_webhook_endpoints is failed or
+      acm_dr_hub_setup_mch_cr_apply is failed or
+      acm_dr_hub_setup_mch_status is failed
+
+# D.2) Read the ACM Subscription status and operator pod status
+#      to find what is blocking the install.
+- name: "[STAGE 02 - MCH DIAGNOSTIC] | D.2) Read ACM Subscription status"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+  register: acm_dr_hub_setup_diag_mch_sub
+  failed_when: false
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_crd_check is failed or
+      acm_dr_hub_setup_mch_operator_deployment is failed or
+      acm_dr_hub_setup_mch_webhook_endpoints is failed or
+      acm_dr_hub_setup_mch_cr_apply is failed or
+      acm_dr_hub_setup_mch_status is failed
+
+# D.3) Check operator pods in the MCH namespace for crash/pending status.
+- name: "[STAGE 02 - MCH DIAGNOSTIC] | D.3) Check operator pods in MCH namespace"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+    label_selectors:
+      - "name=multiclusterhub-operator"
+  register: acm_dr_hub_setup_diag_mch_pods
+  failed_when: false
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_crd_check is failed or
+      acm_dr_hub_setup_mch_operator_deployment is failed or
+      acm_dr_hub_setup_mch_webhook_endpoints is failed or
+      acm_dr_hub_setup_mch_cr_apply is failed or
+      acm_dr_hub_setup_mch_status is failed
+
+# D.4) Build the diagnostic summary and hints.
+- name: "[STAGE 02 - MCH DIAGNOSTIC] | D.4) Build MCH install diagnostic"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_mch_summary: >-
+      {% set subs = acm_dr_hub_setup_diag_mch_sub.resources | default([]) %}
+      Subscription:
+      {% if subs | length > 0 %}state={{ subs[0].status.state | default('Unknown') }},
+      installedCSV={{ subs[0].status.installedCSV | default('(none)') }}{% else %}not found
+      in {{ acm_dr_hub_setup_mch_namespace }}{% endif %}.
+      {% set pods = acm_dr_hub_setup_diag_mch_pods.resources | default([]) %}
+      Operator pods:
+      {% if pods | length == 0 %}none found.{% else %}{% for pod in pods
+      %}{{ pod.metadata.name }}={{ pod.status.phase | default('Unknown')
+      }}{%- for cs in pod.status.containerStatuses | default([])
+      %}{%- if cs.state.waiting is defined %} ({{ cs.name
+      }}: {{ cs.state.waiting.reason | default('Waiting') }}){% endif
+      %}{%- endfor %}; {% endfor %}{% endif %}
+      {% if acm_dr_hub_setup_mch_status is defined
+      and acm_dr_hub_setup_mch_status.resources | default([]) | length > 0 %}
+      MCH phase: {{ acm_dr_hub_setup_mch_status.resources[0].status.phase
+      | default('Unknown') }}.
+      {% endif %}
+    acm_dr_hub_setup_diag_mch_hints: >-
+      {% set step = acm_dr_hub_setup_diag_mch_failed_step | default('') | trim %}
+      {% set hints = [] %}
+      {% if 'CRD availability' in step %}
+      {%   set _ = hints.append(
+             'MCH CRD NOT FOUND: The ACM operator has not registered the MultiClusterHub CRD. '
+             ~ 'Check the CatalogSource health: oc get catalogsource -n openshift-marketplace --context '
+             ~ k8s_target_context ~ '. Verify the ACM Subscription was created at Step 2.2.') %}
+      {% elif 'operator Deployment' in step %}
+      {%   set _ = hints.append(
+             'OPERATOR NOT READY: The multiclusterhub-operator Deployment has no ready replicas. '
+             ~ 'Check operator pod logs: oc logs -n ' ~ acm_dr_hub_setup_mch_namespace
+             ~ ' -l name=multiclusterhub-operator --context ' ~ k8s_target_context ~ '.') %}
+      {% elif 'Webhook Endpoints' in step %}
+      {%   set _ = hints.append(
+             'WEBHOOK NOT READY: The operator pod is running but its webhook server has not started. '
+             ~ 'This is usually transient. Check operator logs for webhook initialization errors.') %}
+      {% elif 'CR template apply' in step %}
+      {%   set _ = hints.append(
+             'MCH CR REJECTED: The webhook is rejecting the MultiClusterHub CR apply. '
+             ~ 'Common causes: (1) an MCO or conflicting CR already exists, '
+             ~ '(2) invalid template values. Check the error in the operator logs.') %}
+      {% elif 'Running phase' in step %}
+      {%   set _ = hints.append(
+             'MCH NOT RUNNING: The MCH CR was applied but did not reach Running phase '
+             ~ 'within 10 minutes. Check MCH conditions: oc get mch -n '
+             ~ acm_dr_hub_setup_mch_namespace ~ ' -o yaml --context ' ~ k8s_target_context
+             ~ '. Look for degraded components in status.components.') %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append('No specific pattern matched. Check operator logs and MCH status.') %}
+      {% endif %}
+      {{ hints }}
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_crd_check is failed or
+      acm_dr_hub_setup_mch_operator_deployment is failed or
+      acm_dr_hub_setup_mch_webhook_endpoints is failed or
+      acm_dr_hub_setup_mch_cr_apply is failed or
+      acm_dr_hub_setup_mch_status is failed
+
+# D.5) Print the structured diagnostic report.
+- name: "[STAGE 02 - MCH DIAGNOSTIC] | D.5) ❌ MCH INSTALL FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ MCH INSTALL FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "FAILED CHECKPOINT:"
+      - "  {{ acm_dr_hub_setup_diag_mch_failed_step | default('unknown') | trim }}"
+      - ""
+      - "TARGET CLUSTER:"
+      - "  {{ k8s_target_context }}"
+      - ""
+      - "STATUS:"
+      - "{{ acm_dr_hub_setup_diag_mch_summary | default('  (could not gather status)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_hub_setup_diag_mch_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_crd_check is failed or
+      acm_dr_hub_setup_mch_operator_deployment is failed or
+      acm_dr_hub_setup_mch_webhook_endpoints is failed or
+      acm_dr_hub_setup_mch_cr_apply is failed or
+      acm_dr_hub_setup_mch_status is failed
+
+# D.6) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 02 - MCH DIAGNOSTIC] | D.6) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => MCH install failed at checkpoint
+      '{{ acm_dr_hub_setup_diag_mch_failed_step | default('unknown') | trim }}'
+      on context '{{ k8s_target_context }}'.
+      See the diagnostic report above for Subscription status, operator pod status,
+      and troubleshooting hints.
+  when:
+    - not acm_dr_hub_setup_already_installed
+    - acm_dr_hub_setup_mch_crd_check is failed or
+      acm_dr_hub_setup_mch_operator_deployment is failed or
+      acm_dr_hub_setup_mch_webhook_endpoints is failed or
+      acm_dr_hub_setup_mch_cr_apply is failed or
+      acm_dr_hub_setup_mch_status is failed
+
+# =============================================================================
+# STEP 2.6: FINAL STATUS VALIDATION AND ASSERTIONS
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | 2.6.1) 🕵️ Collect MCH final status - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_setup_mch_name }}"
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+  register: acm_dr_hub_setup_mch_validation_info
+
+- name: "[STAGE 02 - MCH] | 2.6.2) 🔍 ASSERT - Validate MultiClusterHub RUNNING phase - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_mch_validation_info.resources | length > 0
+      - >-
+        (acm_dr_hub_setup_mch_validation_info.resources[0].status.phase
+        | default('')) == "Running"
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Red Hat ACM MultiClusterHub '{{ acm_dr_hub_setup_mch_name }}'
+      is fully deployed and operational on context '{{ k8s_target_context }}'!
+      Status: Phase = Running.
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => MultiClusterHub
+      '{{ acm_dr_hub_setup_mch_name }}' did not reach the 'Running' phase on context
+      '{{ k8s_target_context }}'.
+
+      🕵️ TROUBLESHOOTING AND DIAGNOSTIC GUIDE:
+      1. Check the detailed status of the MCH Custom Resource:
+          oc get mch {{ acm_dr_hub_setup_mch_name }} -n {{ acm_dr_hub_setup_mch_namespace }} -o yaml --context {{ k8s_target_context }}
+      2. Check for pods in error/pending state in the control namespace:
+          oc get pods -n {{ acm_dr_hub_setup_mch_namespace }} --context {{ k8s_target_context }} | grep -v Running
+      3. Inspect the RHACM operator logs:
+          oc logs -n {{ acm_dr_hub_setup_mch_namespace }} -l name=multiclusterhub-operator --context {{ k8s_target_context }}
+
+# =============================================================================
+# STEP 2.7: COMPLETION SUMMARY AND STAGE 02 CONCLUSION STATUS
+# =============================================================================
+
+- name: "[STAGE 02 - MCH] | Display Red Hat ACM MultiClusterHub installation completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/02_mch_install_summary.j2').split('\n') }}"
+...

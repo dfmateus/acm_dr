@@ -1,0 +1,56 @@
+---
+# roles/acm_argocd_instance/tasks/00_validate.yml
+# =============================================================================
+# STAGE 00: REQUIRED PARAMETER VALIDATION
+# =============================================================================
+
+- name: "[VALIDATE] | 0.1) Assert mandatory instance identity"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.name) | default('') | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => The variable '{{ item.name }}' is required to create
+      a generic ArgoCD instance. Example: -e acm_argocd_instance_setup_name="my-instance"
+      -e acm_argocd_instance_setup_namespace="my-argocd-namespace".
+    success_msg: "✅ PASSED! Oh. Yes! => '{{ item.name }}' validated."
+  loop:
+    - { name: "acm_argocd_instance_setup_name" }
+    - { name: "acm_argocd_instance_setup_namespace" }
+    - { name: "k8s_target_context" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "[VALIDATE] | 0.2) Assert 'list' generator parameters"
+  ansible.builtin.assert:
+    that:
+      - acm_argocd_instance_setup_applications | default([]) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => generator_type='list' requires at least one item in
+      'acm_argocd_instance_setup_applications' (each item: name/path/destination_namespace/destination_server).
+    success_msg: "✅ PASSED! Oh. Yes! => {{ acm_argocd_instance_setup_applications | length }} Application(s) defined for the 'list' generator."
+  when: acm_argocd_instance_setup_generator_type | default('none') == 'list'
+
+- name: "[VALIDATE] | 0.3) Assert 'cluster_decision' generator parameters"
+  ansible.builtin.assert:
+    that:
+      - acm_argocd_instance_setup_placement_name | default('') | length > 0
+      - acm_argocd_instance_setup_cluster_decision_path | default('') | length > 0
+      - acm_argocd_instance_setup_cluster_decision_destination_namespace | default('') | length > 0
+      - acm_argocd_instance_setup_repo_url | default('') | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => generator_type='cluster_decision' requires
+      'acm_argocd_instance_setup_placement_name', 'acm_argocd_instance_setup_cluster_decision_path',
+      'acm_argocd_instance_setup_cluster_decision_destination_namespace', and 'acm_argocd_instance_setup_repo_url'.
+    success_msg: "✅ PASSED! Oh. Yes! => 'cluster_decision' generator parameters validated."
+  when: acm_argocd_instance_setup_generator_type | default('none') == 'cluster_decision'
+
+- name: "[VALIDATE] | 0.4) Assert ConsoleLink parameters"
+  ansible.builtin.assert:
+    that:
+      - acm_argocd_instance_setup_console_link_text | default('') | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => console_link_enabled=true requires
+      'acm_argocd_instance_setup_console_link_text' (the text displayed in the application menu).
+    success_msg: "✅ PASSED! Oh. Yes! => ConsoleLink text validated."
+  when: acm_argocd_instance_setup_console_link_enabled | default(false) | bool
+...

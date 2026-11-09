@@ -1,0 +1,157 @@
+---
+# roles/acm_dr_failover_manager/tasks/02a_pre_restore_cleanup.yml
+# =============================================================================
+# STAGE 02a: PRE-RESTORE CLEANUP ON DESTINATION HUB
+# =============================================================================
+# Purges stale state on the Destination Hub that would otherwise block the
+# Velero Restore: Terminating namespaces (stuck finalizers from previous
+# failover cycles or detached Spokes) and leftover ACM/Velero Restore CRs
+# from failed or incomplete previous runs.
+# =============================================================================
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | Display cleanup banner"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🧹 STAGE 02a - Pre-Restore Cleanup on Destination Hub"
+    acm_dr_failover_manager_banner_lines:
+      - "📡 DESTINATION HUB: {{ passive_hub }}"
+      - "🔎  Terminating NS detected in preflight: {{ acm_dr_failover_manager_dest_terminating_ns.resources | default([]) | length }}"
+      - "🔎  Stale Restore CRs detected in preflight: {{ acm_dr_failover_manager_dest_stale_restores.resources | default([]) | length }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+# -----------------------------------------------------------------------------
+# 2a.1) FORCE-PURGE TERMINATING NAMESPACES
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.1.1) 🧹 Force-purge Terminating namespaces on Destination Hub"
+  ansible.builtin.shell: |
+    set -o pipefail
+    oc get ns {{ item.metadata.name }} --context {{ passive_hub }} -o json 2>/dev/null \
+    | jq '.spec.finalizers = []' \
+    | oc replace --raw /api/v1/namespaces/{{ item.metadata.name }}/finalize --context {{ passive_hub }} -f - 2>/dev/null || true
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  loop: "{{ acm_dr_failover_manager_dest_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: acm_dr_failover_manager_pre_restore_ns_purge
+  changed_when: >-
+    acm_dr_failover_manager_pre_restore_ns_purge.rc == 0 and
+    acm_dr_failover_manager_pre_restore_ns_purge.stdout | default('') | length > 0
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log }}"  # oc error output can expose cluster URL and context details
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_dest_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.1.2) 🔎 [DRY-RUN] Would force-purge Terminating namespaces"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 [DRY-RUN] Would force-purge {{ acm_dr_failover_manager_dest_terminating_ns.resources | length }}
+      Terminating namespace(s) on {{ passive_hub }}:
+      {{ acm_dr_failover_manager_dest_terminating_ns.resources | map(attribute='metadata.name') | list | join(', ') }}
+  when:
+    - acm_dr_failover_manager_dry_run | default(false) | bool
+    - (acm_dr_failover_manager_dest_terminating_ns.resources | default([]) | length) > 0
+
+# -----------------------------------------------------------------------------
+# 2a.2) DELETE STALE VELERO RESTORE CRs
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.2.1) 🔎 Discover stale Velero Restore CRs on Destination Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: velero.io/v1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_dest_stale_velero_restores
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.2.2) 🧹 Delete stale Velero Restore CRs on Destination Hub"
+  kubernetes.core.k8s:
+    context: "{{ passive_hub }}"
+    api_version: velero.io/v1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ item.metadata.name }}"
+    state: absent
+    wait: false
+  loop: "{{ acm_dr_failover_manager_dest_stale_velero_restores.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+  when: (acm_dr_failover_manager_dest_stale_velero_restores.resources | default([]) | length) > 0
+
+# -----------------------------------------------------------------------------
+# 2a.3) DELETE STALE ACM RESTORE CRs
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.3.1) 🧹 Remove finalizers from stale ACM Restore CRs"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ item.metadata.name }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: "{{ acm_dr_failover_manager_dest_stale_restores.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+  when:
+    - (acm_dr_failover_manager_dest_stale_restores.resources | default([]) | length) > 0
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.3.2) 🧹 Delete stale ACM Restore CRs on Destination Hub"
+  kubernetes.core.k8s:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ item.metadata.name }}"
+    state: absent
+    wait: false
+  loop: "{{ acm_dr_failover_manager_dest_stale_restores.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+  when: (acm_dr_failover_manager_dest_stale_restores.resources | default([]) | length) > 0
+
+# Poll until all ACM Restore CRs are gone after the cleanup. The k8s GC typically
+# clears them within 2-5s; exiting early avoids the old fixed 15s burn. Retries:
+# acm_dr_failover_manager_gc_wait_retries x gc_wait_delay seconds (default 6 x 5 = 30s max).
+# failed_when: false so a timeout is a warning, not a blocker; Stage 03 will surface
+# any leftover CRs when it reads the destination hub state.
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.3.3) ⏳ Poll until ACM Restore CRs are fully removed"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_post_cleanup_restore_poll
+  until: acm_dr_failover_manager_post_cleanup_restore_poll.resources | default([]) | length == 0
+  retries: "{{ acm_dr_failover_manager_gc_wait_retries | default(6) }}"
+  delay: "{{ acm_dr_failover_manager_gc_wait_delay | default(5) }}"
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - >-
+      (acm_dr_failover_manager_dest_terminating_ns.resources | default([]) | length > 0) or
+      (acm_dr_failover_manager_dest_stale_restores.resources | default([]) | length > 0)
+  failed_when: false
+
+- name: "[STAGE 02a - Pre-Restore Cleanup] | 2a.3.4) ✅ Pre-restore cleanup summary"
+  ansible.builtin.debug:
+    msg:
+      - "✅ Pre-restore cleanup completed on Destination Hub ({{ passive_hub }})."
+      - "   🧹 Terminating namespaces purged: {{ acm_dr_failover_manager_dest_terminating_ns.resources | default([]) | length }}"
+      - "   🧹 Stale ACM Restore CRs removed: {{ acm_dr_failover_manager_dest_stale_restores.resources | default([]) | length }}"
+...

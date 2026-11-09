@@ -1,0 +1,65 @@
+---
+# execution-environment.yml
+# =============================================================================
+# Execution Environment definition for Red Hat Ansible Automation Platform (AAP)
+#
+# Build command (run from the repository root):
+#   ansible-builder build \
+#     -t acm-dr-orchestrator-ee:1.0.0 \
+#     -f examples/ee/execution-environment.yml \
+#     --context .local/ee-build
+#
+# The --context path is relative to the repository root. ansible-builder copies
+# build assets into that directory; delete it after a successful build to avoid
+# stale layers on the next run:
+#   rm -rf .local/ee-build
+#
+# This EE packages everything needed to run the automation suite on AAP:
+# Ansible collections, Python libraries, and system CLI tools (oc, jq).
+# =============================================================================
+
+version: 3
+
+build_arg_defaults:
+  # Allow pre-release collections when version ranges overlap with a pre-release tag
+  ANSIBLE_GALAXY_CLI_COLLECTION_OPTS: "--pre"
+
+options:
+  # ee-minimal-rhel9 ships microdnf, not dnf. Without this override the bindep
+  # assemble script fails with "/usr/bin/dnf: No such file or directory".
+  package_manager_path: /usr/bin/microdnf
+
+images:
+  base_image:
+    # ee-minimal-rhel9 ships ansible-core + ansible-runner; no extra collections or CLIs.
+    # Red Hat container images require an explicit version tag (no "latest").
+    name: "registry.redhat.io/ansible-automation-platform/ee-minimal-rhel9:2.17"
+
+dependencies:
+  # Ansible collections - azure.azcollection and amazon.aws each pull their own
+  # cloud Python SDKs automatically (azure-mgmt-*, boto3/botocore respectively)
+  galaxy: ../../collections/requirements.yml  # relative to this file (examples/ee/)
+  python:
+    - kubernetes>=28.1.0   # Python client for kubernetes.core modules
+    - PyYAML>=6.0          # YAML parsing (ansible-core dep, pinned for consistency)
+    - jsonpatch>=1.33      # JSON Patch support for k8s_json_patch module
+  # No system deps here - ee-minimal-rhel9 uses microdnf (no dnf), which breaks
+  # the bindep assemble script. All system packages are installed via
+  # additional_build_steps below.
+
+additional_build_steps:
+  append_final:
+    # jq: JSON processor - available in standard RHEL repos via microdnf.
+    - RUN microdnf install -y jq && microdnf clean all
+    # azure-cli: NO LONGER NEEDED. All Azure Storage operations use
+    # azure.azcollection modules (azure_rm_storageaccount, azure_rm_storageblob,
+    # azure_rm_roleassignment), which authenticate via Azure Python SDK and env
+    # vars. The SDK is auto-installed when ansible-builder installs the
+    # azure.azcollection collection from collections/requirements.yml.
+    # Removing the CLI saves ~300MB in the final image.
+    # openshift-clients (oc/kubectl): binary from the Red Hat mirror.
+    # Required by acm_dr_failover_manager (finalizer patches) and break-glass scripts.
+    # Pinned to stable-4.17 (receives 4.17.x security patches; update to match target OCP version).
+    # To pin to a specific patch: replace stable-4.17 with e.g. 4.17.12
+    - RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-4.17/openshift-client-linux.tar.gz | tar xz -C /usr/local/bin oc kubectl && chmod +x /usr/local/bin/oc /usr/local/bin/kubectl
+...

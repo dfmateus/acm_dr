@@ -1,0 +1,446 @@
+---
+argument_specs:
+  main:
+    short_description: RHACM Disaster Recovery (Failover/Failback) Engine
+    description:
+      - >-
+        Orchestrates full failover and failback between two RHACM 2.14+ Hubs in
+        Active/Passive mode, executing 9 sequential stages: preflight, fleet
+        discovery, fencing (pause BackupSchedule), DR Hub activation via OADP Restore,
+        token sanitization (KCS 7039710), Spoke verification, new leader protection,
+        old Hub detach, and post-failover compliance audit.
+    author:
+      - Diego Felipe Mateus
+    options:
+      # --- REQUIRED VARIABLES (no default, provided via -e) ---
+      active_hub:
+        description: >-
+          Kubeconfig context of the current ACTIVE Hub (failover source). Zero-Trust convention: '-sa' suffix.
+        type: str
+        required: true
+        version_added: "1.0.0"
+      passive_hub:
+        description: >-
+          Kubeconfig context of the PASSIVE/DR Hub (failover destination). Zero-Trust convention: '-sa' suffix.
+        type: str
+        required: true
+        version_added: "1.0.0"
+      # --- AESTHETICS AND LOGGING ---
+      acm_dr_failover_manager_separator_char:
+        description:
+          - Character used for visual separators in console/AWX output.
+        type: str
+        default: "="
+        version_added: "1.0.0"
+      acm_dr_failover_manager_debug_no_log:
+        description:
+          - Suppresses task output for security-sensitive operations (tokens, secrets, kubeconfig). Set to false to expose hidden output during troubleshooting.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      # --- CORE ACM / OADP ---
+      acm_dr_failover_manager_acm_namespace:
+        description: RHACM control-plane namespace. Used by postflight queries that inspect Hub-side resources.
+        type: str
+        default: "open-cluster-management"
+        version_added: "1.5.0"
+      acm_dr_failover_manager_backup_ns:
+        description: Namespace where OADP/ACM backup resources reside.
+        type: str
+        default: "open-cluster-management-backup"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_schedule_name:
+        description: Name of the RHACM BackupSchedule Custom Resource.
+        type: str
+        default: "schedule-acm-hub"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_velero_schedule:
+        description: Cron expression for the Velero schedule in the BackupSchedule.
+        type: str
+        default: "0 */2 * * *"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_velero_ttl:
+        description: Time to live (TTL) for backups created by Velero.
+        type: str
+        default: "120h"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_backup_no_backup_on_start:
+        description: >-
+          Suppress the immediate first backup when creating the new BackupSchedule
+          on the destination Hub post-failover. When true, the first backup waits
+          for the next cron interval instead of firing at T+0.
+        type: bool
+        default: false
+        version_added: "1.4.0"
+      acm_dr_failover_manager_managed_service_account_ttl:
+        description: >-
+          ManagedServiceAccount token rotation interval for the BackupSchedule
+          created on the destination Hub post-failover. Empty string uses the
+          ACM default. Requires RHACM 2.16+. Example: "720h0m0s" (30 days).
+        type: str
+        default: ""
+        version_added: "1.4.0"
+      acm_dr_failover_manager_restore_name:
+        description: Name of the Restore Custom Resource created on the destination Hub.
+        type: str
+        default: "restore-acm-activate"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_cleanup_before_restore:
+        description: >-
+          Velero cleanupBeforeRestore strategy used when creating Restore CRs on the
+          destination Hub (Stage 03) and passive Hubs (Stage 05a). CleanupRestored removes
+          only previously restored resources before applying the new backup, avoiding
+          conflicts from stale objects while preserving manually created resources.
+        type: str
+        default: "CleanupRestored"
+        version_added: "1.3.0"
+      # --- TIMEOUTS AND POLLING ---
+      acm_dr_failover_manager_activate_retries:
+        description: Number of polling retries for the Restore to complete.
+        type: int
+        default: 60
+        version_added: "1.0.0"
+      acm_dr_failover_manager_activate_delay:
+        description: Interval in seconds between Restore polling retries.
+        type: int
+        default: 20
+        version_added: "1.0.0"
+      acm_dr_failover_manager_verify_retries:
+        description: Number of polling retries for Spoke verification.
+        type: int
+        default: 40
+        version_added: "1.0.0"
+      acm_dr_failover_manager_verify_delay:
+        description: Interval in seconds between Spoke verification retries.
+        type: int
+        default: 30
+        version_added: "1.0.0"
+      acm_dr_failover_manager_gc_wait_time:
+        description: Wait time (seconds) for the Kubernetes API Garbage Collector.
+        type: int
+        default: 15
+        version_added: "1.0.0"
+      acm_dr_failover_manager_converge_retries:
+        description:
+          - Number of polling retries for the post-failover compliance report (Stage 08). Non-blocking - if timeout is reached, the report runs anyway.
+        type: int
+        default: 20
+        version_added: "1.0.0"
+      acm_dr_failover_manager_converge_delay:
+        description:
+          - Interval in seconds between convergence polling retries.
+        type: int
+        default: 15
+        version_added: "1.0.0"
+      acm_dr_failover_manager_ns_purge_retries:
+        description: >-
+          Number of polling retries for the Spoke namespace purge (Stage 06).
+          Total wait = retries × delay = 15 × 4 = 60 seconds. Increase in
+          environments with heavy webhook controllers that slow namespace termination.
+        type: int
+        default: 15
+        version_added: "1.0.0"
+      acm_dr_failover_manager_ns_purge_delay:
+        description: Interval in seconds between Spoke namespace purge polling retries.
+        type: int
+        default: 4
+        version_added: "1.0.0"
+      acm_dr_failover_manager_managed_cluster_lease_name:
+        description: >-
+          Name of the coordination.k8s.io/v1 Lease per Spoke used by the klusterlet to
+          report liveness to the Hub. Must be deleted explicitly when a Spoke namespace is
+          Terminating on the old Hub (Stage 06) because the klusterlet is already gone.
+          Identical across all Spokes (fixed by the klusterlet controller).
+        type: str
+        default: "managed-cluster-lease"
+        version_added: "1.3.0"
+      acm_dr_failover_manager_bsl_ready_retries:
+        description: >-
+          Number of polling retries for the destination Hub BackupStorageLocation to
+          reach Available phase (Stage 00 preflight). Total wait = retries × delay =
+          10 × 30 = 300 seconds (5 minutes).
+        type: int
+        default: 10
+        version_added: "1.0.0"
+      acm_dr_failover_manager_bsl_ready_delay:
+        description: Interval in seconds between BackupStorageLocation readiness polling retries.
+        type: int
+        default: 30
+        version_added: "1.0.0"
+      # --- FLOW AND SAFETY CONTROLS ---
+      acm_dr_failover_manager_skip_gates:
+        description: Skip manual confirmation gates (equivalent to -e skip_gates=true).
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_failover_manager_dry_run:
+        description: Enable simulation mode (dryRun=All on the API Server, no real mutations).
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_failover_manager_allow_fenced_origin:
+        description: >-
+          Allow failover even when the origin Hub is already in PASSIVE mode
+          (BackupSchedule paused). Required to re-execute an interrupted failover.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_failover_manager_check_msa_labels:
+        description: >-
+          Enable ManagedServiceAccount backup label audit during preflight.
+          Catches the timing race where MSA Secrets lack the backup label
+          and would be excluded from OADP backups. Non-blocking warning only.
+        type: bool
+        default: true
+        version_added: "1.4.0"
+      acm_dr_failover_manager_run_readiness_check:
+        description: >-
+          Run the acm_dr_readiness_check role at the start of Stage 00 before
+          any mutation. When true, the pipeline self-aborts on a degraded BSL,
+          stale backup, or insufficient Spoke count instead of discovering the
+          problem mid-restore. Off by default so existing pipelines are unaffected.
+        type: bool
+        default: false
+        version_added: "1.4.0"
+      acm_dr_failover_manager_warn_on_degraded_addons:
+        description: >-
+          Emit a ⚠️ warning per Spoke with degraded ManagedClusterAddons
+          (Available condition != True) in the postflight compliance report (Stage 08).
+          Does not block the pipeline unless fail_on_degraded_addons is also true.
+        type: bool
+        default: true
+        version_added: "1.3.0"
+      acm_dr_failover_manager_fail_on_degraded_addons:
+        description: >-
+          Hard-fail the postflight assert when degraded ManagedClusterAddons are found.
+          Requires warn_on_degraded_addons to be true. Use in environments where full
+          addon health is a deployment prerequisite.
+        type: bool
+        default: false
+        version_added: "1.3.0"
+      # --- SPOKE CONTEXT MAPPING ---
+      acm_dr_failover_manager_spoke_context_suffix:
+        description: >-
+          Suffix appended to the ManagedCluster name to form the Spoke Kubeconfig
+          context (Zero-Trust convention).
+        type: str
+        default: "-sa"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_spoke_context_map:
+        description: >-
+          Explicit mapping of ManagedCluster names to Kubeconfig contexts
+          (takes priority over the suffix).
+        type: dict
+        default: {}
+        version_added: "1.0.0"
+      acm_dr_failover_manager_fail_on_unreachable_spokes:
+        description: >-
+          Fail the pipeline when any Spoke in the fleet is unreachable during
+          the API connectivity probe (Stage 01). When false (default), unreachable
+          Spokes are skipped with a warning and the compliance report lists them as
+          SKIPPED. Set to true in environments that require full fleet availability
+          for every failover.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      # --- OBSERVABILITY ---
+      acm_dr_failover_manager_observability_ns:
+        description: Namespace of the MultiClusterObservability (Grafana/Thanos).
+        type: str
+        default: "open-cluster-management-observability"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_observability_addon_name:
+        description: >-
+          Name of the ObservabilityAddon CR on each Spoke. Fixed by the
+          open-cluster-management-addon controller and identical across all Spokes.
+          Stage 06 removes stuck finalizers on this resource before detaching Spokes
+          from the old Hub.
+        type: str
+        default: "observability-addon"
+        version_added: "1.3.0"
+      acm_dr_failover_manager_custom_dashboard_label:
+        description: Label to identify custom Grafana dashboard ConfigMaps.
+        type: str
+        default: "grafana-custom-dashboard=true"
+        version_added: "1.0.0"
+      # --- EXPLICIT BACKUP RESOLUTION ---
+      acm_dr_failover_manager_credentials_schedule_name:
+        description: Name of the credentials Velero Schedule created by ACM.
+        type: str
+        default: "acm-credentials-schedule"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_managed_clusters_schedule_name:
+        description: Name of the managed clusters Velero Schedule created by ACM.
+        type: str
+        default: "acm-managed-clusters-schedule"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_resources_schedule_name:
+        description: Name of the resources Velero Schedule created by ACM.
+        type: str
+        default: "acm-resources-schedule"
+        version_added: "1.0.0"
+      acm_dr_failover_manager_resolve_explicit_backup:
+        description: >-
+          Explicitly resolve the most recent backup originated from the source Hub
+          (via clusterID label) instead of trusting the ACM 'latest' string.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_dr_failover_manager_backup_max_age_warn:
+        description: >-
+          Maximum age in hours of the most recent completed backup before emitting
+          a ⚠️ warning in the preflight. A stale backup increases the effective RPO.
+        type: int
+        default: 4
+        version_added: "1.0.0"
+      acm_dr_failover_manager_backup_max_age_fail:
+        description: >-
+          Maximum age in hours before the preflight blocks the pipeline. Set to 0
+          to disable the hard gate (warn-only mode). Overridable via skip_backup_age_gate.
+        type: int
+        default: 0
+        version_added: "1.0.0"
+      acm_dr_failover_manager_skip_backup_age_gate:
+        description: >-
+          Skip the backup age gate entirely (both warn and fail). Useful during lab
+          testing or initial setup where backups may not exist yet.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      # --- VERSION COMPATIBILITY CHECKS ---
+      acm_dr_failover_manager_version_check:
+        description: >-
+          Enable version compatibility checks during preflight (OCP and RHACM
+          versions on both Hubs). When enabled, enforces blocking compatibility
+          gates and displays informational warnings about version skew.
+        type: bool
+        default: true
+        version_added: "1.1.0"
+      acm_dr_failover_manager_skip_version_gate:
+        description: >-
+          Bypass all blocking version compatibility gates in Stage 00 preflight.
+          Use when you have manually validated cross-version compatibility and
+          accept the risk of running the pipeline across unsupported version
+          combinations.
+        type: bool
+        default: false
+        version_added: "1.2.0"
+      acm_dr_failover_manager_supported_acm_versions:
+        description: >-
+          List of RHACM minor versions (e.g., '2.14') known to be supported
+          by this automation. Both Hubs must run a version in this list unless
+          the version gate is overridden.
+        type: list
+        elements: str
+        version_added: "1.2.0"
+      acm_dr_failover_manager_acm_ocp_matrix:
+        description: >-
+          RHACM-to-OCP compatibility matrix. Each key is an RHACM minor version
+          (e.g., '2.14'), each value is the list of supported OCP minor versions
+          (e.g., ['4.17', '4.18', '4.19', '4.20']).
+        type: dict
+        version_added: "1.2.0"
+      acm_dr_failover_manager_max_acm_version_gap:
+        description: >-
+          Maximum allowed minor-version gap between the RHACM versions on the
+          source and destination Hubs. Default 1 allows adjacent versions
+          (e.g., 2.14 and 2.15) but blocks wider gaps.
+        type: int
+        default: 1
+        version_added: "1.2.0"
+      acm_dr_failover_manager_target_acm_version:
+        description: >-
+          Target RHACM version for Planned Maintenance Failover upgrade
+          validation. When set (e.g., '2.16'), the preflight validates that
+          the upgrade is feasible: not already installed, in the supported
+          list, OCP compatible on both Hubs, and all Spokes in range. The
+          fleet compatibility check then evaluates Spokes against this
+          target version instead of the current destination RHACM.
+        type: str
+        default: ""
+        version_added: "1.3.0"
+      # --- FLEET SECRET REFRESH ---
+      acm_dr_failover_manager_fleet_refresh_enabled:
+        description: >-
+          Sync the fleet kubeconfig Secret from the source Hub to the destination Hub
+          right after the BackupSchedule is created (Stage 05). The fleet Secret may
+          be overwritten by OADP Restore with a stale version taken before new Spokes
+          were onboarded. The refresh ensures the full fleet is visible on the new
+          active Hub for subsequent failovers.
+        type: bool
+        default: true
+        version_added: "1.2.0"
+      acm_dr_failover_manager_fleet_secret_name:
+        description: >-
+          Name of the fleet kubeconfig Secret on the Hub. Must match
+          acm_dr_kubeconfig_resolver and acm_dr_spoke_manager defaults.
+        type: str
+        default: "spoke-fleet-kubeconfig"
+        version_added: "1.2.0"
+      acm_dr_failover_manager_fleet_secret_namespace:
+        description: >-
+          Namespace of the fleet kubeconfig Secret on the Hub. Must match
+          acm_dr_kubeconfig_resolver and acm_dr_spoke_manager defaults.
+        type: str
+        default: "ansible-automation"
+        version_added: "1.2.0"
+      # --- MULTI-HUB TOPOLOGY ---
+      acm_dr_failover_manager_additional_passive_hubs:
+        description: >-
+          List of kubeconfig contexts for passive hubs beyond the primary failover
+          pair. After failover, their passive sync Restore CRs are recycled to pick
+          up backups from the new leader. Empty list = legacy 2-hub mode.
+        type: list
+        elements: str
+        default: []
+        version_added: "1.2.0"
+      acm_dr_failover_manager_passive_restore_name:
+        description: >-
+          Name of the passive sync Restore CR on additional passive hubs. Must match
+          acm_dr_hub_setup_passive_restore_name.
+        type: str
+        default: "restore-passive-sync"
+        version_added: "1.2.0"
+      acm_dr_failover_manager_passive_restore_sync_interval:
+        description: >-
+          Sync interval for the recreated passive sync Restore CR. Must match
+          acm_dr_hub_setup_passive_restore_sync_interval.
+        type: str
+        default: "30m"
+        version_added: "1.2.0"
+      acm_dr_failover_manager_skip_passive_recycling:
+        description: >-
+          Skip passive hub recycling even if additional_passive_hubs is non-empty.
+          Useful for partial failover scenarios.
+        type: bool
+        default: false
+        version_added: "1.2.0"
+      acm_dr_failover_manager_rollback_on_restore_failure:
+        description: >-
+          When true (default), a failed Stage 03 (Restore) triggers an automatic
+          rollback: the source Hub BackupSchedule is re-enabled (spec.paused=false),
+          the failed Restore CR is deleted from the destination Hub, and the pipeline
+          fails with a clear rollback confirmation. The source Hub returns to its
+          pre-failover state and the next attempt can start cleanly after the root
+          cause is fixed. Set to false only when you need the failed Restore CR
+          preserved for Velero debug or when you intend to retry Stage 03 manually
+          without re-running the full role.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_dr_failover_manager_rollback_wait_retries:
+        description: >-
+          Number of polling attempts to wait for the source Hub BackupSchedule
+          status.phase to return to Enabled after the rollback re-enables it.
+          Total max wait: retries * delay seconds (default: 120s).
+        type: int
+        default: 12
+        version_added: "1.0.0"
+      acm_dr_failover_manager_rollback_wait_delay:
+        description: >-
+          Seconds between polling attempts during the post-rollback BackupSchedule
+          status check.
+        type: int
+        default: 10
+        version_added: "1.0.0"
+...

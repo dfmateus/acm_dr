@@ -1,0 +1,111 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 05 METADATA DISPLAY (AWS)
+# =============================================================================
+
+- name: "[STAGE 05 - AWS S3 Storage Cleanup] | Display optional AWS S3 purge metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "☁️ STAGE 05 - Optional AWS S3 Bucket Purge"
+    acm_dr_hub_cleanup_banner_lines:
+      - "🔄 acm_dr_hub_cleanup_purge_aws_storage: {{ acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool }}"
+  run_once: true
+
+# =============================================================================
+# STEP 5.0: DEFAULT PATH (FLAG OFF) - NOTHING IN AWS IS TOUCHED
+# =============================================================================
+
+- name: "[STAGE 05 - AWS S3 Storage Cleanup] | 5.0.1) Inform that AWS S3 storage was preserved (default)"
+  ansible.builtin.debug:
+    msg:
+      - "ℹ️  [PRESERVED]: acm_dr_hub_cleanup_purge_aws_storage=false (default). The S3 buckets"
+      - "    (Backup and Observability) were NOT touched. This is expected when the primary"
+      - "    ACM Hub still depends on the same shared storage. To completely delete (irreversible),"
+      - "    re-run with -e acm_dr_hub_cleanup_purge_aws_storage=true."
+  run_once: true
+  when: not (acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool)
+
+# =============================================================================
+# STEP 5.1: DESTRUCTIVE PATH (FLAG ON) - TOTAL AND IRREVERSIBLE REMOVAL
+# =============================================================================
+
+- name: "[STAGE 05 - AWS S3 Storage Cleanup] | 5.1.1) Assert mandatory AWS credentials for purge"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_cleanup_aws_access_key_id | default('') | length > 0
+      - acm_dr_hub_cleanup_aws_secret_access_key | default('') | length > 0
+      - acm_dr_hub_cleanup_aws_region | default('') | length > 0
+      - acm_dr_hub_cleanup_aws_s3_bucket_backup | default('') | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => acm_dr_hub_cleanup_purge_aws_storage=true requires complete AWS
+      credentials (access key, secret key, region) and the backup bucket name.
+    success_msg: "✅ PASSED! Oh. Yes! => AWS credentials validated for S3 purge."
+  no_log: "{{ acm_dr_hub_cleanup_debug_no_log | default(true) | bool }}"
+  when: acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool
+
+- name: "[STAGE 05 - AWS S3 Storage Cleanup] | 5.1.2) 🔎 [DRY-RUN] S3 bucket purge preview"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 [DRY-RUN] S3 buckets '{{ acm_dr_hub_cleanup_aws_s3_bucket_backup }}'
+      and '{{ acm_dr_hub_cleanup_aws_s3_bucket_observability | default('(not configured)') }}'
+      in region '{{ acm_dr_hub_cleanup_aws_region }}' would be PERMANENTLY REMOVED via
+      amazon.aws.s3_bucket (state=absent, force=true), along with all their
+      objects (Velero Backups and Thanos history). No actual changes were applied.
+  when:
+    - acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool
+    - acm_dr_hub_cleanup_dry_run | default(false) | bool
+
+# amazon.aws modules authenticate via env vars (AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION). No explicit login steps needed.
+- name: "[STAGE 05 - AWS S3 Storage Cleanup] | 5.1.3) 🗑️ PERMANENTLY REMOVE Backup S3 Bucket and all objects"
+  # force: true empties the bucket (deletes all objects and versions) before removing
+  # it. Without this, the API rejects deletion of non-empty buckets.
+  amazon.aws.s3_bucket:
+    name: "{{ acm_dr_hub_cleanup_aws_s3_bucket_backup }}"
+    state: absent
+    force: true
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ acm_dr_hub_cleanup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ acm_dr_hub_cleanup_aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ acm_dr_hub_cleanup_aws_region }}"
+  no_log: "{{ acm_dr_hub_cleanup_debug_no_log | default(true) | bool }}"
+  when:
+    - acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool
+    - not (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+
+- name: "[STAGE 05 - AWS S3 Storage Cleanup] | 5.1.4) 🗑️ PERMANENTLY REMOVE Observability S3 Bucket and all objects"
+  amazon.aws.s3_bucket:
+    name: "{{ acm_dr_hub_cleanup_aws_s3_bucket_observability }}"
+    state: absent
+    force: true
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ acm_dr_hub_cleanup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ acm_dr_hub_cleanup_aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ acm_dr_hub_cleanup_aws_region }}"
+  no_log: "{{ acm_dr_hub_cleanup_debug_no_log | default(true) | bool }}"
+  when:
+    - acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool
+    - not (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+    - acm_dr_hub_cleanup_aws_s3_bucket_observability | default('') | length > 0
+
+# =============================================================================
+# STEP 5.2: COMPLETION SUMMARY AND STAGE 05 STATUS
+# =============================================================================
+
+- name: "[STAGE 05 - AWS S3 Storage Cleanup] | Display AWS S3 purge completion status"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        '☁️ [STAGE 05]: S3 buckets preserved (default). No action in AWS.'
+        if not (acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool)
+        else (
+          '🔎 [STAGE 05 - DRY-RUN]: simulated S3 purge, no actual changes applied in AWS.'
+          if (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+          else "🗑️ [STAGE 05]: S3 buckets '" ~ acm_dr_hub_cleanup_aws_s3_bucket_backup ~
+            "' and '" ~ (acm_dr_hub_cleanup_aws_s3_bucket_observability | default('N/A')) ~
+            "' were permanently removed from AWS."
+        )
+      }}
+  run_once: true
+...

@@ -1,0 +1,508 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 04 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 04 - ACM Cleanup] | Display complete Red Hat ACM removal metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "🚀 STAGE 04 - Remove Red Hat ACM (MultiClusterHub + Subscription/CSV)"
+    acm_dr_hub_cleanup_banner_lines:
+      - "⚠️  Unlike OADP/GitOps, the ACM operator IS completely removed (see README)"
+  run_once: true
+
+# =============================================================================
+# STEP 4.1: REMOVE THE MULTICLUSTERHUB CUSTOM RESOURCE (DISMOUNTS ALL OF ACM)
+# =============================================================================
+# This is the most time-consuming step of the entire role: the ACM operator needs to
+# gracefully dismantle submariner-addon, search, policy-engine,
+# console-plugin and dozens of other components before releasing the finalizer
+# of MultiClusterHub. This can take 10 to 20 minutes on real clusters.
+
+- name: "[STAGE 04 - ACM Cleanup] | 4.1.1) ⏳ WARNING: MultiClusterHub removal in progress (10-20 MINUTES) - DO NOT CANCEL"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/04_mch_dismantling.j2').split('\n') }}"
+  when: not (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+
+- name: "[STAGE 04 - ACM Cleanup] | 4.1.2) Remove MultiClusterHub CR and wait for complete teardown - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_cleanup_mch_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_mch_delete_timeout | default(1800) }}"
+  register: acm_dr_hub_cleanup_mch_removal
+  when: not (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+  ignore_errors: true
+
+# =============================================================================
+# STEP 4.1.D: MCH REMOVAL TIMEOUT - DIAGNOSTIC + INLINE BREAK-GLASS
+# =============================================================================
+# When the MCH operator cannot complete its teardown within the timeout, the
+# most common causes (confirmed in TC-07.2 testing, 2026-08-10) are:
+#
+# 1. InternalHubComponent 'cluster-backup' stuck because the Restore CR
+#    finalizer was not cleared (Velero Restore InProgress with deletionTimestamp).
+# 2. ManagedCluster objects stuck with finalizers because Spoke clusters are
+#    unreachable and the import controller cannot clean up the agent side.
+# 3. KlusterletAddonConfig objects in Hub-side Spoke namespaces preventing
+#    namespace deletion.
+# 4. Spoke namespaces stuck in Terminating with no spec.finalizers but
+#    resources still inside.
+#
+# The remediation block below follows the same pattern as Phase 2c in
+# acm_dr_spoke_manager/tasks/02_spoke_detach.yml: diagnose, force-patch
+# finalizers, then re-wait for the operator to finish its remaining work.
+
+# D.1) Read MCH status conditions when the removal timed out.
+- name: "[STAGE 04 - ACM Cleanup DIAGNOSTIC] | D.1) Read MCH status after removal timeout"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_cleanup_mch_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  register: acm_dr_hub_cleanup_diag_mch
+  failed_when: false
+  when:
+    - acm_dr_hub_cleanup_mch_removal is defined
+    - acm_dr_hub_cleanup_mch_removal is failed
+
+# D.2) Read operator pod status in the ACM namespace.
+- name: "[STAGE 04 - ACM Cleanup DIAGNOSTIC] | D.2) Read ACM operator pod status"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+    label_selectors:
+      - "name=multiclusterhub-operator"
+  register: acm_dr_hub_cleanup_diag_mch_pods
+  failed_when: false
+  when:
+    - acm_dr_hub_cleanup_mch_removal is defined
+    - acm_dr_hub_cleanup_mch_removal is failed
+
+# D.3) Print the diagnostic report.
+- name: "[STAGE 04 - ACM Cleanup DIAGNOSTIC] | D.3) ❌ MCH REMOVAL TIMED OUT: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ MULTICLUSTERHUB REMOVAL TIMED OUT: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "TARGET CLUSTER:"
+      - "  {{ k8s_target_context }}"
+      - ""
+      - "MCH STATUS:"
+      - >-
+        {% set mch = acm_dr_hub_cleanup_diag_mch.resources | default([]) %}
+        {% if mch | length > 0 %}  phase={{ mch[0].status.phase | default('Unknown') }},
+        finalizers={{ mch[0].metadata.finalizers | default([]) | join(', ') | default('(none)') }}.
+        {% for c in mch[0].status.conditions | default([]) %}
+          {{ c.type }}: {{ c.status
+        }}{%- if c.status != 'True' %} ({{ c.message | default('no message') }}){% endif %};
+        {% endfor %}{% else %}  MCH CR no longer exists (may have been removed after timeout).{% endif %}
+      - ""
+      - "OPERATOR PODS:"
+      - >-
+        {% set pods = acm_dr_hub_cleanup_diag_mch_pods.resources | default([]) %}
+        {% if pods | length == 0 %}  none found.{% else %}{% for pod in pods
+        %}  {{ pod.metadata.name }}={{ pod.status.phase | default('Unknown') }};
+        {% endfor %}{% endif %}
+      - ""
+      - "⏩ Inline break-glass remediation will attempt to clear stuck finalizers next."
+      - ""
+      - "======================================================================"
+  when:
+    - acm_dr_hub_cleanup_mch_removal is defined
+    - acm_dr_hub_cleanup_mch_removal is failed
+
+# D.4) Determine whether remediation is needed: MCH still exists with at least one
+# finalizer after a failed delete attempt.
+#
+# Two failure modes reach this point:
+#   a) MCH entered Terminating (deletionTimestamp set) but ACM cannot complete teardown
+#      because InternalHubComponents, ManagedClusters, or Spoke namespaces are stuck.
+#   b) The admission webhook 'multiclusterhub.validating-webhook.open-cluster-management.io'
+#      blocked the delete upfront (HTTP 403 Forbidden) because ManagedCluster objects still
+#      exist - MCH is still in Running phase with no deletionTimestamp.
+#
+# Previously this condition required deletionTimestamp to be defined, which caused mode (b)
+# to skip D.5-D.9 entirely (the webhook-blocked Hub never entered Terminating, so the fact
+# was set to false and all remediation was skipped). The fix is to trigger remediation
+# whenever MCH still exists after a failed delete, regardless of its phase.
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.4) Evaluate whether MCH needs inline break-glass"
+  ansible.builtin.set_fact:
+    acm_dr_hub_cleanup_mch_remediation_needed: >-
+      {{
+        acm_dr_hub_cleanup_diag_mch.resources | default([]) | length > 0
+        and acm_dr_hub_cleanup_diag_mch.resources[0].metadata.finalizers | default([]) | length > 0
+      }}
+  when:
+    - acm_dr_hub_cleanup_mch_removal is defined
+    - acm_dr_hub_cleanup_mch_removal is failed
+
+# ---- D.5: Force-remove InternalHubComponent finalizers ----
+# The MCH operator tracks each component (cluster-backup, search, etc.) as an
+# InternalHubComponent CR. A stuck component blocks the MCH finalizer forever.
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.5a) Discover stuck InternalHubComponents - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: InternalHubComponent
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  register: acm_dr_hub_cleanup_stuck_ihcs
+  failed_when: false
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.5b) Force-remove finalizers from stuck InternalHubComponents - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    api_version: operator.open-cluster-management.io/v1
+    kind: InternalHubComponent
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: >-
+    {{
+      acm_dr_hub_cleanup_stuck_ihcs.resources | default([])
+      | selectattr('metadata.deletionTimestamp', 'defined')
+      | selectattr('metadata.finalizers', 'defined')
+      | list
+    }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+  failed_when: false
+
+# ---- D.6: Force-remove ManagedCluster finalizers ----
+# When Spoke clusters are unreachable, the import controller cannot clean up
+# the agent side and the ManagedCluster CR stays stuck with finalizers.
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.6a) Discover remaining ManagedClusters - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+  register: acm_dr_hub_cleanup_stuck_mcs
+  failed_when: false
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.6b) Delete remaining ManagedClusters - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item.metadata.name }}"
+    wait: false
+  loop: "{{ acm_dr_hub_cleanup_stuck_mcs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+  failed_when: false
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.6c) Force-remove finalizers from stuck ManagedClusters - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item.metadata.name }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: >-
+    {{
+      acm_dr_hub_cleanup_stuck_mcs.resources | default([])
+      | selectattr('metadata.finalizers', 'defined')
+      | list
+    }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+  failed_when: false
+
+# D.6d) Webhook-blocked mode: MCH is still in Running phase (no deletionTimestamp)
+# because the 'multiclusterhub-operator-validating-webhook' ValidatingWebhookConfiguration
+# rejected the delete due to existing ManagedCluster objects. At this point D.6c has already
+# cleared (or attempted to clear) ManagedCluster finalizers, but the ACM controllers running
+# inside the still-active MCH immediately re-add them. The reliable escape is to remove the
+# VWC entirely so the next MCH delete call is not intercepted, then let ACM do its own
+# orderly ManagedCluster cleanup during the Terminating phase.
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.6d) Remove MCH admission webhook to unblock delete - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: admissionregistration.k8s.io/v1
+    kind: ValidatingWebhookConfiguration
+    name: multiclusterhub-operator-validating-webhook
+  when:
+    - acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+    # Only needed in mode b (webhook blocked): MCH never entered Terminating.
+    # In mode a (MCH already in Terminating), the VWC is not the blocker.
+    - acm_dr_hub_cleanup_diag_mch.resources | default([]) | length > 0
+    - acm_dr_hub_cleanup_diag_mch.resources[0].metadata.deletionTimestamp is not defined
+  failed_when: false
+
+# D.6e) After removing the blocking VWC (or clearing ManagedCluster finalizers in mode a),
+# retry the MCH delete. D.8 handles the subsequent wait with retries.
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.6e) Retry MCH delete after removing blockers - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_cleanup_mch_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+    wait: false  # D.8 handles the re-wait with retries
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+  failed_when: false
+
+# ---- D.7: Clean up KlusterletAddonConfigs and stuck Spoke namespaces ----
+# Hub-side Spoke namespaces contain KlusterletAddonConfig objects that the
+# klusterlet-addon-controller should delete. When the controller is gone or
+# stuck, these CRs keep the namespace in Terminating.
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.7a) Discover KlusterletAddonConfigs across all namespaces - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+  register: acm_dr_hub_cleanup_stuck_kacs
+  failed_when: false
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.7b) Delete orphaned KlusterletAddonConfigs - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace }}"
+  loop: "{{ acm_dr_hub_cleanup_stuck_kacs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+  failed_when: false
+
+# Discover namespaces stuck in Terminating (Spoke namespaces left behind
+# by the MCH operator's incomplete teardown).
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.7c) Discover Terminating namespaces - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Namespace
+    field_selectors:
+      - "status.phase=Terminating"
+  register: acm_dr_hub_cleanup_terminating_ns
+  failed_when: false
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+
+# Force-finalize stuck namespaces. Gets the namespace JSON, clears spec.finalizers
+# with jq, and pushes it back via the /finalize subresource in one pipeline.
+# kubernetes.core.k8s does not support the /finalize endpoint, so this is a
+# necessary raw-API call. || true makes rc always 0; stdout is non-empty only
+# when oc get found the namespace and oc replace ran successfully.
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.7d-e) Force-finalize stuck Terminating namespaces - {{ k8s_target_context }}"
+  ansible.builtin.shell: |
+    set -o pipefail
+    oc get ns {{ item.metadata.name }} --context {{ k8s_target_context }} -o json 2>/dev/null \
+    | jq '.spec.finalizers = []' \
+    | oc replace --raw "/api/v1/namespaces/{{ item.metadata.name }}/finalize" \
+      --context {{ k8s_target_context }} -f - 2>/dev/null || true
+  loop: "{{ acm_dr_hub_cleanup_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: acm_dr_hub_cleanup_ns_finalize_cmd
+  # rc is always 0 because the pipeline ends with || true.
+  # stdout is non-empty only when oc get found the namespace and oc replace ran.
+  changed_when: acm_dr_hub_cleanup_ns_finalize_cmd.stdout | default('') | length > 0
+  failed_when: false
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+
+# ---- D.8: Re-wait for MCH to complete after remediation ----
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.8) ⏳ Re-wait for MCH to disappear after break-glass remediation - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_cleanup_mch_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  register: acm_dr_hub_cleanup_mch_recheck
+  until: acm_dr_hub_cleanup_mch_recheck.resources | default([]) | length == 0
+  retries: "{{ acm_dr_hub_cleanup_mch_remediation_retries | default(18) }}"
+  delay: "{{ acm_dr_hub_cleanup_mch_remediation_delay | default(10) }}"
+  when: acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+  failed_when: false
+
+# ---- D.9: Last resort - force-remove the MCH finalizer itself ----
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.9) Force-remove MCH finalizer (last resort) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_cleanup_mch_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+    definition:
+      metadata:
+        finalizers: []
+  when:
+    - acm_dr_hub_cleanup_mch_remediation_needed | default(false) | bool
+    - acm_dr_hub_cleanup_mch_recheck.resources | default([]) | length > 0
+  failed_when: false
+
+# D.10) Final MCH check - confirm whether remediation succeeded.
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.10a) Final MCH existence check - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_cleanup_mch_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  register: acm_dr_hub_cleanup_mch_final
+  failed_when: false
+  when:
+    - acm_dr_hub_cleanup_mch_removal is defined
+    - acm_dr_hub_cleanup_mch_removal is failed
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.10b) ✅ MCH removed after inline break-glass"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ MultiClusterHub '{{ acm_dr_hub_cleanup_mch_name }}' was successfully removed
+      after inline break-glass remediation on context '{{ k8s_target_context }}'.
+  when:
+    - acm_dr_hub_cleanup_mch_removal is defined
+    - acm_dr_hub_cleanup_mch_removal is failed
+    - acm_dr_hub_cleanup_mch_final.resources | default([]) | length == 0
+
+- name: "[STAGE 04 - ACM Cleanup REMEDIATION] | D.10c) ❌ MCH still present after all remediation attempts"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => MultiClusterHub '{{ acm_dr_hub_cleanup_mch_name }}'
+      is still present after {{ acm_dr_hub_cleanup_mch_delete_timeout | default(1800) }}s
+      initial wait + inline break-glass remediation ({{ acm_dr_hub_cleanup_mch_remediation_retries
+      | default(18) }} retries) on context '{{ k8s_target_context }}'.
+      Manual intervention required. Check: oc get mch,internalhubcomponent,managedcluster
+      -A -o yaml --context {{ k8s_target_context }}.
+  when:
+    - acm_dr_hub_cleanup_mch_removal is defined
+    - acm_dr_hub_cleanup_mch_removal is failed
+    - acm_dr_hub_cleanup_mch_final.resources | default([]) | length > 0
+
+# Note: the admission webhook 'multiclusterhub.validating-webhook.open-cluster-management.io'
+# refuses removal of MultiClusterHub while a MultiClusterObservability exists in the
+# cluster. In actual execution this is never a problem, since Stage 03 already removed the MCO
+# in fact before this point. But in dry-run the MCO is never actually removed (only
+# simulated), so an actual dryRun=All attempt against the API would fall into this same
+# webhook and fail the simulation without real reason. Therefore, in dry-run, we skip the
+# call and just explain what would happen (same pattern used in
+# acm_dr_failover_manager/tasks/03_activate_hub.yml).
+- name: "[STAGE 04 - ACM Cleanup] | 4.1.3) 🔎 [DRY-RUN] MultiClusterHub removal preview"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] MultiClusterHub '{{ acm_dr_hub_cleanup_mch_name }}' (namespace
+      '{{ acm_dr_hub_cleanup_mch_namespace }}') would be removed and automation would wait for
+      complete teardown (10-20 minutes). This specific call is skipped in dry-run because
+      the ACM admission webhook refuses MCH removal while MultiClusterObservability
+      still exists, and in dry-run Stage 03 did not actually remove it (only simulated).
+      In actual execution, Stage 03 would have already removed the MCO before this point.
+  when: acm_dr_hub_cleanup_dry_run | default(false) | bool
+
+# =============================================================================
+# STEP 4.2: UNINSTALL THE ACM OPERATOR (SUBSCRIPTION + CSV + OPERATORGROUP)
+# =============================================================================
+
+- name: "[STAGE 04 - ACM Cleanup] | 4.2.1) Query ACM Subscription to discover installed CSV - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ acm_dr_hub_cleanup_mch_operator_subscription }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  register: acm_dr_hub_cleanup_mch_subscription_info
+
+- name: "[STAGE 04 - ACM Cleanup] | 4.2.2) Remove Advanced Cluster Management operator Subscription - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ acm_dr_hub_cleanup_mch_operator_subscription }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 04 - ACM Cleanup] | 4.2.3) Remove installed ACM ClusterServiceVersion (CSV) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: "{{ acm_dr_hub_cleanup_mch_subscription_info.resources[0].status.installedCSV }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  when:
+    - acm_dr_hub_cleanup_mch_subscription_info.resources | default([]) | length > 0
+    - acm_dr_hub_cleanup_mch_subscription_info.resources[0].status.installedCSV | default('') | length > 0
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 04 - ACM Cleanup] | 4.2.4) Remove ACM OperatorGroup - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    name: "{{ acm_dr_hub_cleanup_mch_operatorgroup }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 04 - ACM Cleanup] | 4.2.5) Remove ACM namespace (rhacm-pull-secret together) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    kind: Namespace
+    name: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}"
+  register: acm_dr_hub_cleanup_mch_ns_removal
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  ignore_errors: true
+
+- name: "[STAGE 04 - ACM Cleanup DIAGNOSTIC] | ❌ ACM namespace stuck"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Namespace '{{ acm_dr_hub_cleanup_mch_namespace }}'
+      did not terminate within {{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}s
+      on context '{{ k8s_target_context }}'.
+      Check for stuck finalizers: oc get ns {{ acm_dr_hub_cleanup_mch_namespace }}
+      -o yaml --context {{ k8s_target_context }}.
+      Use examples/scripts/break-glass/force_delete_namespace.sh if needed.
+  when:
+    - acm_dr_hub_cleanup_mch_ns_removal is defined
+    - acm_dr_hub_cleanup_mch_ns_removal is failed
+
+# =============================================================================
+# STEP 4.3: COMPLETION SUMMARY AND STAGE 04 STATUS
+# =============================================================================
+
+- name: "[STAGE 04 - ACM Cleanup] | Display complete Red Hat ACM removal completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/04_mch_acm_cleanup_summary.j2').split('\n') }}"
+  run_once: true
+...

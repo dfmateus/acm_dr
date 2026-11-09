@@ -1,0 +1,17 @@
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: BackupSchedule
+metadata:
+  name: "{{ acm_dr_hub_setup_schedule_name | default('acm-hub-schedule') }}"
+  namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+spec:
+  veleroSchedule: "{{ acm_dr_hub_setup_backup_cron_schedule | default('0 */2 * * *') }}"
+  veleroTtl: "{{ acm_dr_hub_setup_backup_ttl | default('120h') }}"
+  useManagedServiceAccount: true
+{% if acm_dr_hub_setup_backup_no_backup_on_start | default(false) | bool %}
+  noBackupOnStart: true
+{% endif %}
+{% if acm_dr_hub_setup_managed_service_account_ttl | default('') | length > 0 %}
+  managedServiceAccountTTL: "{{ acm_dr_hub_setup_managed_service_account_ttl }}"
+{% endif %}
+  paused: false

@@ -1,0 +1,16 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 03 - OBSERVABILITY & THANOS FULLY DEPLOYED & READY
+{{ _sep }}
+ 🎯 TARGET CONTEXT:         {{ k8s_target_context }}
+ 📂 OBS NAMESPACE:         {{ acm_dr_hub_setup_observability_namespace | default('open-cluster-management-observability') }}
+ 💾 STORAGECLASS:          {{ acm_dr_hub_setup_observability_storage_class | default('Default/CSI') }}
+ ☁️ CLOUD STORAGE:         {{ (acm_dr_hub_setup_cloud_provider == 'aws') | ternary('S3 bucket ' ~ acm_dr_hub_setup_aws_s3_bucket_observability | default('N/A'), 'Azure SA ' ~ acm_dr_hub_setup_azure_storage_account_name | default('N/A')) }}
+ 📊 MCO RECONCILIATION:    Ready (Condition True)
+ 📦 RUNNING PODS:          {{ acm_dr_hub_setup_mco_pods.resources | length }} operational pod(s)
+{{ _sep }}
+ ⚠️  ARCHITECTURE NOTE:
+ The Thanos mesh (Compact, Store, Query, and Receive) is active and
+ connected to {{ (acm_dr_hub_setup_cloud_provider == 'aws') | ternary('AWS S3', 'Azure Blob') }} Storage. Multi-cluster
+ metrics collection and alerting are operational.
+{{ _sep }}

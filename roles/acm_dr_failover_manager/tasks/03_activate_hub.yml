@@ -1,0 +1,399 @@
+---
+# roles/acm_dr_failover_manager/tasks/03_activate_hub.yml
+
+- name: "[STAGE 03 - Activate Hub] | Display DR Hub activation metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "⚡ STAGE 03 - Activate Hub (Restore Operations on DR Hub)"
+    acm_dr_failover_manager_banner_lines:
+      - "📡 DESTINATION HUB: {{ passive_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+# Stage 00 task 0.3.1 already queries ClusterVersion on active_hub when version_check=true.
+# Reuse that cached result to avoid a duplicate API call. Fall back to a fresh query
+# only when version_check=false caused Stage 00 to skip the read.
+- name: "[STAGE 03 - Activate Hub] | 3.0.1) Use cached Stage 00 ClusterVersion for explicit backup resolution"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_origin_ns_info: "{{ acm_dr_failover_manager_source_clusterversion }}"
+  when:
+    - acm_dr_failover_manager_resolve_explicit_backup | default(true) | bool
+    - acm_dr_failover_manager_source_clusterversion is defined
+    - acm_dr_failover_manager_source_clusterversion.resources | default([]) | length > 0
+
+- name: "[STAGE 03 - Activate Hub] | 3.0.1f) Fetch ClusterVersion from Source Hub (version_check=false fallback) - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterVersion
+    name: version
+  register: acm_dr_failover_manager_origin_ns_info
+  when:
+    - acm_dr_failover_manager_resolve_explicit_backup | default(true) | bool
+    - acm_dr_failover_manager_source_clusterversion is not defined or
+      (acm_dr_failover_manager_source_clusterversion.resources | default([]) | length == 0)
+
+- name: "[STAGE 03 - Activate Hub] | 3.0.2) Discover backups (credentials/resources/managed-clusters) originated from the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: velero.io/v1
+    kind: Backup
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    label_selectors:
+      - "velero.io/schedule-name={{ item }}"
+      - "cluster.open-cluster-management.io/backup-cluster={{ acm_dr_failover_manager_origin_ns_info.resources[0].spec.clusterID }}"
+  loop:
+    - "{{ acm_dr_failover_manager_credentials_schedule_name }}"
+    - "{{ acm_dr_failover_manager_resources_schedule_name }}"
+    - "{{ acm_dr_failover_manager_managed_clusters_schedule_name }}"
+  loop_control:
+    label: "{{ item }}"
+  register: acm_dr_failover_manager_origin_backups
+  when:
+    - acm_dr_failover_manager_resolve_explicit_backup | default(true) | bool
+    - acm_dr_failover_manager_origin_ns_info.resources | default([]) | length > 0
+
+- name: "[STAGE 03 - Activate Hub] | 3.0.3) Resolve explicit names of the most recent backups by category"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_resolved_credentials_backup: >-
+      {{
+        acm_dr_failover_manager_origin_backups.results[0].resources | default([])
+        | selectattr('status.phase', 'equalto', 'Completed')
+        | sort(attribute='metadata.creationTimestamp')
+        | map(attribute='metadata.name') | list | last | default('latest')
+      }}
+    acm_dr_failover_manager_resolved_resources_backup: >-
+      {{
+        acm_dr_failover_manager_origin_backups.results[1].resources | default([])
+        | selectattr('status.phase', 'equalto', 'Completed')
+        | sort(attribute='metadata.creationTimestamp')
+        | map(attribute='metadata.name') | list | last | default('latest')
+      }}
+    acm_dr_failover_manager_resolved_managed_clusters_backup: >-
+      {{
+        acm_dr_failover_manager_origin_backups.results[2].resources | default([])
+        | selectattr('status.phase', 'equalto', 'Completed')
+        | sort(attribute='metadata.creationTimestamp')
+        | map(attribute='metadata.name') | list | last | default('latest')
+      }}
+  when:
+    - acm_dr_failover_manager_resolve_explicit_backup | default(true) | bool
+    - acm_dr_failover_manager_origin_backups.results is defined
+
+- name: "[STAGE 03 - Activate Hub] | 3.0.4) Apply fallback to 'latest' when explicit resolution does not apply"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_resolved_credentials_backup: "{{ acm_dr_failover_manager_resolved_credentials_backup | default('latest') }}"
+    acm_dr_failover_manager_resolved_resources_backup: "{{ acm_dr_failover_manager_resolved_resources_backup | default('latest') }}"
+    acm_dr_failover_manager_resolved_managed_clusters_backup: "{{ acm_dr_failover_manager_resolved_managed_clusters_backup | default('latest') }}"
+
+- name: "[STAGE 03 - Activate Hub] | 3.0.5) Display applied backup resolution"
+  ansible.builtin.debug:
+    msg:
+      - "🔎 Credentials backup resolved: {{ acm_dr_failover_manager_resolved_credentials_backup }}"
+      - "🔎 Resources backup resolved:   {{ acm_dr_failover_manager_resolved_resources_backup }}"
+      - "🔎 Managed clusters backup resolved: {{ acm_dr_failover_manager_resolved_managed_clusters_backup }}"
+  run_once: true
+
+- name: "[STAGE 03 - Activate Hub] | 3.0.6) 🛡️ Assert no backup category fell back to 'latest'"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_failover_manager_resolved_credentials_backup != 'latest'
+      - acm_dr_failover_manager_resolved_resources_backup != 'latest'
+      - acm_dr_failover_manager_resolved_managed_clusters_backup != 'latest'
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => One or more backup categories resolved to 'latest'
+      because no Completed backup was found for that category on the source Hub.
+      Credentials backup: {{ acm_dr_failover_manager_resolved_credentials_backup }}.
+      Resources backup: {{ acm_dr_failover_manager_resolved_resources_backup }}.
+      Managed-clusters backup: {{ acm_dr_failover_manager_resolved_managed_clusters_backup }}.
+      Using 'latest' risks restoring from the wrong Hub's backup when the storage
+      is shared between multiple Hub pairs. To override (e.g., first-run lab with
+      no backup history), set: acm_dr_failover_manager_allow_latest_backup=true.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => All 3 backup categories resolved to explicit names.
+      Credentials: {{ acm_dr_failover_manager_resolved_credentials_backup }}.
+      Resources: {{ acm_dr_failover_manager_resolved_resources_backup }}.
+      Managed-clusters: {{ acm_dr_failover_manager_resolved_managed_clusters_backup }}.
+  when:
+    - acm_dr_failover_manager_resolve_explicit_backup | default(true) | bool
+    - not (acm_dr_failover_manager_allow_latest_backup | default(false) | bool)
+
+- name: "[STAGE 03 - Activate Hub] | 3.1.1) Map residual Restore objects - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_old_restores
+
+- name: "[STAGE 03 - Activate Hub] | 3.1.2) Delete old Restore objects - {{ passive_hub }}"
+  kubernetes.core.k8s:
+    context: "{{ passive_hub }}"
+    state: absent
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ item.metadata.name }}"
+  loop: "{{ acm_dr_failover_manager_old_restores.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: acm_dr_failover_manager_old_restores.resources | default([]) | length > 0
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 03 - Activate Hub] | 3.1.3) Create Activation Restore Custom Resource - {{ passive_hub }}"
+  kubernetes.core.k8s:
+    context: "{{ passive_hub }}"
+    state: present
+    definition:
+      apiVersion: cluster.open-cluster-management.io/v1beta1
+      kind: Restore
+      metadata:
+        name: "{{ acm_dr_failover_manager_restore_name }}"
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+      spec:
+        cleanupBeforeRestore: "{{ acm_dr_failover_manager_cleanup_before_restore }}"
+        veleroCredentialsBackupName: "{{ acm_dr_failover_manager_resolved_credentials_backup | default('latest') }}"
+        veleroResourcesBackupName: "{{ acm_dr_failover_manager_resolved_resources_backup | default('latest') }}"
+        veleroManagedClustersBackupName: "{{ acm_dr_failover_manager_resolved_managed_clusters_backup | default('latest') }}"
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 03 - Activate Hub] | 3.1.4) ⏳ Polling restore progress - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_restore_name }}"
+  register: acm_dr_failover_manager_restore_status
+  retries: "{{ acm_dr_failover_manager_activate_retries | default(60) }}"
+  delay: "{{ acm_dr_failover_manager_activate_delay | default(10) }}"
+  until:
+    - (acm_dr_failover_manager_restore_status.resources | default([])) | length > 0
+    - acm_dr_failover_manager_restore_status.resources[0].status.phase | default('') in ['Finished', 'Completed', 'FinishedWithErrors']
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  ignore_errors: true
+
+# =============================================================================
+# RESTORE PROGRESS DIAGNOSTIC SECTION
+# =============================================================================
+# Runs only when the Restore polling times out (3.1.4 is failed).
+# Gathers evidence from the Restore CR, BackupStorageLocation, and Velero
+# pods, then prints a structured diagnostic report before re-failing.
+# On the happy path, every task below is skipped (when: ... is failed).
+
+# D.1) Re-read the Restore CR to capture its current phase and conditions.
+#      The polling task already has the last-attempt data in the register,
+#      but re-reading ensures we have the freshest status.
+- name: "[STAGE 03 - Activate Hub DIAGNOSTIC] | D.1) Read Restore CR status from DR Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_restore_name }}"
+  register: acm_dr_failover_manager_diag_restore_info
+  failed_when: false  # must not crash the diagnostic itself
+  when: acm_dr_failover_manager_restore_status is failed
+
+# D.2) Read the BackupStorageLocation phase. An unavailable BSL blocks
+#      all restore operations (Velero cannot read the backup data).
+- name: "[STAGE 03 - Activate Hub DIAGNOSTIC] | D.2) Read BackupStorageLocation status"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: velero.io/v1
+    kind: BackupStorageLocation
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_diag_bsl_info
+  failed_when: false
+  when: acm_dr_failover_manager_restore_status is failed
+
+# D.3) Check Velero pod status in the backup namespace. CrashLoopBackOff
+#      or OOMKilled on the Velero pod prevents any restore from completing.
+- name: "[STAGE 03 - Activate Hub DIAGNOSTIC] | D.3) Check Velero pod status"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    label_selectors:
+      - "app.kubernetes.io/name=velero"
+  register: acm_dr_failover_manager_diag_velero_pods
+  failed_when: false
+  when: acm_dr_failover_manager_restore_status is failed
+
+# D.4) Build a structured summary from the gathered evidence.
+- name: "[STAGE 03 - Activate Hub DIAGNOSTIC] | D.4) Build restore diagnostic summary"
+  ansible.builtin.set_fact:
+    # Restore CR phase and conditions
+    acm_dr_failover_manager_diag_restore_phase: >-
+      {{ acm_dr_failover_manager_diag_restore_info.resources[0].status.phase | default('Unknown')
+         if (acm_dr_failover_manager_diag_restore_info.resources | default([]) | length > 0)
+         else 'Restore CR not found' }}
+    acm_dr_failover_manager_diag_restore_conditions: >-
+      {% set restore = acm_dr_failover_manager_diag_restore_info.resources | default([]) %}
+      {% if restore | length > 0 and restore[0].status.conditions is defined %}
+      {% for c in restore[0].status.conditions %}
+      {{ c.type }}: {{ c.status }} - {{ c.message | default('(no message)') }}
+      {% endfor %}
+      {% else %}
+      (no conditions available)
+      {% endif %}
+    # BSL phase and message
+    acm_dr_failover_manager_diag_bsl_summary: >-
+      {% set bsls = acm_dr_failover_manager_diag_bsl_info.resources | default([]) %}
+      {% if bsls | length == 0 %}
+      No BackupStorageLocation found in {{ acm_dr_failover_manager_backup_ns }}.
+      {% else %}
+      {% for bsl in bsls %}
+      BSL '{{ bsl.metadata.name }}': phase={{ bsl.status.phase | default('Unknown') }}{%- if bsl.status.message is defined %}, message={{ bsl.status.message[:200] }}{% endif %}{%- if bsl.status.lastValidationTime is defined %}, lastValidation={{ bsl.status.lastValidationTime }}{% endif -%}
+
+      {% endfor %}
+      {% endif %}
+    # Velero pod status with container wait reasons
+    acm_dr_failover_manager_diag_velero_summary: >-
+      {% set pods = acm_dr_failover_manager_diag_velero_pods.resources | default([]) %}
+      {% if pods | length == 0 %}
+      No Velero pods found in {{ acm_dr_failover_manager_backup_ns }}.
+      {% else %}
+      {% for pod in pods %}
+      Pod: {{ pod.metadata.name }} | Phase: {{ pod.status.phase | default('Unknown') }}
+      {%   for cs in pod.status.containerStatuses | default([]) %}
+      {%     if cs.state.waiting is defined %}
+        -> Container '{{ cs.name }}': {{ cs.state.waiting.reason | default('Waiting') }}{% if cs.state.waiting.message is defined %} ({{ cs.state.waiting.message[:200] }}){% endif %}
+
+      {%     endif %}
+      {%   endfor %}
+      {% endfor %}
+      {% endif %}
+  when: acm_dr_failover_manager_restore_status is failed
+
+# D.5) Match observed symptoms against known restore failure patterns.
+- name: "[STAGE 03 - Activate Hub DIAGNOSTIC] | D.5) Generate troubleshooting hints"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_diag_restore_hints: >-
+      {% set restore_phase = acm_dr_failover_manager_diag_restore_phase | default('') %}
+      {% set bsl_text = acm_dr_failover_manager_diag_bsl_summary | default('') %}
+      {% set velero_text = acm_dr_failover_manager_diag_velero_summary | default('') %}
+      {% set cond_text = acm_dr_failover_manager_diag_restore_conditions | default('') %}
+      {% set hints = [] %}
+      {% if 'Unavailable' in bsl_text or 'No BackupStorageLocation found' in bsl_text %}
+      {%   set _ = hints.append(
+             'BSL UNAVAILABLE: The BackupStorageLocation is not healthy. '
+             ~ 'Check cloud storage credentials (cloud-credentials Secret in '
+             ~ acm_dr_failover_manager_backup_ns ~ '), verify the storage bucket/container '
+             ~ 'exists, and confirm network connectivity from the Hub to the storage backend.') %}
+      {% endif %}
+      {% if 'CrashLoopBackOff' in velero_text or 'OOMKilled' in velero_text %}
+      {%   set _ = hints.append(
+             'VELERO POD UNHEALTHY: The Velero pod is crashing or running out of memory. '
+             ~ 'Check pod logs: oc logs -n ' ~ acm_dr_failover_manager_backup_ns
+             ~ ' -l app.kubernetes.io/name=velero --context ' ~ passive_hub
+             ~ '. For OOMKilled, increase Velero memory limits in the DPA resource.') %}
+      {% endif %}
+      {% if 'PartiallyFailed' in restore_phase %}
+      {%   set _ = hints.append(
+             'PARTIALLY FAILED: The restore completed with errors. Some resources '
+             ~ 'may not have been restored correctly. Check the Velero Restore logs '
+             ~ 'and conditions above for which sub-restore (credentials, resources, '
+             ~ 'managed-clusters) had problems.') %}
+      {% endif %}
+      {% if restore_phase == 'Unknown' or 'not found' in restore_phase %}
+      {%   set _ = hints.append(
+             'RESTORE CR MISSING: The Restore Custom Resource was not found on the DR Hub. '
+             ~ 'This can happen if the Restore CRD is not installed (missing cluster-backup '
+             ~ 'addon) or if the Restore was deleted before polling started.') %}
+      {% endif %}
+      {% if 'InProgress' in restore_phase or 'Enabled' in restore_phase %}
+      {%   set _ = hints.append(
+             'STILL IN PROGRESS: The restore is running but has not finished within the timeout ('
+             ~ (acm_dr_failover_manager_activate_retries | default(60) | int
+                * acm_dr_failover_manager_activate_delay | default(10) | int) | string
+             ~ 's). Large fleets or slow storage can cause this. '
+             ~ 'Consider increasing acm_dr_failover_manager_activate_retries or checking '
+             ~ 'node resources and storage throughput on the DR Hub.') %}
+      {% endif %}
+      {% if 'No Velero pods found' in velero_text %}
+      {%   set _ = hints.append(
+             'NO VELERO PODS: The Velero operator is not running in '
+             ~ acm_dr_failover_manager_backup_ns ~ '. Verify the DataProtectionApplication '
+             ~ 'resource exists and the OADP operator is installed on the DR Hub.') %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append(
+             'No specific pattern matched. Check the Restore conditions and Velero pod '
+             ~ 'logs above for details: oc logs -n ' ~ acm_dr_failover_manager_backup_ns
+             ~ ' -l app.kubernetes.io/name=velero --context ' ~ passive_hub) %}
+      {% endif %}
+      {{ hints }}
+  when: acm_dr_failover_manager_restore_status is failed
+
+# D.6) Print the structured diagnostic report.
+- name: "[STAGE 03 - Activate Hub DIAGNOSTIC] | D.6) ❌ RESTORE FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ RESTORE POLLING FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "RESTORE NAME:"
+      - "  {{ acm_dr_failover_manager_restore_name }}"
+      - ""
+      - "TARGET HUB:"
+      - "  {{ passive_hub }}"
+      - ""
+      - "ATTEMPTS:"
+      - "  {{ acm_dr_failover_manager_restore_status.attempts | default('?') }} of {{ acm_dr_failover_manager_activate_retries | default(60) }} retries exhausted"
+      - ""
+      - "RESTORE PHASE:"
+      - "  {{ acm_dr_failover_manager_diag_restore_phase | default('(unknown)') }}"
+      - ""
+      - "RESTORE CONDITIONS:"
+      - "{{ acm_dr_failover_manager_diag_restore_conditions | default('  (could not read Restore CR)') }}"
+      - ""
+      - "BACKUPSTORAGELOCATION STATUS:"
+      - "{{ acm_dr_failover_manager_diag_bsl_summary | default('  (could not read BSL)') }}"
+      - ""
+      - "VELERO POD STATUS:"
+      - "{{ acm_dr_failover_manager_diag_velero_summary | default('  (could not read Velero pods)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_failover_manager_diag_restore_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: acm_dr_failover_manager_restore_status is failed
+
+# D.7) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 03 - Activate Hub DIAGNOSTIC] | D.7) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Restore '{{ acm_dr_failover_manager_restore_name }}' on Hub
+      '{{ passive_hub }}' did not reach Finished/Completed state after
+      {{ acm_dr_failover_manager_restore_status.attempts | default('?') }} polling attempts
+      ({{ (acm_dr_failover_manager_restore_status.attempts | default(60) | int)
+          * (acm_dr_failover_manager_activate_delay | default(10) | int) }}s).
+      Current phase: {{ acm_dr_failover_manager_diag_restore_phase | default('unknown') }}.
+      See the diagnostic report above for Restore conditions, BSL status,
+      Velero pod status, and troubleshooting hints.
+  when: acm_dr_failover_manager_restore_status is failed
+
+- name: "[STAGE 03 - Activate Hub] | 3.1.5) Validate Final Restore Status - {{ passive_hub }}"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ [RESTORE COMPLETED]: The restore process on DR Hub '{{ passive_hub }}' has finished.
+      Status: {{ acm_dr_failover_manager_restore_status.resources[0].status.phase | default('N/A') }}.
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_restore_status is not failed
+
+- name: "[STAGE 03 - Activate Hub] | 3.1.6) 🔎 [DRY-RUN] Restore preview - {{ passive_hub }}"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] The Restore Custom Resource '{{ acm_dr_failover_manager_restore_name }}' would be created in namespace
+      '{{ acm_dr_failover_manager_backup_ns }}' on Hub '{{ passive_hub }}' (cleanupBeforeRestore:
+      CleanupRestored) and the orchestration would wait for its status to reach Finished/Completed before
+      proceeding. No real changes were applied (validated via Kubernetes API dry-run).
+  when: acm_dr_failover_manager_dry_run | default(false) | bool
+...

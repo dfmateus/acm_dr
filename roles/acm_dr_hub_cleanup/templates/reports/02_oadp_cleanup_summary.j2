@@ -1,0 +1,12 @@
+{% set _sep = (acm_dr_hub_cleanup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 02 - OADP DR CONFIGURATION REMOVED
+{{ _sep }}
+ 🗑️  REMOVED: BackupSchedule '{{ acm_dr_hub_cleanup_schedule_name }}', DataProtectionApplication
+              '{{ acm_dr_hub_cleanup_oadp_dpa_name }}' and the Secret '{{ acm_dr_hub_cleanup_oadp_cloud_secret_name }}'.
+ 🟢 UNTOUCHED BY THIS STAGE: Red Hat OADP operator, its OperatorGroup/Subscription/CSV and the
+              namespace '{{ acm_dr_hub_cleanup_oadp_namespace }}'.
+ ⚠️  WARNING: Stage 04 (MultiClusterHub removal) may still cascade this namespace/operator
+              as a side effect of the ACM cluster-backup component - see README (Real Finding).
+ ☁️  PRESERVED IN CLOUD: Backups already written to {{ (acm_dr_hub_cleanup_cloud_provider | default('azure')) == 'aws' | ternary('S3', 'Azure') }} Storage were NOT deleted by this stage.
+{{ _sep }}

@@ -1,0 +1,34 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: {{ acm_dr_hub_setup_appset_policies_name | default('governance-policies') }}
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+spec:
+  generators:
+    - clusterDecisionResource:
+        configMapRef: acm-placement
+        labelSelector:
+          matchLabels:
+            cluster.open-cluster-management.io/placement: {{ acm_dr_hub_setup_placement_name | default('hub-governance-placement') }}
+        requeueAfterSeconds: 180
+  template:
+    metadata:
+      name: {{ acm_dr_hub_setup_appset_policies_name | default('governance-policies') }}-{{ '{{' }}name{{ '}}' }}
+      labels:
+        cluster.open-cluster-management.io/backup: cluster-activation
+    spec:
+      project: default
+      source:
+        repoURL: {{ acm_dr_hub_setup_github_repo_url }}
+        targetRevision: {{ acm_dr_hub_setup_github_target_revision | default('main') }}
+        path: {{ acm_dr_hub_setup_github_policies_path | default('policies') }}
+      destination:
+        server: "{{ '{{' }}server{{ '}}' }}"
+        namespace: {{ acm_dr_hub_setup_policies_namespace | default('acm-policies') }}
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: false
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true

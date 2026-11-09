@@ -1,0 +1,11 @@
+apiVersion: console.openshift.io/v1
+kind: ConsoleLink
+metadata:
+  name: "argocd-{{ acm_argocd_instance_setup_name }}-{{ k8s_target_context }}"
+spec:
+  applicationMenu:
+    section: {{ acm_argocd_instance_setup_console_link_section | default('OpenShift GitOps') }}
+    imageURL: "{{ acm_argocd_instance_setup_icon_url | default('') | trim }}"
+  href: "https://{{ acm_argocd_instance_setup_route_info.resources[0].spec.host }}"
+  location: ApplicationMenu
+  text: "{{ acm_argocd_instance_setup_console_link_text }}"

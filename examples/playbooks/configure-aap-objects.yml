@@ -1,0 +1,318 @@
+---
+# examples/playbooks/configure-aap-objects.yml
+# =============================================================================
+# AAP OBJECT NAMING STANDARDIZATION: EXAMPLE SCRIPT
+# =============================================================================
+# This playbook renames AAP credentials, projects, inventories, and job
+# templates from their auto-generated import names to the naming convention
+# used by this collection (see the AAP object naming section in docs/).
+#
+# HOW TO USE:
+#   1. Edit the mapping lists below to match your environment.
+#      Replace every old_name with the name that was created when you imported
+#      the CasC objects, and set new_name to the convention name you want.
+#   2. Export your controller credentials:
+#        export CONTROLLER_HOST="https://your-aap.example.com"
+#        export CONTROLLER_PASSWORD="<admin password>"
+#   3. Preview changes (dry-run):
+#        ansible-playbook examples/playbooks/configure-aap-objects.yml --check -v
+#   4. Apply:
+#        ansible-playbook examples/playbooks/configure-aap-objects.yml -v
+#
+# IMPORTANT: This is an example, not a reusable library.
+#   The credential and template name lists below are placeholders showing the
+#   naming pattern. Replace them with your own environment's object names
+#   before running. Only PATCH name + description; secrets are never touched.
+#
+# This file is excluded from the built collection artifact (see galaxy.yml
+# build_ignore) so it travels with the source but not the tarball.
+#
+# Task helper:
+#   This playbook delegates per-object API calls to
+#   ../tasks/aap/rename-single-object.yml.
+#   Adjust the path if you move this file relative to the project root.
+#
+# Requires:
+#   - Ansible 2.15+
+#   - No external collections (uses ansible.builtin.uri)
+#   - CONTROLLER_HOST and CONTROLLER_PASSWORD env vars
+
+- name: "Standardize ACM DR object names and descriptions on AAP"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # AAP Controller connection (read from env vars, overridable via -e)
+    configure_aap_controller_host: >-
+      {{ lookup('ansible.builtin.env', 'CONTROLLER_HOST', default='') }}
+    configure_aap_controller_username: >-
+      {{ lookup('ansible.builtin.env', 'CONTROLLER_USERNAME', default='') | default('admin', true) }}
+    configure_aap_controller_password: >-
+      {{ lookup('ansible.builtin.env', 'CONTROLLER_PASSWORD', default='') }}
+    configure_aap_validate_certs: true  # set false only for lab with self-signed certs
+
+    # REST API base URL (strip trailing slash if present)
+    configure_aap_api_base: >-
+      {{ configure_aap_controller_host | regex_replace('/$', '') }}/api/controller/v2
+
+    # =========================================================================
+    # CREDENTIAL TYPES
+    # Pattern: <Domain> - <Schema description>
+    # Only custom types (managed=false); built-in types are left untouched.
+    # =========================================================================
+    configure_aap_credential_types:
+      # Replace old_name with the name generated at import time,
+      # and new_name with the convention name.
+      - old_name: "ACM DR Source Hub"
+        new_name: "ACM DR - Source Hub"
+        type: "Credential Type"
+        endpoint: "credential_types"
+        description: >-
+          Per-cluster credentials for the failover origin Hub (currently
+          ACTIVE). Injects ACM_DR_SOURCE_HOST, ACM_DR_SOURCE_TOKEN,
+          ACM_DR_SOURCE_CA_DATA, and ACM_DR_SOURCE_CONTEXT. Used by the
+          Failover Orchestrator playbook.
+
+      - old_name: "ACM DR Destination Hub"
+        new_name: "ACM DR - Destination Hub"
+        type: "Credential Type"
+        endpoint: "credential_types"
+        description: >-
+          Per-cluster credentials for the failover destination Hub (currently
+          PASSIVE). Injects ACM_DR_DEST_HOST, ACM_DR_DEST_TOKEN,
+          ACM_DR_DEST_CA_DATA, and ACM_DR_DEST_CONTEXT. Used by the
+          Failover Orchestrator playbook.
+
+      - old_name: "ACM DR Target Cluster"
+        new_name: "ACM DR - Target Cluster"
+        type: "Credential Type"
+        endpoint: "credential_types"
+        description: >-
+          Per-cluster credentials for single-target operations (Hub Setup,
+          Cleanup, ArgoCD, Spoke Manager Hub-side). Injects
+          ACM_DR_TARGET_HOST, ACM_DR_TARGET_TOKEN, ACM_DR_TARGET_CA_DATA,
+          and ACM_DR_TARGET_CONTEXT.
+
+      - old_name: "ACM DR Spoke Cluster"
+        new_name: "ACM DR - Spoke Cluster"
+        type: "Credential Type"
+        endpoint: "credential_types"
+        description: >-
+          Per-cluster credentials for an individual Spoke cluster. Injects
+          ACM_DR_SPOKE_HOST, ACM_DR_SPOKE_TOKEN, ACM_DR_SPOKE_CA_DATA,
+          and ACM_DR_SPOKE_CONTEXT. Used by Spoke Manager and Spoke
+          Onboarding for direct Spoke connectivity.
+
+      - old_name: "Multi-Context KUBECONFIG"
+        new_name: "ACM DR - Multi-Context Kubeconfig"
+        type: "Credential Type"
+        endpoint: "credential_types"
+        description: >-
+          Legacy monolithic kubeconfig containing all cluster contexts.
+          Injects KUBECONFIG and K8S_AUTH_KUBECONFIG as a temp file.
+          Supported for backward compatibility; prefer per-cluster
+          credentials for new Job Templates.
+
+      - old_name: "GitHub PAT"
+        new_name: "ACM DR - GitHub PAT"
+        type: "Credential Type"
+        endpoint: "credential_types"
+        description: >-
+          GitHub Personal Access Token for private repository access.
+          Injects GITHUB_USER and GITHUB_PAT. Used by Hub Setup (Stage 04)
+          to configure ArgoCD repository secrets.
+
+    # =========================================================================
+    # CREDENTIALS
+    # Pattern for Hub credentials:  <Distro> <Role> <cluster-id> (<auth>)
+    # Pattern for Spoke credentials: <Distro> Spoke <cluster-id> (<auth>)
+    # Pattern for service credentials: <System> <id> (<auth type>)
+    # PATCH only sends name + description - secrets are never modified.
+    # =========================================================================
+    configure_aap_credentials:
+      # --- Example Hub credentials - replace with your own cluster names ---
+      - old_name: "Hub-01 Primary (Source)"
+        new_name: "ARO Source your-hub-01 (SA)"
+        type: "Credential"
+        endpoint: "credentials"
+        description: >-
+          Zero-Trust ServiceAccount for the primary ARO Hub (your-hub-01).
+          Bearer token for ansible-dr-orchestrator in ansible-automation,
+          cluster-admin scoped. Attach as Source Hub credential when this
+          cluster is the failover origin. Rotate via
+          examples/scripts/cluster-onboarding/02_provision_automation_sa.sh.
+
+      - old_name: "Hub-02 DR (Destination)"
+        new_name: "ARO Dest your-hub-02 (SA)"
+        type: "Credential"
+        endpoint: "credentials"
+        description: >-
+          Zero-Trust ServiceAccount for the DR ARO Hub (your-hub-02).
+          Attach as Destination Hub credential when this cluster is the
+          failover target. Rotate together with the Source credential pair.
+
+      # --- Example Spoke credentials - replace with your own cluster names ---
+      - old_name: "AKS Spoke your-aks-01"
+        new_name: "AKS Spoke your-aks-01 (SA)"
+        type: "Credential"
+        endpoint: "credentials"
+        description: >-
+          Zero-Trust SA for AKS cluster your-aks-01. Spoke-side credential
+          for onboarding and detach operations.
+
+      # --- Example service credentials ---
+      - old_name: "GitHub PAT - your-github-username"
+        new_name: "GitHub your-github-username (PAT)"
+        type: "Credential"
+        endpoint: "credentials"
+        description: >-
+          GitHub Personal Access Token for user your-github-username. Used
+          by Hub Setup (Stage 04) to configure ArgoCD repository secrets
+          for private repos. Rotate when the PAT approaches expiry.
+
+    # =========================================================================
+    # PROJECTS
+    # Pattern: <Domain> Collection (<branch>)
+    # =========================================================================
+    configure_aap_projects:
+      - old_name: "ACM DR Orchestrator"
+        new_name: "ACM DR Collection (main)"
+        type: "Project"
+        endpoint: "projects"
+        description: >-
+          RHACM Multi-Cluster Business Continuity automation suite. Roles:
+          acm_dr_failover_manager (DR engine), acm_dr_hub_setup/cleanup
+          (Hub provisioning), acm_dr_spoke_manager (Spoke lifecycle),
+          acm_argocd_instance_setup/cleanup, acm_dr_kubeconfig_resolver.
+
+    # =========================================================================
+    # INVENTORIES
+    # Pattern: <Domain> - <ENV>
+    # =========================================================================
+    configure_aap_inventories:
+      - old_name: "Demo Inventory"
+        new_name: "ACM DR - LAB"
+        type: "Inventory"
+        endpoint: "inventories"
+        description: >-
+          Localhost-only inventory for the ACM DR environment. All cluster
+          targeting uses kubeconfig contexts, not inventory hosts.
+
+    # =========================================================================
+    # JOB TEMPLATES
+    # Pattern: JT - <Domain> - <ENV> - <Action>
+    # =========================================================================
+    configure_aap_job_templates:
+      - old_name: "ACM Hub Switchover Orchestrator"
+        new_name: "JT - ACM DR - LAB - Hub Switchover"
+        type: "Job Template"
+        endpoint: "job_templates"
+        description: >-
+          9-stage DR failover/failback pipeline for RHACM Hub clusters.
+          Transfers managed cluster ownership from the active Hub to the
+          passive Hub using OADP Restore, with KCS 7039710 mitigation and
+          explicit backup resolution by clusterID. Supports dry-run
+          simulation and planned maintenance failover with target version
+          validation. Run dry-run first before any production failover.
+
+      - old_name: "ACM DR Lab Setup"
+        new_name: "JT - ACM DR - LAB - Hub Setup"
+        type: "Job Template"
+        endpoint: "job_templates"
+        description: >-
+          Provisions Hub infrastructure for DR readiness: cloud storage
+          (Azure Blob or AWS S3), MultiClusterHub operator, OADP
+          DataProtectionApplication, Thanos Observability, OpenShift
+          GitOps/ArgoCD instances, and Zero-Trust automation RBAC.
+          Idempotent and safe to re-run.
+
+      - old_name: "ACM DR Lab Cleanup"
+        new_name: "JT - ACM DR - LAB - Hub Cleanup"
+        type: "Job Template"
+        endpoint: "job_templates"
+        description: >-
+          Controlled decommissioning of a cluster that was elected as a DR
+          node. Removes ACM, DR-scoped GitOps/OADP config, and
+          Observability while preserving generic operators and cloud backup
+          data. Refuses to tear down an active Hub unless force flag is set.
+
+      - old_name: "ACM Spoke Manager"
+        new_name: "JT - ACM DR - LAB - Spoke Lifecycle"
+        type: "Job Template"
+        endpoint: "job_templates"
+        description: >-
+          Spoke lifecycle manager: spoke_prep (Hub-side RHACM registration)
+          and spoke_detach (graceful removal per KCS 5950901). Requires an
+          explicit action var and matching tag.
+
+      - old_name: "ACM ArgoCD Instance Setup"
+        new_name: "JT - ACM DR - LAB - ArgoCD Setup"
+        type: "Job Template"
+        endpoint: "job_templates"
+        description: >-
+          Provisions N parametric ArgoCD instances on a Hub: namespace, repo
+          secret, ApplicationSet generator, RBAC, and ConsoleLink.
+
+      - old_name: "ACM ArgoCD Instance Cleanup"
+        new_name: "JT - ACM DR - LAB - ArgoCD Cleanup"
+        type: "Job Template"
+        endpoint: "job_templates"
+        description: >-
+          Removes ArgoCD instances and their managed namespaces without
+          touching the shared GitOps operator. Supports dry-run via check mode.
+
+  pre_tasks:
+    - name: "[AAP CONFIG] | Validate controller connection parameters"
+      ansible.builtin.assert:
+        that:
+          - configure_aap_controller_host | length > 0
+          - configure_aap_controller_password | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Set CONTROLLER_HOST and CONTROLLER_PASSWORD
+          env vars before running this playbook.
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Controller connection configured
+          ({{ configure_aap_controller_host }}).
+
+  tasks:
+    # Phase 1: Credential Types (must complete before credentials reference them)
+    - name: "[AAP CONFIG] | Phase 1: Rename Credential Types"
+      ansible.builtin.include_tasks:
+        file: ../tasks/aap/rename-single-object.yml
+      loop: "{{ configure_aap_credential_types }}"
+      loop_control:
+        label: "{{ item.new_name }}"
+
+    # Phase 2: Credentials (PATCH only touches name + description, not secrets)
+    - name: "[AAP CONFIG] | Phase 2: Rename Credentials"
+      ansible.builtin.include_tasks:
+        file: ../tasks/aap/rename-single-object.yml
+      loop: "{{ configure_aap_credentials }}"
+      loop_control:
+        label: "{{ item.new_name }}"
+
+    # Phase 3: Projects
+    - name: "[AAP CONFIG] | Phase 3: Rename Projects"
+      ansible.builtin.include_tasks:
+        file: ../tasks/aap/rename-single-object.yml
+      loop: "{{ configure_aap_projects }}"
+      loop_control:
+        label: "{{ item.new_name }}"
+
+    # Phase 4: Inventories
+    - name: "[AAP CONFIG] | Phase 4: Rename Inventories"
+      ansible.builtin.include_tasks:
+        file: ../tasks/aap/rename-single-object.yml
+      loop: "{{ configure_aap_inventories }}"
+      loop_control:
+        label: "{{ item.new_name }}"
+
+    # Phase 5: Job Templates (depend on project + inventory)
+    - name: "[AAP CONFIG] | Phase 5: Rename Job Templates"
+      ansible.builtin.include_tasks:
+        file: ../tasks/aap/rename-single-object.yml
+      loop: "{{ configure_aap_job_templates }}"
+      loop_control:
+        label: "{{ item.new_name }}"
+...

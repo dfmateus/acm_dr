@@ -1,0 +1,110 @@
+---
+# roles/acm_dr_cluster_onboard/meta/argument_specs.yml
+argument_specs:
+  main:
+    short_description: Bootstrap a cluster with the ansible-dr-orchestrator ServiceAccount
+    description: >-
+      Creates the ansible-dr-orchestrator ServiceAccount, ClusterRoleBinding, and
+      non-expiring token Secret on a target Kubernetes cluster. Optionally registers
+      the resulting SA credential in AAP via REST API when CONTROLLER_HOST and
+      CONTROLLER_OAUTH_TOKEN are injected by the ACM DR - AAP Automation Token
+      credential. Run once per cluster before configuring permanent credentials in AAP.
+    options:
+      acm_dr_cluster_onboard_namespace:
+        type: str
+        default: "ansible-automation"
+        description: >-
+          Namespace where the ServiceAccount and token Secret are created. Works on
+          any cluster regardless of whether AAP is installed there. Override if your
+          organization enforces a different namespace naming convention.
+
+      acm_dr_cluster_onboard_sa_name:
+        type: str
+        default: "ansible-dr-orchestrator"
+        description: >-
+          Name of the ServiceAccount to create. All other ACM DR roles expect this
+          default. Change only if your organization enforces a different naming policy.
+
+      acm_dr_cluster_onboard_crb_name:
+        type: str
+        default: "ansible-dr-orchestrator-admin"
+        description: >-
+          Name of the ClusterRoleBinding that binds the SA to the ClusterRole.
+          Derived from sa_name for consistency; override only if a naming policy requires it.
+
+      acm_dr_cluster_onboard_token_secret:
+        type: str
+        default: "ansible-dr-orchestrator-token"
+        description: >-
+          Name of the Kubernetes Secret of type kubernetes.io/service-account-token.
+          Kubernetes populates .data.token automatically once the SA exists.
+
+      acm_dr_cluster_onboard_cluster_role:
+        type: str
+        default: "cluster-admin"
+        description: >-
+          ClusterRole bound to the ServiceAccount. cluster-admin is required because
+          the automation reads and writes RHACM CRs, OADP objects, GitOps resources,
+          and RBAC objects across all namespaces.
+
+      acm_dr_cluster_onboard_cluster_name:
+        type: str
+        default: ""
+        description: >-
+          Short display name for this cluster (e.g., hub-primary, hub-dr, spoke-01).
+          Used only in the post-run output and as the AAP credential context name.
+          Does not affect any Kubernetes object.
+
+      acm_dr_cluster_onboard_token_wait_retries:
+        type: int
+        default: 6
+        description: >-
+          Number of polling attempts to wait for Kubernetes to populate the token
+          Secret's .data.token field after SA creation.
+          Total max wait: retries * delay seconds (default: 30s).
+
+      acm_dr_cluster_onboard_token_wait_delay:
+        type: int
+        default: 5
+        description: >-
+          Seconds between polling attempts for the token Secret.
+
+      acm_dr_cluster_onboard_debug_no_log:
+        type: bool
+        default: true
+        description: >-
+          When true, suppresses task output for security-sensitive operations (SA tokens,
+          kubeconfig content). Set to false only in lab environments for troubleshooting.
+
+      acm_dr_cluster_onboard_aap_credential_name:
+        type: str
+        default: ""
+        description: >-
+          Name of the permanent AAP credential to create or update after bootstrap.
+          Naming pattern: "<Distro> <Role> <id> (SA)" (e.g., "ARO Hub Primary 01 (SA)").
+          Leave empty to skip AAP self-registration and fall back to manual instructions.
+
+      acm_dr_cluster_onboard_aap_organization:
+        type: str
+        default: "Default"
+        description: >-
+          AAP organization under which to create the permanent credential. Must match
+          an existing organization in the AAP instance.
+
+      acm_dr_cluster_onboard_aap_credential_type_name:
+        type: str
+        default: "ACM DR - Target Cluster"
+        description: >-
+          Name of the AAP credential type for per-cluster SA credentials. Must match the
+          type created by the CasC import (controller_credential_types.yml). Used to look
+          up the credential type ID via the AAP REST API before creating the credential.
+
+      acm_dr_cluster_onboard_aap_credential_description:
+        type: str
+        default: ""
+        description: >-
+          Optional description for the permanent AAP credential. If empty, a standard
+          description is generated from cluster_name, sa_name, and namespace. The
+          generated description follows the format expected by ansible.md credential
+          description standards.
+...

@@ -1,0 +1,85 @@
+---
+# roles/acm_dr_failover_manager/tasks/common/notify_event.yml
+# =============================================================================
+# INLINE WEBHOOK NOTIFICATION (non-blocking helper)
+#
+# Sends a single webhook notification when NOTIF_WEBHOOK_URL is injected by
+# the 'ACM DR - Notification Webhook' credential. Silent no-op when the
+# credential is not attached to the job. Never fails the failover pipeline.
+#
+# Caller must set these vars via include_tasks vars:
+#   _notify_title     str  heading line shown in all webhook formats
+#   _notify_message   str  body text
+#   _notify_severity  str  info | warning | critical (default: info)
+#
+# Format dispatch matches the notify-workflow-event.yml playbook:
+#   slack        - text block with bold title
+#   teams        - Adaptive Card v1.4
+#   generic-json - {title, body, severity} (fallback)
+# =============================================================================
+
+- name: "[NOTIFY] | Read webhook URL and format from environment"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_notify_url: "{{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_URL', default='') }}"
+    acm_dr_failover_manager_notify_fmt: "{{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_FORMAT', default='generic-json') }}"
+    acm_dr_failover_manager_notify_sev: "{{ _notify_severity | default('info') }}"
+  no_log: true  # NOTIF_WEBHOOK_URL is a secret endpoint
+
+- name: "[NOTIFY] | Skip - NOTIF_WEBHOOK_URL not set"
+  ansible.builtin.debug:
+    msg: "🔎 NOTIF_WEBHOOK_URL is not set. Skipping internal webhook notification for '{{ _notify_title }}'."
+  when: acm_dr_failover_manager_notify_url | length == 0
+
+- name: "[NOTIFY] | Build Slack payload"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_notify_payload:
+      text: "*{{ _notify_title }}* ({{ acm_dr_failover_manager_notify_sev }})\n{{ _notify_message }}"
+  when:
+    - acm_dr_failover_manager_notify_url | length > 0
+    - acm_dr_failover_manager_notify_fmt == 'slack'
+
+- name: "[NOTIFY] | Build Teams Adaptive Card payload"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_notify_payload:
+      type: "message"
+      attachments:
+        - contentType: "application/vnd.microsoft.card.adaptive"
+          content:
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json"
+            type: "AdaptiveCard"
+            version: "1.4"
+            body:
+              - type: "TextBlock"
+                text: "{{ _notify_title }} ({{ acm_dr_failover_manager_notify_sev }})"
+                weight: "Bolder"
+                size: "Medium"
+              - type: "TextBlock"
+                text: "{{ _notify_message }}"
+                wrap: true
+  when:
+    - acm_dr_failover_manager_notify_url | length > 0
+    - acm_dr_failover_manager_notify_fmt == 'teams'
+
+- name: "[NOTIFY] | Build generic-json payload"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_notify_payload:
+      title: "{{ _notify_title }}"
+      body: "{{ _notify_message }}"
+      severity: "{{ acm_dr_failover_manager_notify_sev }}"
+  when:
+    - acm_dr_failover_manager_notify_url | length > 0
+    - acm_dr_failover_manager_notify_fmt not in ['slack', 'teams']
+
+- name: "[NOTIFY] | POST to webhook endpoint"
+  ansible.builtin.uri:
+    url: "{{ acm_dr_failover_manager_notify_url }}"
+    method: POST
+    body: "{{ acm_dr_failover_manager_notify_payload | to_json }}"
+    body_format: json
+    headers:
+      Content-Type: "application/json"
+    status_code: [200, 202, 204]
+  no_log: true  # acm_dr_failover_manager_notify_url is a secret endpoint
+  failed_when: false  # notification is best-effort; never block the failover pipeline
+  when: acm_dr_failover_manager_notify_url | length > 0
+...

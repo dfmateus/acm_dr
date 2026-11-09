@@ -1,0 +1,65 @@
+---
+# roles/acm_argocd_instance/tasks/08_console_link.yml
+# =============================================================================
+# STAGE 08: CONSOLE LINK (SHORTCUT IN THE OPENSHIFT APPLICATION MENU)
+# =============================================================================
+
+- name: "[CONSOLE LINK] | 8.1) Retrieve the ArgoCD instance Route - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: route.openshift.io/v1
+    kind: Route
+    namespace: "{{ acm_argocd_instance_setup_namespace }}"
+    name: "{{ acm_argocd_instance_setup_name }}-server"
+  register: acm_argocd_instance_setup_route_info
+
+- name: "[CONSOLE LINK] | 8.2) Query existing ConsoleLinks to extract the Argo CD icon"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: console.openshift.io/v1
+    kind: ConsoleLink
+  register: acm_argocd_instance_setup_console_links_info
+
+- name: "[CONSOLE LINK] | 8.3) Resolve default Argo CD icon imageURL"
+  ansible.builtin.set_fact:
+    acm_argocd_instance_setup_icon_url: >-
+      {{
+        (
+          acm_argocd_instance_setup_console_links_info.resources | default([]) |
+          selectattr('spec.applicationMenu.imageURL', 'defined') |
+          map(attribute='spec.applicationMenu.imageURL') | first
+        ) if (
+          acm_argocd_instance_setup_console_links_info.resources is defined and
+          (acm_argocd_instance_setup_console_links_info.resources | selectattr('spec.applicationMenu.imageURL', 'defined') | list | length > 0)
+        ) else ''
+      }}
+
+- name: "[CONSOLE LINK] | 8.4) Publish ConsoleLink to the OpenShift Web Console - {{ acm_argocd_instance_setup_name }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: console_link.yml.j2
+  when: acm_argocd_instance_setup_route_info.resources | default([]) | length > 0
+
+- name: "[CONSOLE LINK] | 8.5) Query enabled plugins in the OpenShift Console"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: console.operator.openshift.io/v1
+    kind: Console
+    name: cluster
+  register: acm_argocd_instance_setup_console_cluster
+
+- name: "[CONSOLE LINK] | 8.6) Enable the GitOps Operator Dynamic Console Plugin"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ k8s_target_context }}"
+    api_version: console.operator.openshift.io/v1
+    kind: Console
+    name: cluster
+    patch:
+      - op: "{{ 'add' if (acm_argocd_instance_setup_console_cluster.resources[0].spec.plugins is defined) else 'replace' }}"
+        path: "{{ '/spec/plugins/-' if (acm_argocd_instance_setup_console_cluster.resources[0].spec.plugins is defined) else '/spec/plugins' }}"
+        value: "{{ 'gitops-plugin' if (acm_argocd_instance_setup_console_cluster.resources[0].spec.plugins is defined) else ['gitops-plugin'] }}"
+  when:
+    - acm_argocd_instance_setup_console_cluster.resources | length > 0
+    - "'gitops-plugin' not in (acm_argocd_instance_setup_console_cluster.resources[0].spec.plugins | default([]))"
+...

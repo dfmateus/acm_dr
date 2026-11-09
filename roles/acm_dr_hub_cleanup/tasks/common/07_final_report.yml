@@ -1,0 +1,10 @@
+---
+# =============================================================================
+# STAGE 07 - CONSOLIDATED FINAL CLEANUP REPORT
+# =============================================================================
+
+- name: "[STAGE 07 - Final Report] | Display consolidated final cleanup report for DR node - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/07_final_report.j2').split('\n') }}"
+  run_once: true
+...

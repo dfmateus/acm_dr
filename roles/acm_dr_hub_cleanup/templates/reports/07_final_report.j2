@@ -1,0 +1,35 @@
+{% set _sep = (acm_dr_hub_cleanup_separator_char | default('=')) * 78 %}
+{% set _mode_str = (acm_dr_hub_cleanup_dry_run | default(false) | bool) | ternary('🔎 DRY-RUN (simulation -- no actual changes applied)', '🔥 PRODUCTION (actual changes applied)') %}
+{% set _automation_summary = ('Zero-Trust automation identity (namespace ' ~ acm_dr_hub_cleanup_automation_namespace ~ ')') if (acm_dr_hub_cleanup_remove_automation_identity | default(false) | bool) else 'Zero-Trust automation identity PRESERVED (default -- automated access to the cluster remains functional)' %}
+{% set _any_storage_purge = (acm_dr_hub_cleanup_purge_azure_storage | default(false) | bool) or (acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool) %}
+{% set _storage_summary = 'Cloud storage PERMANENTLY REMOVED (purge_' ~ acm_dr_hub_cleanup_cloud_provider | default('azure') ~ '_storage=true).' if _any_storage_purge else 'Cloud storage PRESERVED (default) -- nothing was touched in the storage backend.' %}
+{% set _final_status = 'SIMULATION COMPLETE (DRY-RUN) -- no actual changes were applied' if (acm_dr_hub_cleanup_dry_run | default(false) | bool) else 'CLUSTER SUCCESSFULLY DECOMMISSIONED AS DR NODE' %}
+{{ _sep }}
+  🧹 FINAL REPORT - RHACM DR NODE DECOMMISSIONING
+{{ _sep }}
+ 🎯 PROCESSED CONTEXT:      {{ k8s_target_context }}
+ 🔎 EXECUTION MODE:         {{ _mode_str }}
+{{ _sep }}
+ 🗑️  REMOVED FROM THIS CLUSTER:
+    • Full Red Hat ACM (MultiClusterHub + operator Subscription/CSV)
+    • MultiClusterObservability (Thanos) and its namespace
+    • Governance/AppDemo ArgoCD instances, ApplicationSets, RBAC and ConsoleLinks
+    • BackupSchedule and DataProtectionApplication (OADP configuration)
+    • {{ _automation_summary }}
+{{ _sep }}
+ 🟢 PRESERVED ON THIS CLUSTER (by design -- see README):
+    • Red Hat OpenShift GitOps operator (operator Subscription/CSV/namespace)
+    • ACM CustomResourceDefinitions (reusable by a future acm_dr_hub_setup)
+{{ _sep }}
+ ⚠️  REAL FINDING ABOUT THE OADP OPERATOR:
+    This role does NOT remove the OADP Operator by design, but the
+    MultiClusterHub teardown (Stage 04) may cascade, as a side effect of the
+    ACM 'cluster-backup' component itself, the OADP namespace/OperatorGroup/Subscription
+    that live in '{{ acm_dr_hub_cleanup_oadp_namespace }}' - confirmed
+    in actual testing. See the 'Real Finding' section of the README for details.
+{{ _sep }}
+ ☁️  CLOUD STORAGE STATE (EXTERNAL INFRASTRUCTURE):
+    • {{ _storage_summary }}
+{{ _sep }}
+ 🚀 FINAL STATUS: {{ _final_status }}
+{{ _sep }}

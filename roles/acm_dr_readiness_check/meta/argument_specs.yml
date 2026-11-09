@@ -1,0 +1,54 @@
+---
+# roles/acm_dr_readiness_check/meta/argument_specs.yml
+argument_specs:
+  main:
+    short_description: Read-only DR readiness assessment for RHACM Hub clusters
+    description: >-
+      Validates BackupSchedule health, BackupStorageLocation availability, backup freshness
+      against the RPO threshold, Spoke fleet connectivity, and passive Hub pre-positioning.
+      All checks are read-only. Non-destructive - safe to run on production at any time.
+      Credentials are injected via the ACM DR Source Hub and ACM DR Destination Hub
+      credential types (env vars k8s_source_context / k8s_dest_context).
+    options:
+      acm_dr_readiness_check_backup_namespace:
+        type: str
+        default: "open-cluster-management-backup"
+        description: >-
+          Namespace where OADP/Velero and ACM backup resources live on both Hubs.
+
+      acm_dr_readiness_check_backup_schedule_name:
+        type: str
+        default: ""
+        description: >-
+          Name of the ACM-managed BackupSchedule on the Source Hub. Leave empty to
+          auto-detect the first BackupSchedule found in the namespace.
+
+      acm_dr_readiness_check_rpo_seconds:
+        type: int
+        default: 25200
+        description: >-
+          Maximum age (in seconds) of the most recent successful backup on the Source Hub.
+          Backups older than this threshold trigger a warning or failure depending on
+          acm_dr_readiness_check_fail_on_stale_backup. Default: 25200 (7 hours).
+
+      acm_dr_readiness_check_min_spoke_count:
+        type: int
+        default: 0
+        description: >-
+          Minimum number of connected Spokes expected on the Source Hub, excluding
+          local-cluster. Set to 0 to disable the spoke count check.
+
+      acm_dr_readiness_check_fail_on_stale_backup:
+        type: bool
+        default: false
+        description: >-
+          When true, a backup older than acm_dr_readiness_check_rpo_seconds causes the
+          role to fail. When false, logs a warning and continues.
+
+      acm_dr_readiness_check_fail_on_missing_restore:
+        type: bool
+        default: true
+        description: >-
+          When true, absence of a passive Restore CR on the Destination Hub causes the
+          role to fail. When false, logs a warning. Set to true in production readiness gates.
+...

@@ -1,0 +1,37 @@
+---
+# roles/acm_argocd_instance/tasks/01_namespace.yml
+# =============================================================================
+# STAGE 01: INSTANCE NAMESPACE + MANAGED NAMESPACES (PRE-CREATED)
+# =============================================================================
+
+- name: "[NAMESPACE] | 1.1) Create ArgoCD instance Namespace - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    kind: Namespace
+    name: "{{ acm_argocd_instance_setup_namespace }}"
+
+# Field Finding (inherited from acm_dr_hub_setup): pre-creating here, instead of
+# using CreateNamespace=true on the Application/ApplicationSet, avoids the
+# gitops-engine "namespaced mode" lock when trying to manage a cluster-scoped
+# resource (Namespace). The 'managed-by' label is what triggers the automatic
+# bootstrap of the namespaced Role/RoleBinding by the OpenShift GitOps operator.
+- name: "[NAMESPACE] | 1.2) Create managed Namespaces (Application destinations) - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ item.name }}"
+        labels: >-
+          {{
+            {'argocd.argoproj.io/managed-by': acm_argocd_instance_setup_namespace}
+            if (item.managed_by_label | default(true) | bool)
+            else {}
+          }}
+  loop: "{{ acm_argocd_instance_setup_managed_namespaces | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+...

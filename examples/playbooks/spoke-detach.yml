@@ -1,0 +1,35 @@
+---
+# examples/playbooks/spoke-detach.yml
+# Gracefully detach a Spoke (managed cluster) from a Hub.
+# Cleans up the agent namespace and manifests on the Spoke before removing
+# the ManagedCluster object from the Hub (per KCS 5950901).
+#
+# Required extra vars:
+#   k8s_target_context                      - kubeconfig context for the Hub
+#   acm_dr_spoke_manager_cluster_name       - name of the ManagedCluster to detach
+#   acm_dr_spoke_manager_spoke_k8s_context  - kubeconfig context for the Spoke
+#
+# Usage:
+#   ansible-playbook examples/playbooks/spoke-detach.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e acm_dr_spoke_manager_cluster_name="my-spoke-01" \
+#     -e acm_dr_spoke_manager_spoke_k8s_context="my-spoke-01-sa" \
+#     -e acm_dr_spoke_manager_action="detach" \
+#     --tags "spoke_detach"
+
+- name: Detach a Spoke cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    # Resolve kubeconfig from per-cluster credentials or fall back to KUBECONFIG env var
+    - role: dfmateus.acm_dr.acm_dr_kubeconfig_resolver
+
+    # Gracefully detach the Spoke from the Hub
+    - role: dfmateus.acm_dr.acm_dr_spoke_manager
+      vars:
+        k8s_target_context: "acm-primary-hub-sa"  # Hub that currently manages the Spoke
+        acm_dr_spoke_manager_action: "detach"  # detach action (KCS 5950901)
+        acm_dr_spoke_manager_cluster_name: "my-spoke-01"  # ManagedCluster name to detach
+        acm_dr_spoke_manager_spoke_k8s_context: "my-spoke-01-sa"  # kubeconfig context for the Spoke
+...

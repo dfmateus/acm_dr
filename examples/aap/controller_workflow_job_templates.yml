@@ -1,0 +1,898 @@
+---
+# examples/aap/controller_workflow_job_templates.yml
+#
+# Machine-importable Workflow Job Template definitions for AAP. Compatible with
+# the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES - same as controller_job_templates.yml:
+#   {{ aap_organization }}          → Your AAP Organization name
+#   {{ aap_project }}               → Your AAP Project name
+#   {{ aap_inventory }}             → Your localhost Inventory name
+#   {{ aap_execution_environment }} → Your EE name
+#
+# CREDENTIAL NOTES:
+#   Workflow-level credentials are passed through to all JT nodes unless
+#   overridden at the node level. For the Planned Maintenance workflow (WF-02),
+#   each JT node prompts for credentials individually because the Source/Dest
+#   Hub roles swap between the failover and failback legs.
+#
+# Node topology key:
+#   unified_job_template → references a JT by name
+#   success_nodes        → nodes to run when this node succeeds
+#   failure_nodes        → nodes to run when this node fails
+#   always_nodes         → nodes to run regardless of success or failure
+
+controller_workflow_job_templates:
+
+  # ---------------------------------------------------------------------------
+  # WF-01: Hub Switchover with Approval Gate
+  # ---------------------------------------------------------------------------
+  # Dry-run → human review → production switchover. The Approval Node gives the
+  # operator time to review the compliance report from the dry-run before
+  # committing to a real direction change. Both JT nodes use skip_gates=true
+  # because the Approval Node replaces the in-playbook interactive pause.
+  #
+  # Supports both failover (active→passive) and failback (passive→active).
+  # Direction is controlled by acm_dr_failover_action in the survey.
+  # For failback, credential assignments on the WF nodes never change --
+  # the role inverts the hub roles internally when action=failback.
+  #
+  # Credentials are attached per node:
+  #   dry-run node      → Source Hub (active, being fenced) + Destination Hub (passive, receiving restore)
+  #   production node   → Source Hub + Destination Hub (same assignments for both failover and failback)
+  #
+  # Node topology:
+  #   [Dry-Run Switchover] ──success──▶ [Approval] ──approved──▶ [Production Switchover]
+  #   [Dry-Run Switchover] ──failure──▶ [Switchover State Diagnostics]
+  #   [Approval]           ──failure──▶ [Check Approval Outcome]
+  #   [Production Switchover] ──failure──▶ [Switchover State Diagnostics]
+  - name: "WF - ACM DR - LAB - Hub Switchover"
+    description: >-
+      Orchestrates a controlled hub direction change between two RHACM Hub clusters.
+      Supports both failover (active to passive) and failback (passive to active).
+      The direction is set by acm_dr_failover_action in the survey. Source Hub credential
+      always maps to the cluster being fenced; Destination Hub to the cluster receiving
+      the restore. For failback, the role inverts direction internally so credential
+      assignments on WF nodes never change between failover and failback runs.
+
+      WORKFLOW STRUCTURE:
+        1. dry-run-switchover     - All 9 stages in dry-run mode (no mutations). Review output before approving.
+        2. approval-review        - Approval gate (30-min timeout). Approve to continue; deny or timeout triggers check-approval-outcome.
+        3. production-switchover  - Full 9-stage pipeline: Stage 00 Preflight, 01 Fleet Discovery, 02 Logical Fencing,
+                                    03 Restore and Activate, 04 Verify Spokes, 05 Protect New Leader,
+                                    06 Recycle Passive Hubs, 07 Sanitize, 08 Post-flight Check.
+        4. check-approval-outcome - Queries the approval job and sends a notification if the gate was denied or timed out.
+        5. diagnose-failure       - Collects and reports current DR state on any job failure for incident triage.
+
+      SURVEY FIELDS:
+        acm_dr_failover_action (Required):
+          'failover' - Fences Source Hub, restores fleet on Destination Hub, promotes Destination as new active leader.
+          'failback' - Reverse direction. Source Hub credential maps to the cluster that was previously passive
+                       and is now being re-activated. Destination Hub credential maps to the cluster being fenced.
+                       No credential reassignment needed on the WF nodes.
+
+        acm_dr_failover_manager_allow_fenced_origin (Optional, default false):
+          Set 'true' when Source Hub BackupSchedule is already Paused or in BackupCollision before the run.
+          Covers re-runs after an interrupted switchover and pre-existing BackupCollision from out-of-band backups.
+          Bypasses Stage 00 pre-flight guard and Stage 02 fencing poll for the BackupCollision phase.
+
+        acm_dr_failover_manager_skip_version_gate (Optional, default false):
+          Set 'true' to skip MCH version consistency check between hubs. Emergency use only.
+          Mismatched versions can cause spoke reconciliation failures on the destination hub.
+
+        acm_dr_failover_manager_target_acm_version (Optional):
+          Pin the expected MCH version for the version gate. Leave empty to auto-detect from Source Hub MCH status.
+          Set this for Planned Maintenance Switchover to validate that the destination hub is at the target version.
+
+        acm_dr_failover_manager_additional_passive_hubs (Optional):
+          YAML or JSON list of kubeconfig context names for additional passive hubs beyond the Source/Destination pair.
+          Required in 3+ hub topologies so passive sync Restore CRs track the new active hub backups. Leave empty for 2-hub.
+
+      CREDENTIAL MODEL (attach at WF node level, not at WF template level):
+        Nodes 'dry-run-switchover' and 'production-switchover' require:
+          - ACM DR - Source Hub      - currently ACTIVE hub (being fenced and losing spoke ownership).
+          - ACM DR - Destination Hub - currently PASSIVE hub (receiving the fleet restore and becoming the new leader).
+        For failback: keep the same credential assignments. The role reads acm_dr_failover_action and inverts internally.
+
+      POST-SWITCHOVER:
+        After a successful switchover, run 'JT - ACM DR - LAB - Hub Setup' on the fenced hub with
+        is_primary_hub=false to configure it as the new passive hub (syncRestoreWithNewBackups=true Restore CR).
+        Pass acm_dr_hub_setup_allow_existing_dr=true to bypass the topology guard on the fenced hub.
+    organization: "{{ aap_organization }}"
+    inventory: "{{ aap_inventory }}"
+    ask_variables_on_launch: true
+    # Tier 1 webhook fires on every WJT event. Tier 2 context-rich notifications
+    # are sent by JT-10 (approval path) and JT-11 (failure path) within the WJT.
+    notification_templates_started:
+      - name: "ACM DR - Failover Events (Webhook)"
+    notification_templates_success:
+      - name: "ACM DR - Failover Events (Webhook)"
+    notification_templates_error:
+      - name: "ACM DR - Failover Events (Webhook)"
+    survey_enabled: true
+    survey_spec:
+      name: Hub Switchover Configuration
+      description: >-
+        Controls passed through to both the dry-run and production switchover
+        legs. Credentials are attached at the WF node level (not here) and
+        inherited by each JT execution independently.
+      spec:
+        # --- Failover direction ---
+        - variable: acm_dr_failover_action
+          type: multiplechoice
+          required: true
+          question_name: "Failover Action (Required)"
+          question_description: >-
+            The direction of the hub direction change. 'failover' fences the Source Hub and
+            promotes the Destination Hub as the new active leader. 'failback' reverses the
+            direction: the role internally treats Source Hub as the hub being re-activated
+            and Destination Hub as the hub being fenced. Credential assignments on the WF
+            nodes never change between failover and failback.
+          default: "failover"
+          choices:
+            - failover
+            - failback
+          new_question: true
+
+        # --- Version gate override ---
+        - variable: acm_dr_failover_manager_skip_version_gate
+          type: multiplechoice
+          required: false
+          question_name: "Skip Version Gate (Optional)"
+          question_description: >-
+            Bypasses all blocking version compatibility gates during preflight.
+            Use only when you have independently validated that the detected
+            version combination is safe.
+          default: "false"
+          choices:
+            - "false"
+            - "true"
+          new_question: true
+
+        # --- Fenced origin override ---
+        - variable: acm_dr_failover_manager_allow_fenced_origin
+          type: multiplechoice
+          required: false
+          question_name: "Allow Fenced Origin (Optional)"
+          question_description: >-
+            Allows the switchover to proceed when the Source Hub BackupSchedule is already
+            Paused or in BackupCollision before the workflow starts. Required when re-running
+            after an interrupted switchover, or when the source has a pre-existing
+            BackupCollision caused by out-of-band backups (e.g., manual Backup CRs with
+            empty cluster IDs). Bypasses Stage 00 guard and Stage 02 fencing poll.
+          default: "false"
+          choices:
+            - "false"
+            - "true"
+          new_question: true
+
+        # --- Target ACM version (Planned Maintenance) ---
+        - variable: acm_dr_failover_manager_target_acm_version
+          type: text
+          required: false
+          question_name: "Target ACM Version (Optional)"
+          question_description: >-
+            Target RHACM version for Planned Maintenance Switchover upgrade
+            validation. When set (e.g., '2.15'), the preflight validates that
+            the upgrade is feasible. Leave empty for standard DR failover.
+          default: ""
+          min: 0
+          max: 16
+          new_question: true
+
+        # --- Additional passive hubs ---
+        - variable: acm_dr_failover_manager_additional_passive_hubs
+          type: text
+          required: false
+          question_name: "Additional Passive Hubs (Optional)"
+          question_description: >-
+            JSON list of kubeconfig contexts for passive hubs beyond the
+            primary failover pair. Example: '["acm-dr-hub-02-sa"]'. Leave
+            empty for 2-hub mode.
+          default: ""
+          min: 0
+          max: 512
+          new_question: true
+
+    simplified_workflow_nodes:
+      # Node 1: Dry-Run Failover
+      # Needs Hub credentials to authenticate to both clusters during preflight
+      # and staging checks. Fleet Kubeconfig is not needed for the dry-run because
+      # check_mode prevents any mutations, and spoke connectivity is not exercised.
+      # Credentials are empty here - cluster credentials do not exist until after bootstrap.
+      # After running --tags credentials, attach via AAP UI: WJT node > Credentials:
+      #   "ARO Hub 01 (Source)", "ARO Hub 02 (Dest)"
+      - identifier: "dry-run-switchover"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Switchover"
+          type: job_template
+        extra_data:
+          acm_dr_failover_manager_dry_run: "true"
+          acm_dr_failover_manager_skip_gates: "true"
+        credentials: []  # attach after bootstrap: Source Hub + Dest Hub
+        success_nodes:
+          - "approval-review"
+        failure_nodes:
+          - "diagnose-failover-failure"
+
+      # Node 2: Approval Gate
+      - identifier: "approval-review"
+        approval_node:
+          name: "Review dry-run compliance report"
+          description: >-
+            Review the compliance report in the previous job stdout. Approve
+            to proceed with the production switchover. Deny or let the timeout
+            expire to abort and trigger check-approval-outcome.
+          timeout: 1800  # seconds (30 minutes)
+        success_nodes:
+          - "production-switchover"
+        # Both denial and timeout follow this failure link.
+        # JT-10 queries the AAP API to classify which occurred.
+        failure_nodes:
+          - "check-approval-outcome-wf01"
+
+      # Node 3: Production Switchover
+      # Requires both Hub credentials (Source + Destination). Spokes without a fleet
+      # kubeconfig context are reconnected via Operation C at Stage 07 using the
+      # mirrored SA token Secret created by 'Spoke Lifecycle action=prep'.
+      # For failback, keep the same Source + Destination credential assignments --
+      # the role inverts hub roles internally when acm_dr_failover_action=failback.
+      # Credentials are empty here - cluster credentials do not exist until after bootstrap.
+      # After running --tags credentials, attach via AAP UI: WJT node > Credentials:
+      #   "ARO Hub 01 (Source)", "ARO Hub 02 (Dest)"
+      - identifier: "production-switchover"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Switchover"
+          type: job_template
+        extra_data:
+          acm_dr_failover_manager_dry_run: "false"
+          acm_dr_failover_manager_skip_gates: "true"
+        credentials: []  # attach after bootstrap: Source Hub + Dest Hub
+        failure_nodes:
+          - "diagnose-failover-failure"
+
+      # Failure handler: Approval Gate denied or timed out
+      # JT-10 queries /api/controller/v2/workflow_approvals/?job=<WJT_JOB_ID>
+      # and reads timed_out to classify the outcome, then sends a distinct notification.
+      - identifier: "check-approval-outcome-wf01"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Check Approval Outcome"
+          type: job_template
+        extra_data:
+          wf_name: "WF - ACM DR - LAB - Hub Switchover"
+        credentials: []  # attach permanently: AAP Automation Token + Notification Webhook
+
+      # Failure handler: Hub Switchover JT failed (dry-run or production leg)
+      # Probes both Hubs to classify how far the failover progressed.
+      # Attach the same credentials as the failing Hub Switchover node.
+      - identifier: "diagnose-failover-failure"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Switchover State Diagnostics"
+          type: job_template
+        credentials: []  # attach at WJT node: Source Hub + Dest Hub + Notification Webhook
+
+  # ---------------------------------------------------------------------------
+  # WF-02: Planned Maintenance Switchover
+  # ---------------------------------------------------------------------------
+  # Full rolling upgrade cycle: failover the fleet away from Hub A, upgrade
+  # Hub A while idle, then failback. Each JT node prompts for credentials
+  # because the Source/Dest roles swap between the two failover directions.
+  #
+  # Node topology:
+  #   [Failover A→B] ──success──▶ [Notify: upgrade window open] ──always──▶ [Approval: upgrade Hub A]
+  #   [Failover A→B] ──failure──▶ [Failover Diagnostics]
+  #   [Approval]     ──failure──▶ [Check Approval Outcome]
+  #   [Dry-Run Failback] ──success──▶ [Production Failback] ──failure──▶ [Failover Diagnostics]
+  #   [Dry-Run Failback] ──failure──▶ [Failover Diagnostics]
+  - name: "WF - ACM DR - LAB - Planned Maintenance Switchover"
+    description: >-
+      Fully automated rolling upgrade workflow. Fails over the fleet from Hub A
+      to Hub B, runs JT - ACM DR - LAB - Hub ACM Channel Upgrade automatically
+      to patch the idle Hub A subscription and wait for MCH Running, validates
+      the upgrade with a dry-run failback, executes the production failback, then
+      upgrades Hub B in-place (already idle/passive). The operator only presses
+      Approve on the gate - no manual cluster access required.
+    organization: "{{ aap_organization }}"
+    inventory: "{{ aap_inventory }}"
+    notification_templates_started:
+      - name: "ACM DR - Failover Events (Webhook)"
+    notification_templates_success:
+      - name: "ACM DR - Failover Events (Webhook)"
+    notification_templates_error:
+      - name: "ACM DR - Failover Events (Webhook)"
+    survey_enabled: true
+    survey_spec:
+      name: Planned Maintenance Configuration
+      description: >-
+        Controls for the rolling upgrade workflow. Credentials are fixed per
+        node (no manual attachment required).
+      spec:
+        # --- Target ACM version ---
+        - variable: acm_dr_failover_manager_target_acm_version
+          type: text
+          required: true
+          question_name: "Target ACM Version (Required)"
+          question_description: >-
+            The target RHACM major.minor version for this upgrade round
+            (e.g., '2.15'). The upgrade node derives the OLM channel
+            automatically (release-2.15) and OLM installs the latest z-stream.
+            Run this WF once per minor version: 2.14 to 2.15, then 2.15 to 2.16,
+            then 2.16 to 2.17.
+          default: ""
+          min: 3
+          max: 10
+          new_question: true
+
+        # --- Additional passive hubs ---
+        - variable: acm_dr_failover_manager_additional_passive_hubs
+          type: text
+          required: false
+          question_name: "Additional Passive Hubs (Optional)"
+          question_description: >-
+            JSON list of kubeconfig contexts for passive hubs beyond the
+            primary failover pair. Example: '["acm-dr-hub-02-sa"]'. Leave
+            empty for 2-hub mode.
+          default: ""
+          min: 0
+          max: 512
+          new_question: true
+
+    simplified_workflow_nodes:
+      # Node 1: Production Failover (Hub A = Primary → Hub B = Secondary)
+      - identifier: "failover-a-to-b"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Switchover"
+          type: job_template
+        extra_data:
+          acm_dr_failover_action: "failover"
+          acm_dr_failover_manager_dry_run: "false"
+          acm_dr_failover_manager_skip_gates: "true"
+        credentials:
+          - "ARO Hub 01 (Source)"
+          - "ARO Hub 02 (Dest)"
+        success_nodes:
+          - "notify-upgrade-window-open"
+        failure_nodes:
+          - "diagnose-failover-failure"
+
+      # Intermediate notification: Hub A is idle, automation will upgrade it.
+      # always_nodes so the gate opens even if webhook delivery fails.
+      - identifier: "notify-upgrade-window-open"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Notify Workflow Event"
+          type: job_template
+        extra_data:
+          notification_title: "Planned Maintenance: Approval Gate Open"
+          notification_message: >-
+            Failover A to B completed. Hub A is now idle (BackupSchedule paused)
+            and the fleet runs on Hub B. Approve the gate in AAP - the automation
+            will patch the Hub A RHACM Subscription and wait for MCH to reach
+            Running before starting the failback validation. No manual cluster
+            access is required.
+          notification_severity: "info"
+        credentials:
+          - "ACM DR - Lab Test Webhook"
+        always_nodes:
+          - "approval-upgrade"
+
+      # Node 2: Approval gate - operator reviews the failover report and approves.
+      # After approval, the automation patches Hub A's ACM channel and waits for MCH.
+      - identifier: "approval-upgrade"
+        approval_node:
+          name: "Hub A is idle - approve to trigger automated upgrade"
+          description: >-
+            Hub A is fenced (BackupSchedule paused) and the fleet runs on Hub B.
+            Review the failover report above. When satisfied, approve this gate.
+            The automation will then patch Hub A's RHACM Subscription channel to
+            the target version and wait for the MCH to reach Running - no manual
+            cluster access needed. Timeout: 2 hours.
+          timeout: 7200  # seconds (2 hours)
+        success_nodes:
+          - "upgrade-hub-a-acm"
+        # Both denial and timeout route to check-approval-outcome.
+        failure_nodes:
+          - "check-approval-outcome-wf02"
+
+      # Node 2b: Automated ACM channel upgrade on idle Hub A.
+      # Patches spec.channel on the Subscription and waits for MCH Running.
+      # The WF survey variable acm_dr_failover_manager_target_acm_version is
+      # passed to this JT automatically (ask_variables_on_launch: true) and the
+      # acm_dr_upgrade_manager role reads it via its defaults fallback.
+      - identifier: "upgrade-hub-a-acm"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub ACM Channel Upgrade"
+          type: job_template
+        credentials:
+          - "ARO Hub 01 (SA)"
+        success_nodes:
+          - "dryrun-failback-b-to-a"
+        failure_nodes:
+          - "diagnose-failover-failure"
+
+      # Node 3: Dry-Run Failback (Hub B → Hub A, validates the upgrade)
+      - identifier: "dryrun-failback-b-to-a"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Switchover"
+          type: job_template
+        extra_data:
+          acm_dr_failover_action: "failback"
+          acm_dr_failover_manager_dry_run: "true"
+          acm_dr_failover_manager_skip_gates: "true"
+          acm_dr_failover_manager_allow_fenced_origin: "true"
+        # Same credentials as the failover node (failover-a-to-b).
+        # The role inverts Source/Dest when acm_dr_failover_action=failback:
+        #   active_hub  = ACM_DR_DEST_CONTEXT  = Hub Secondary (to pause)
+        #   passive_hub = ACM_DR_SOURCE_CONTEXT = Hub Primary   (to restore)
+        # Using "Secondary Source + Primary Dest" here would reverse this
+        # inversion and produce a second failover instead of a failback.
+        credentials:
+          - "ARO Hub 01 (Source)"
+          - "ARO Hub 02 (Dest)"
+        success_nodes:
+          - "production-failback-b-to-a"
+        failure_nodes:
+          - "diagnose-failover-failure"
+
+      # Node 4: Production Failback (Hub B → Hub A)
+      - identifier: "production-failback-b-to-a"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Switchover"
+          type: job_template
+        extra_data:
+          acm_dr_failover_action: "failback"
+          acm_dr_failover_manager_dry_run: "false"
+          acm_dr_failover_manager_skip_gates: "true"
+          acm_dr_failover_manager_allow_fenced_origin: "true"
+        # Same rationale as dryrun-failback-b-to-a above.
+        credentials:
+          - "ARO Hub 01 (Source)"
+          - "ARO Hub 02 (Dest)"
+        # After failback, Hub B is idle/passive - upgrade it in-place.
+        success_nodes:
+          - "upgrade-hub-b-acm"
+        failure_nodes:
+          - "diagnose-failover-failure"
+
+      # Node 4b: Automated ACM channel upgrade on now-idle Hub B (Secondary).
+      # Hub B is passive after failback - safe to upgrade in-place without another failover.
+      - identifier: "upgrade-hub-b-acm"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub ACM Channel Upgrade"
+          type: job_template
+        credentials:
+          - "ARO Hub 02 (SA)"
+        failure_nodes:
+          - "diagnose-failover-failure"
+
+      # Failure handler: Approval Gate denied or timed out
+      - identifier: "check-approval-outcome-wf02"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Check Approval Outcome"
+          type: job_template
+        extra_data:
+          wf_name: "WF - ACM DR - LAB - Planned Maintenance Switchover"
+        credentials:
+          - "AAP Bootstrap Automation (API Token)"
+          - "ACM DR - Lab Test Webhook"
+
+      # Failure handler: any JT node failure (failover, upgrade, or failback legs)
+      - identifier: "diagnose-failover-failure"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Switchover State Diagnostics"
+          type: job_template
+        credentials:
+          - "ARO Hub 01 (Source)"
+          - "ARO Hub 02 (Dest)"
+          - "ACM DR - Lab Test Webhook"
+
+  # ---------------------------------------------------------------------------
+  # WF-03: Full Lab Rebuild
+  # ---------------------------------------------------------------------------
+  # End-to-end lab provisioning: set up the primary Hub, onboard Spokes,
+  # set up the passive Hub, then run a validation dry-run failover.
+  #
+  # Node topology:
+  #   [Hub Setup (primary)] ──success──▶ [Spoke Onboarding] ──success──▶ [Hub Setup (passive)]
+  #       ──success──▶ [Dry-Run Failover (validation)]
+  #   [Hub Setup (primary)] ──failure──▶ [Hub Cleanup]
+  #   [Spoke Onboarding]    ──failure──▶ [Hub Cleanup]
+  #   [Hub Setup (passive)] ──failure──▶ [Hub Cleanup]
+  #   [Dry-Run Failover]    ──failure──▶ [Notify Validation Failed]
+  - name: "WF - ACM DR - LAB - Full Lab Rebuild"
+    description: >-
+      End-to-end lab provisioning pipeline. Sets up the primary Hub (ACM,
+      OADP, Observability, GitOps), onboards Spokes into the fleet, sets up
+      the passive Hub with shared storage, then validates the DR setup with
+      a dry-run failover. Each node prompts for its own credentials. Hub Setup
+      and Spoke Onboarding failures trigger Hub Cleanup (JT-06) automatically.
+    organization: "{{ aap_organization }}"
+    inventory: "{{ aap_inventory }}"
+    # Lab rebuild failures (Hub Setup / Spoke Onboarding) may leave partial infrastructure.
+    # The failure handler node (Hub Cleanup) runs automatically, but the webhook also fires
+    # so the operator is notified independently of the cleanup outcome.
+    notification_templates_success:
+      - name: "ACM DR - Lab Ops (Webhook)"
+    notification_templates_error:
+      - name: "ACM DR - Lab Ops (Webhook)"
+    survey_enabled: false
+    simplified_workflow_nodes:
+      # Node 1: Hub Setup (primary)
+      - identifier: "setup-primary-hub"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Setup"
+          type: job_template
+        extra_data:
+          is_primary_hub: "true"
+          # Channel must be overridden here; the JT survey default (release-2.14)
+          # would otherwise trigger an OLM channel downgrade on already-upgraded hubs.
+          # Update this value when the lab standard ACM version changes.
+          acm_dr_hub_setup_mch_channel: "release-2.17"
+          # Required when re-running against a hub that already has DR artifacts
+          # (BackupSchedule, DPA, BSL). The topology gate blocks the role by default
+          # to prevent accidental re-runs on a live hub; set true for idempotent rebuilds.
+          acm_dr_hub_setup_allow_existing_dr: "true"
+          # Azure storage reuse - the storage account was created on the primary hub's
+          # first run. Set true to skip creation and reuse the existing account.
+          acm_dr_hub_setup_azure_storage_allow_reuse: "true"
+          # Azure resource group and storage account name. Update per environment.
+          # REPLACE_WITH_* values must be provided before running WF-03.
+          acm_dr_hub_setup_azure_resource_group: "REPLACE_WITH_AZURE_RESOURCE_GROUP"
+          acm_dr_hub_setup_azure_storage_account_name: "acmdrsto01"  # max 24 chars, lowercase alphanumeric only
+        credentials: []  # attach: Hub (Target Cluster) + Azure SP + GitHub PAT
+        success_nodes:
+          - "onboard-spokes"
+        failure_nodes:
+          - "cleanup-on-failure"
+
+      # Node 2: Spoke Onboarding (operator runs for each Spoke)
+      - identifier: "onboard-spokes"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        extra_data:
+          # Cluster name must match the ManagedCluster name in RHACM exactly.
+          # Update per environment before running WF-03.
+          acm_dr_spoke_manager_cluster_name: "REPLACE_WITH_SPOKE_CLUSTER_NAME"
+          acm_dr_spoke_manager_cluster_environment: "lab"
+        credentials: []  # attach: Hub (Target Cluster) + Spoke (Spoke Cluster)
+        success_nodes:
+          - "setup-passive-hub"
+        failure_nodes:
+          - "cleanup-on-failure"
+
+      # Node 3: Hub Setup (passive / DR)
+      - identifier: "setup-passive-hub"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Setup"
+          type: job_template
+        extra_data:
+          is_primary_hub: "false"
+          # Same overrides as setup-primary-hub. The passive setup shares the
+          # storage account (allow_reuse=true) and faces the same topology gate.
+          acm_dr_hub_setup_mch_channel: "release-2.17"
+          acm_dr_hub_setup_allow_existing_dr: "true"
+          acm_dr_hub_setup_azure_storage_allow_reuse: "true"
+          acm_dr_hub_setup_azure_resource_group: "REPLACE_WITH_AZURE_RESOURCE_GROUP"
+          acm_dr_hub_setup_azure_storage_account_name: "acmdrsto01"  # max 24 chars, lowercase alphanumeric only
+        credentials: []  # attach: Hub (Target Cluster) + Azure SP + GitHub PAT
+        success_nodes:
+          - "validation-dryrun"
+        failure_nodes:
+          - "cleanup-on-failure"
+
+      # Node 4: Validation Dry-Run Failover
+      # Hub is intact at this point. Failure here does NOT trigger cleanup;
+      # it only sends a notification so the operator investigates the DR config.
+      - identifier: "validation-dryrun"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Switchover"
+          type: job_template
+        extra_data:
+          acm_dr_failover_action: "failover"
+          acm_dr_failover_manager_dry_run: "true"
+          acm_dr_failover_manager_skip_gates: "true"
+        credentials: []  # operator selects Source + Dest Hub credentials
+        failure_nodes:
+          - "notify-validation-failed"
+
+      # Failure handler: Hub Setup or Spoke Onboarding failed.
+      # Triggers Hub Cleanup (JT-06) automatically to remove partial infrastructure.
+      # acm_dr_hub_cleanup_cloud_provider must match the lab's cloud (azure or aws).
+      # Attach the same Hub + cloud credentials as the setup nodes.
+      - identifier: "cleanup-on-failure"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Cleanup"
+          type: job_template
+        extra_data:
+          acm_dr_hub_cleanup_confirm: "true"
+          acm_dr_hub_cleanup_dry_run: "false"
+          acm_dr_hub_cleanup_cloud_provider: "azure"  # change to "aws" for ROSA-based labs
+        credentials: []  # attach: Hub (Target Cluster) + cloud provider credential
+
+      # Failure handler: Validation dry-run failed.
+      # Hub setup is intact; only the DR configuration validation failed.
+      # Notifies the operator without triggering cleanup.
+      - identifier: "notify-validation-failed"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Notify Workflow Event"
+          type: job_template
+        extra_data:
+          notification_title: "Lab Rebuild: Validation Dry-Run Failed"
+          notification_message: >-
+            The lab rebuild completed, but the validation dry-run failover failed.
+            Hub infrastructure is intact. Review the validation job output and fix
+            the DR configuration before using this environment for drills.
+          notification_severity: "warning"
+        credentials: []  # attach: Notification Webhook
+
+  # ---------------------------------------------------------------------------
+  # WF-04: Spoke Onboarding Batch
+  # ---------------------------------------------------------------------------
+  # Sequential onboarding of up to 7 Spokes. Attach Hub Primary (Target) and
+  # Spoke Cluster credentials to each node you want to run, and set extra_data
+  # with the cluster name, environment, and context for each Spoke individually.
+  #
+  # ⚠️  SINGLE-SPOKE CAVEAT: WF-04 uses a linear chain (spoke-01→spoke-02→...).
+  # If you configure only spoke-01 and disconnect it from spoke-02 to stop the
+  # chain, spoke-02 becomes a root node (no predecessor) and starts automatically
+  # when the workflow launches, failing immediately. For a single spoke, run the
+  # "JT - ACM DR - LAB - Spoke Onboarding" JT directly rather than through WF-04.
+  # WF-04 is only efficient when all configured slots run together.
+  #
+  # Required extra_data per node:
+  #   acm_dr_spoke_manager_cluster_name      - ManagedCluster name in RHACM
+  #   acm_dr_spoke_manager_cluster_environment - "lab", "dev", "hml", or "prd"
+  #   acm_dr_spoke_manager_spoke_k8s_context - kubeconfig context for the Spoke
+  #
+  # Credentials per node:
+  #   Hub Primary (Target)   - ACM DR - Target Cluster type (for the Hub side)
+  #   <Spoke> Spoke Cluster  - ACM DR - Spoke Cluster type (for direct Spoke access)
+  #
+  # Node topology (always chain - all spokes run even if one fails):
+  #   [Spoke 01] ──always──▶ [Spoke 02] ──always──▶ ... ──always──▶ [Spoke 07]
+  #       ──always──▶ [Onboarding Summary notification]
+  - name: "WF - ACM DR - LAB - Spoke Onboarding Batch"
+    description: >-
+      Sequential onboarding of up to 7 Spokes into a Hub fleet. Uses always_nodes
+      between spokes so a single Spoke failure does not block the remaining ones.
+      Each node prompts for Hub and Spoke credentials individually. Run only the
+      nodes you need; unused nodes can be removed from the list. After completion,
+      review the onboarding summary notification and run a dry-run failover to
+      validate the fleet. For failed Spokes, run JT - ACM DR - LAB - Spoke Token
+      Sanitize (JT-13) manually with the specific Spoke name.
+    organization: "{{ aap_organization }}"
+    inventory: "{{ aap_inventory }}"
+    notification_templates_success:
+      - name: "ACM DR - Lab Ops (Webhook)"
+    notification_templates_error:
+      - name: "ACM DR - Lab Ops (Webhook)"
+    survey_enabled: false
+    simplified_workflow_nodes:
+      - identifier: "spoke-01"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        credentials: []
+        always_nodes:
+          - "spoke-02"
+
+      - identifier: "spoke-02"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        credentials: []
+        always_nodes:
+          - "spoke-03"
+
+      - identifier: "spoke-03"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        credentials: []
+        always_nodes:
+          - "spoke-04"
+
+      - identifier: "spoke-04"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        credentials: []
+        always_nodes:
+          - "spoke-05"
+
+      - identifier: "spoke-05"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        credentials: []
+        always_nodes:
+          - "spoke-06"
+
+      - identifier: "spoke-06"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        credentials: []
+        always_nodes:
+          - "spoke-07"
+
+      - identifier: "spoke-07"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Spoke Onboarding"
+          type: job_template
+        credentials: []
+        always_nodes:
+          - "onboarding-summary"
+
+      # Summary notification: all spokes ran (success or failure).
+      # Instructs the operator to review individual job outputs and run
+      # JT-13 (Spoke Token Sanitize) for any spokes that failed.
+      - identifier: "onboarding-summary"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Notify Workflow Event"
+          type: job_template
+        extra_data:
+          notification_title: "Spoke Onboarding Batch Completed"
+          notification_message: >-
+            All configured Spoke onboarding nodes ran (always_nodes, regardless
+            of individual success or failure). Review each Spoke node's job output
+            in AAP to identify failures. For any Spoke that failed, run
+            'JT - ACM DR - LAB - Spoke Token Sanitize' (JT-13) with the specific
+            Spoke cluster name. Then re-run a dry-run failover to validate the fleet.
+          notification_severity: "info"
+        credentials: []  # attach: Notification Webhook
+
+  # ---------------------------------------------------------------------------
+  # WF-05: Full DR Drill (Readiness → Dry-Run → Approval → Notification)
+  # ---------------------------------------------------------------------------
+  # Periodic DR rehearsal pipeline: runs the readiness check first to confirm
+  # the topology is healthy, then simulates the full failover in dry-run mode
+  # (no mutations), pauses for operator sign-off, and notifies the team via
+  # the configured Slack notification template.
+  #
+  # Node topology:
+  #   [DR Readiness Check] ──success──▶ [Dry-Run Failover]
+  #       ──success──▶ [Approval: sign-off] ──approved──▶ [Notify: Drill Complete]
+  #   [Approval] ──failure──▶ [Check Approval Outcome]
+  #   Readiness and dry-run failures: WJT-level error notification fires automatically.
+  #
+  # Credentials are attached per node because the survey-driven nodes need
+  # explicit credential resolution at the node level (WJT-level credentials
+  # are not automatically inherited by individual nodes in simplified_workflow_nodes):
+  #   dr-readiness-check → Source Hub + Destination Hub
+  #   dryrun-failover    → Source Hub + Destination Hub
+  #
+  # API launch note: AAP requires all required survey fields to be explicitly
+  # provided in the launch payload even when they have defaults. Include
+  # {"extra_vars": {"acm_dr_failover_action": "failover"}} when launching via API.
+  - name: "WF - ACM DR - LAB - Full DR Drill"
+    description: >-
+      Periodic DR readiness drill. Runs the DR readiness health check (BackupSchedule,
+      BSL, RPO, Spoke count, passive Restore) then simulates a full failover with
+      dry-run enabled (no cluster mutations). Pauses at an approval node for operator
+      sign-off, then sends a notification with the drill outcome. Designed for weekly
+      or monthly scheduled runs to validate DR posture without any real impact.
+      Approval gate denial or timeout fires JT-10 (Check Approval Outcome) for
+      context-rich classification.
+    organization: "{{ aap_organization }}"
+    inventory: "{{ aap_inventory }}"
+    notification_templates_success:
+      - name: "ACM DR - Failover Events (Webhook)"
+    notification_templates_error:
+      - name: "ACM DR - Failover Events (Webhook)"
+    survey_enabled: true
+    survey_spec:
+      name: DR Drill Configuration
+      description: >-
+        Controls passed through to the Readiness Check and Dry-Run Failover legs.
+        Credentials are set at the workflow level and inherited by all nodes.
+      spec:
+        # --- Failover direction (used by the dry-run leg) ---
+        - variable: acm_dr_failover_action
+          type: multiplechoice
+          required: true
+          question_name: "Failover Direction (Required)"
+          question_description: >-
+            The direction to rehearse. 'failover' drills the forward path
+            (Source Hub → Destination Hub). 'failback' drills the reverse.
+            Affects only the dry-run leg; no cluster mutations occur.
+          default: "failover"
+          choices:
+            - failover
+            - failback
+          new_question: true
+
+        # --- Version gate override (for labs with mixed OCP versions) ---
+        - variable: acm_dr_failover_manager_skip_version_gate
+          type: multiplechoice
+          required: false
+          question_name: "Skip Version Gate (Optional)"
+          question_description: >-
+            Bypasses the fleet OCP version compatibility gate during the
+            dry-run preflight. Use in lab environments where Spoke OCP versions
+            intentionally exceed the Hub's RHACM supported range.
+          default: "false"
+          choices:
+            - "false"
+            - "true"
+          new_question: true
+
+        # --- Additional passive hubs ---
+        - variable: acm_dr_failover_manager_additional_passive_hubs
+          type: text
+          required: false
+          question_name: "Additional Passive Hubs (Optional)"
+          question_description: >-
+            JSON list of kubeconfig contexts for passive hubs beyond the
+            primary failover pair. Example: '["acm-dr-hub-02-sa"]'. Leave
+            empty for 2-hub mode.
+          default: ""
+          min: 0
+          max: 512
+          new_question: true
+
+    simplified_workflow_nodes:
+      # Node 1: DR Readiness Check (read-only, no mutations)
+      # Needs Source + Dest Hub credentials to resolve both k8s_source_context
+      # and k8s_dest_context for the preflight assert.
+      - identifier: "dr-readiness-check"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - DR Readiness Check"
+          type: job_template
+        credentials: []  # attach after bootstrap: Source Hub + Dest Hub
+        success_nodes:
+          - "dryrun-failover"
+
+      # Node 2: Dry-Run Failover (full pipeline, check_mode - no cluster mutations)
+      - identifier: "dryrun-failover"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Hub Switchover"
+          type: job_template
+        extra_data:
+          acm_dr_failover_manager_dry_run: "true"
+          acm_dr_failover_manager_skip_gates: "true"
+        credentials: []  # attach after bootstrap: Source Hub + Dest Hub
+        success_nodes:
+          - "approval-drill-signoff"
+
+      # Node 3: Approval Gate - operator reviews the dry-run compliance report
+      - identifier: "approval-drill-signoff"
+        approval_node:
+          name: "Review drill compliance report and sign off"
+          description: >-
+            Review the compliance report in the previous job's stdout. Approve
+            to confirm the DR topology is in good shape and send the drill
+            completion notification. Deny to flag an issue for investigation
+            before the next scheduled drill.
+          timeout: 3600  # seconds (1 hour - time for on-call to review)
+        success_nodes:
+          - "notify-drill-complete"
+        # Both denial and timeout follow this link.
+        failure_nodes:
+          - "check-approval-outcome-wf05"
+
+      # Node 4: Drill completed notification (replaces the drill_summary_only=true hack)
+      # JT-12 sends a purpose-built notification without borrowing failover playbook logic.
+      - identifier: "notify-drill-complete"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Notify Workflow Event"
+          type: job_template
+        extra_data:
+          notification_title: "DR Drill Completed"
+          notification_message: >-
+            The Full DR Drill completed successfully. The dry-run failover passed all
+            preflight checks and simulated the pipeline without cluster mutations. DR
+            posture confirmed. Review the drill job outputs and update the DR runbook
+            if any findings require action before the next scheduled drill.
+          notification_severity: "info"
+        credentials: []  # attach: Notification Webhook
+
+      # Failure handler: Approval Gate denied or timed out
+      - identifier: "check-approval-outcome-wf05"
+        unified_job_template:
+          name: "JT - ACM DR - LAB - Check Approval Outcome"
+          type: job_template
+        extra_data:
+          wf_name: "WF - ACM DR - LAB - Full DR Drill"
+        credentials: []  # attach permanently: AAP Automation Token + Notification Webhook
+...

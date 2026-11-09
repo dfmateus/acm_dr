@@ -1,0 +1,533 @@
+---
+# roles/acm_dr_spoke_manager/tasks/00_spoke_onboard.yml
+# =============================================================================
+# STAGE 00: FULL SPOKE ONBOARDING (SA + FLEET SECRET + HUB REGISTRATION)
+# =============================================================================
+# Provisions the permanent ansible-dr-orchestrator ServiceAccount on a new
+# Spoke cluster, merges its SA token into the Hub's fleet Secret, and runs
+# the standard spoke_prep flow (ManagedCluster + KlusterletAddonConfig +
+# auto-import-secret).
+#
+# The operator provides admin credentials for the Spoke via:
+#   a) Custom "ACM DR - Spoke Cluster" credential type (ACM_DR_SPOKE_HOST/TOKEN/CONTEXT)
+#   b) Built-in "OpenShift or Kubernetes API Bearer Token" (K8S_AUTH_HOST/K8S_AUTH_API_KEY)
+#   c) CLI env vars exported via: source examples/scripts/lib/load_cluster_env.sh spoke <env-file>
+# Custom vars (a) take priority when both (a) and (b) are present.
+# The Hub is reached via the Target Cluster credential (ACM_DR_TARGET_*) or a
+# monolithic kubeconfig context (-e k8s_target_context).
+#
+# After this action completes, the Spoke has:
+#   1) A permanent ansible-dr-orchestrator SA with cluster-admin
+#   2) Its SA token aggregated in the fleet Secret on the Hub (OADP-replicated)
+#   3) A ManagedCluster object on the Hub (JOINED + AVAILABLE)
+#
+# No permanent per-Spoke AAP credential is needed for failover. The fleet
+# Secret aggregates all Spoke SA tokens and OADP replicates it to passive
+# Hubs automatically.
+
+# =============================================================================
+# PHASE 0: RESOLVE AND VALIDATE SPOKE ADMIN CREDENTIALS
+# =============================================================================
+# Read the operator's admin credential for the new Spoke. Supports two
+# AAP credential types plus CLI env vars:
+#   1) Custom "ACM DR - Spoke Cluster" -> ACM_DR_SPOKE_HOST / ACM_DR_SPOKE_TOKEN
+#   2) Built-in "OpenShift or Kubernetes API Bearer Token" -> K8S_AUTH_HOST / K8S_AUTH_API_KEY
+#   3) CLI: source examples/scripts/lib/load_cluster_env.sh spoke <env-file>
+# Custom vars (1) take priority when both are present.
+
+- name: "[STAGE 00 - ONBOARD] | 0.0.1) Read Spoke admin credentials from env vars"
+  ansible.builtin.set_fact:
+    # Custom ACM_DR_SPOKE_* env vars have priority over the built-in K8S_AUTH_*
+    # env vars. The default(X, true) filter treats empty strings as undefined,
+    # falling through to the built-in alternative.
+    acm_dr_spoke_manager_onboard_spoke_host: >-
+      {{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_HOST', default='')
+         | default(lookup('ansible.builtin.env', 'K8S_AUTH_HOST', default=''), true) }}
+    acm_dr_spoke_manager_onboard_spoke_token: >-
+      {{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_TOKEN', default='')
+         | default(lookup('ansible.builtin.env', 'K8S_AUTH_API_KEY', default=''), true) }}
+    acm_dr_spoke_manager_onboard_spoke_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_CONTEXT', default='') }}"
+    acm_dr_spoke_manager_onboard_spoke_ca_data: "{{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_CA_DATA', default='') }}"
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.0.2) Validate Spoke admin credentials are present"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_spoke_manager_onboard_spoke_host | length > 0
+      - acm_dr_spoke_manager_onboard_spoke_token | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Spoke admin credentials not found.
+      Attach one of these AAP credential types to the Job Template:
+        - "ACM DR - Spoke Cluster" (custom, injects ACM_DR_SPOKE_HOST/TOKEN)
+        - "OpenShift or Kubernetes API Bearer Token" (built-in, injects K8S_AUTH_HOST/API_KEY)
+      Or export ACM_DR_SPOKE_HOST and ACM_DR_SPOKE_TOKEN via
+      'source examples/scripts/lib/load_cluster_env.sh spoke <env-file>'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Spoke admin credentials resolved
+      (host: {{ acm_dr_spoke_manager_onboard_spoke_host }}).
+
+- name: "[STAGE 00 - ONBOARD] | 0.0.3) Compute SA context name and TLS policy"
+  ansible.builtin.set_fact:
+    # Fleet kubeconfig context follows the Zero-Trust naming convention:
+    # <cluster-name>-sa (e.g., aro-spoke-01-sa). Matches the convention from
+    # examples/scripts/cluster-onboarding/02_provision_automation_sa.sh.
+    acm_dr_spoke_manager_sa_context_name: "{{ acm_dr_spoke_manager_cluster_name }}-sa"
+    # TLS policy for direct host/api_key connections to the Spoke.
+    # kubernetes.core.k8s can't use inline CA data (it needs a file path via
+    # ca_cert), so having CA data in the env var doesn't help with validation.
+    # The CA data is used in the fleet kubeconfig entry, not here.
+    # Follows the same pattern as acm_dr_kubeconfig_resolver Step 2a.
+    acm_dr_spoke_manager_onboard_validate_certs: >-
+      {{ not (acm_dr_spoke_manager_fleet_skip_tls_when_no_ca | bool) }}
+
+- name: "[STAGE 00 - ONBOARD] | Display onboarding pipeline metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_spoke_manager_banner_title: "🚀 STAGE 00 - Full Spoke Onboarding Pipeline (SA + Fleet + Import)"
+    acm_dr_spoke_manager_banner_lines:
+      - "🎛️  HUB CONTEXT:    {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+      - "🎯 SPOKE NAME:     {{ acm_dr_spoke_manager_cluster_name }}"
+      - "🔐 SPOKE HOST:     {{ acm_dr_spoke_manager_onboard_spoke_host }}"
+      - "📍 SA CONTEXT:     {{ acm_dr_spoke_manager_sa_context_name }}"
+  run_once: true
+
+# =============================================================================
+# PHASE 1: PROVISION PERMANENT SA ON THE SPOKE CLUSTER
+# =============================================================================
+# Creates the ansible-dr-orchestrator SA with cluster-admin, matching the RBAC
+# resources in examples/rbac/ansible-dr-orchestrator-rbac.yaml and the flow in
+# examples/examples/scripts/cluster-onboarding/02_provision_automation_sa.sh.
+# Connects via host/api_key (operator's admin token), not kubeconfig context.
+
+- name: "[STAGE 00 - ONBOARD] | 0.1.1) Create ansible-automation Namespace on the Spoke"
+  kubernetes.core.k8s:
+    host: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+    api_key: "{{ acm_dr_spoke_manager_onboard_spoke_token }}"
+    validate_certs: "{{ acm_dr_spoke_manager_onboard_validate_certs | bool }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ acm_dr_spoke_manager_automation_namespace }}"
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.1.2) Create ansible-dr-orchestrator ServiceAccount on the Spoke"
+  kubernetes.core.k8s:
+    host: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+    api_key: "{{ acm_dr_spoke_manager_onboard_spoke_token }}"
+    validate_certs: "{{ acm_dr_spoke_manager_onboard_validate_certs | bool }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ acm_dr_spoke_manager_automation_sa_name }}"
+        namespace: "{{ acm_dr_spoke_manager_automation_namespace }}"
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.1.3) Assign cluster-admin ClusterRoleBinding on the Spoke"
+  kubernetes.core.k8s:
+    host: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+    api_key: "{{ acm_dr_spoke_manager_onboard_spoke_token }}"
+    validate_certs: "{{ acm_dr_spoke_manager_onboard_validate_certs | bool }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: ansible-dr-orchestrator-admin
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ acm_dr_spoke_manager_automation_sa_name }}"
+          namespace: "{{ acm_dr_spoke_manager_automation_namespace }}"
+      roleRef:
+        kind: ClusterRole
+        name: cluster-admin
+        apiGroup: rbac.authorization.k8s.io
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.1.4) Create permanent token Secret for the SA"
+  kubernetes.core.k8s:
+    host: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+    api_key: "{{ acm_dr_spoke_manager_onboard_spoke_token }}"
+    validate_certs: "{{ acm_dr_spoke_manager_onboard_validate_certs | bool }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ acm_dr_spoke_manager_automation_secret_name }}"
+        namespace: "{{ acm_dr_spoke_manager_automation_namespace }}"
+        annotations:
+          kubernetes.io/service-account.name: "{{ acm_dr_spoke_manager_automation_sa_name }}"
+      type: kubernetes.io/service-account-token
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.1.5) Wait for token controller to populate the Secret"
+  # The token controller takes a few seconds to write the data.token field
+  # after the Secret is created. Poll until it appears.
+  kubernetes.core.k8s_info:
+    host: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+    api_key: "{{ acm_dr_spoke_manager_onboard_spoke_token }}"
+    validate_certs: "{{ acm_dr_spoke_manager_onboard_validate_certs | bool }}"
+    api_version: v1
+    kind: Secret
+    name: "{{ acm_dr_spoke_manager_automation_secret_name }}"
+    namespace: "{{ acm_dr_spoke_manager_automation_namespace }}"
+  register: acm_dr_spoke_manager_onboard_sa_secret_info
+  until:
+    - (acm_dr_spoke_manager_onboard_sa_secret_info.resources | default([])) | length > 0
+    - acm_dr_spoke_manager_onboard_sa_secret_info.resources[0].data.token is defined
+  retries: 10  # 10 x 3s = 30 seconds max wait
+  delay: 3  # seconds between retries
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.1.6) Extract SA token from the provisioned Secret"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_onboard_sa_token: >-
+      {{ acm_dr_spoke_manager_onboard_sa_secret_info.resources[0].data.token | b64decode }}
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.1.7) ✅ SA provisioned on the Spoke"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ ansible-dr-orchestrator SA provisioned on {{ acm_dr_spoke_manager_onboard_spoke_host }}.
+      Namespace: {{ acm_dr_spoke_manager_automation_namespace }},
+      Secret: {{ acm_dr_spoke_manager_automation_secret_name }}.
+
+# =============================================================================
+# PHASE 2: DETECT SPOKE VENDOR AND CLOUD PROVIDER
+# =============================================================================
+# Query the Infrastructure CR on the Spoke to detect OpenShift vs vanilla K8s
+# and the cloud platform. Same logic as spoke_prep tasks 1.2.2b-d but
+# connecting via host/api_key instead of kubeconfig context.
+
+- name: "[STAGE 00 - ONBOARD] | 0.2.1) Query Infrastructure CR on the Spoke (OpenShift detection)"
+  kubernetes.core.k8s_info:
+    host: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+    api_key: "{{ acm_dr_spoke_manager_onboard_spoke_token }}"
+    validate_certs: "{{ acm_dr_spoke_manager_onboard_validate_certs | bool }}"
+    api_version: config.openshift.io/v1
+    kind: Infrastructure
+    name: cluster
+  register: acm_dr_spoke_manager_spoke_infra_info
+  failed_when: false  # non-OCP clusters (AKS, EKS, GKE) don't have this API
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.2.2) Register detected Spoke vendor (OpenShift vs Kubernetes)"
+  # Infrastructure CR exists only on OpenShift. If absent, the Spoke is vanilla
+  # Kubernetes (AKS, EKS, GKE, IKS). The vendor label controls which Policies
+  # RHACM applies (OpenShift-specific policies skip Kubernetes Spokes).
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_cluster_vendor: >-
+      {{
+        'OpenShift'
+        if (acm_dr_spoke_manager_spoke_infra_info.resources is defined and
+            acm_dr_spoke_manager_spoke_infra_info.resources | length > 0)
+        else 'Kubernetes'
+      }}
+
+- name: "[STAGE 00 - ONBOARD] | 0.2.3) Detect Spoke cloud provider from Infrastructure CR"
+  # Stores the auto-detected cloud in a SEPARATE variable because AAP surveys
+  # inject acm_dr_spoke_manager_cluster_cloud as an extra var (even when the
+  # user leaves it empty). Extra vars have the highest Ansible precedence, so
+  # set_fact cannot override them. The resolved value is merged at the point
+  # of use (ManagedCluster creation in spoke_prep and the onboarding report).
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_detected_cloud: >-
+      {{
+        acm_dr_spoke_manager_platform_to_cloud_map[
+          acm_dr_spoke_manager_spoke_infra_info.resources[0].status.platform | default('')
+        ] | default(
+          acm_dr_spoke_manager_spoke_infra_info.resources[0].status.platform | default('Other')
+        )
+        if (
+          acm_dr_spoke_manager_spoke_infra_info.resources is defined and
+          acm_dr_spoke_manager_spoke_infra_info.resources | length > 0
+        )
+        else 'Other'
+      }}
+  when:
+    - (acm_dr_spoke_manager_cluster_cloud | default('')) | length == 0
+
+# =============================================================================
+# PHASE 3: UPDATE FLEET SECRET ON THE HUB
+# =============================================================================
+# Read the existing fleet Secret (spoke-fleet-kubeconfig) from the Hub, merge
+# in the new Spoke's SA token, and write it back. If the Secret doesn't exist
+# yet, create it from scratch. The merge uses rejectattr + append to handle
+# both first-add and re-onboard (token rotation) cases.
+#
+# The fleet Secret is labeled cluster.open-cluster-management.io/backup=cluster
+# so OADP replicates it to passive Hubs automatically via the passive sync Restore.
+#
+# Phase 3 tasks talk to the HUB (not the Spoke). When a built-in "OpenShift or
+# Kubernetes API Bearer Token" credential is attached for the Spoke, its
+# K8S_AUTH_HOST / K8S_AUTH_API_KEY env vars override the kubeconfig context and
+# silently redirect all kubernetes.core calls to the Spoke. Neutralize them on
+# every kubernetes.core task in this phase (same pattern as Phase 4, task 0.4.2).
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.1) Read existing fleet Secret from Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_spoke_manager_fleet_secret_namespace }}"
+    name: "{{ acm_dr_spoke_manager_fleet_secret_name }}"
+  register: acm_dr_spoke_manager_fleet_secret_info
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  environment:
+    K8S_AUTH_HOST: ""
+    K8S_AUTH_API_KEY: ""
+    K8S_AUTH_VERIFY_SSL: "False"
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.2) Parse existing fleet kubeconfig or initialize empty structure"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_fleet_kubeconfig: >-
+      {{
+        (acm_dr_spoke_manager_fleet_secret_info.resources[0].data[acm_dr_spoke_manager_fleet_secret_key]
+         | b64decode | from_yaml)
+        if (acm_dr_spoke_manager_fleet_secret_info.resources | default([]) | length > 0 and
+            acm_dr_spoke_manager_fleet_secret_info.resources[0].data[acm_dr_spoke_manager_fleet_secret_key] is defined)
+        else {
+          'apiVersion': 'v1',
+          'kind': 'Config',
+          'preferences': {},
+          'clusters': [],
+          'users': [],
+          'contexts': []
+        }
+      }}
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.3) Merge new Spoke entry into fleet kubeconfig"
+  # Dedup by context name (rejectattr removes any existing entry with the same
+  # name), then append the new entry. Re-onboard replaces the old entry rather
+  # than duplicating it.
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_fleet_merged:
+      apiVersion: v1
+      kind: Config
+      preferences: {}
+      clusters: >-
+        {{ (acm_dr_spoke_manager_fleet_kubeconfig.clusters | default([])
+            | rejectattr('name', 'equalto', acm_dr_spoke_manager_sa_context_name) | list)
+           + [_new_cluster] }}
+      users: >-
+        {{ (acm_dr_spoke_manager_fleet_kubeconfig.users | default([])
+            | rejectattr('name', 'equalto', acm_dr_spoke_manager_sa_context_name) | list)
+           + [_new_user] }}
+      contexts: >-
+        {{ (acm_dr_spoke_manager_fleet_kubeconfig.contexts | default([])
+            | rejectattr('name', 'equalto', acm_dr_spoke_manager_sa_context_name) | list)
+           + [_new_context] }}
+  vars:
+    # Cluster config: include CA data when available, otherwise skip TLS
+    # (controlled by acm_dr_spoke_manager_fleet_skip_tls_when_no_ca)
+    _cluster_cfg: >-
+      {{
+        {'server': acm_dr_spoke_manager_onboard_spoke_host,
+         'certificate-authority-data': acm_dr_spoke_manager_onboard_spoke_ca_data}
+        if acm_dr_spoke_manager_onboard_spoke_ca_data | length > 0
+        else {'server': acm_dr_spoke_manager_onboard_spoke_host,
+              'insecure-skip-tls-verify': true}
+      }}
+    _new_cluster:
+      name: "{{ acm_dr_spoke_manager_sa_context_name }}"
+      cluster: "{{ _cluster_cfg }}"
+    _new_user:
+      name: "{{ acm_dr_spoke_manager_sa_context_name }}"
+      user:
+        token: "{{ acm_dr_spoke_manager_onboard_sa_token }}"
+    _new_context:
+      name: "{{ acm_dr_spoke_manager_sa_context_name }}"
+      context:
+        cluster: "{{ acm_dr_spoke_manager_sa_context_name }}"
+        user: "{{ acm_dr_spoke_manager_sa_context_name }}"
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.4) Compute fleet context count for reporting"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_fleet_context_count: "{{ acm_dr_spoke_manager_fleet_merged.contexts | length }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.5) Write updated fleet Secret to Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ acm_dr_spoke_manager_fleet_secret_name }}"
+        namespace: "{{ acm_dr_spoke_manager_fleet_secret_namespace }}"
+        labels:
+          # OADP backup label: the fleet Secret is replicated to passive Hubs
+          # via the passive sync Restore (cluster-level backup, not activation)
+          cluster.open-cluster-management.io/backup: "cluster"
+          app.kubernetes.io/managed-by: "ansible-dr-orchestrator"
+      type: Opaque
+      # Build stringData as a Jinja2 dict expression so the dynamic key name
+      # (acm_dr_spoke_manager_fleet_secret_key, defaults to "kubeconfig") is
+      # properly evaluated. YAML-level Jinja2 in dict keys is not templated
+      # by kubernetes.core.k8s in all Ansible versions.
+      stringData: >-
+        {{ { acm_dr_spoke_manager_fleet_secret_key:
+             (acm_dr_spoke_manager_fleet_merged | to_nice_yaml(indent=2, width=10000)) } }}
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  environment:
+    K8S_AUTH_HOST: ""
+    K8S_AUTH_API_KEY: ""
+    K8S_AUTH_VERIFY_SSL: "False"
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.6) ✅ Fleet Secret updated on Hub"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ Fleet Secret '{{ acm_dr_spoke_manager_fleet_secret_namespace }}/{{ acm_dr_spoke_manager_fleet_secret_name }}'
+      updated on Hub '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}'
+      with context '{{ acm_dr_spoke_manager_sa_context_name }}'
+      ({{ acm_dr_spoke_manager_fleet_context_count }} total Spoke(s) in fleet).
+
+# =============================================================================
+# PHASE 3.5: WRITE MIRRORED SA TOKEN SECRET TO HUB
+# =============================================================================
+# Writes a per-Spoke copy of the SA token and API host to the Hub under the
+# ansible-automation namespace. The OADP backup label ensures OADP replicates
+# this Secret in the cluster-level BackupSchedule alongside the fleet Secret.
+# Stage 07 Operation C reads this Secret as a fallback for Spokes added after
+# the last OADP snapshot (absent from the restored fleet kubeconfig).
+# Opt-out via acm_dr_spoke_manager_hub_token_mirror_enabled: false.
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.7) Write mirrored SA token Secret to Hub (Stage 07 OADP fallback)"
+  # This Secret survives OADP Restore automatically because of the backup label.
+  # Stage 07 Operation C reads host + token from it to reconnect Spokes that
+  # are missing from the restored fleet kubeconfig.
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ acm_dr_spoke_manager_hub_token_mirror_prefix }}{{ acm_dr_spoke_manager_cluster_name }}-sa-token"
+        namespace: "{{ acm_dr_spoke_manager_hub_token_mirror_namespace }}"
+        labels:
+          cluster.open-cluster-management.io/backup: "cluster"
+          app.kubernetes.io/managed-by: "ansible-dr-orchestrator"
+          acm-dr.io/spoke-name: "{{ acm_dr_spoke_manager_cluster_name }}"
+      type: Opaque
+      stringData:
+        host: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+        token: "{{ acm_dr_spoke_manager_onboard_sa_token }}"
+        ca_data: "{{ acm_dr_spoke_manager_onboard_spoke_ca_data | default('') }}"
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  environment:
+    K8S_AUTH_HOST: ""
+    K8S_AUTH_API_KEY: ""
+    K8S_AUTH_VERIFY_SSL: "False"
+  when: acm_dr_spoke_manager_hub_token_mirror_enabled | default(true) | bool
+
+- name: "[STAGE 00 - ONBOARD] | 0.3.8) ✅ Hub mirrored token Secret written"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ Mirrored SA token Secret
+      '{{ acm_dr_spoke_manager_hub_token_mirror_namespace }}/{{ acm_dr_spoke_manager_hub_token_mirror_prefix }}{{ acm_dr_spoke_manager_cluster_name }}-sa-token'
+      written to Hub '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}'.
+      Stage 07 will use it as fallback if this Spoke is absent from the fleet kubeconfig after Restore.
+  when: acm_dr_spoke_manager_hub_token_mirror_enabled | default(true) | bool
+
+# =============================================================================
+# PHASE 4: RUN SPOKE_PREP (HUB-SIDE REGISTRATION)
+# =============================================================================
+# Set the SA token and API URL facts, then include the standard spoke_prep
+# flow. Because acm_dr_spoke_manager_api_token is pre-set, spoke_prep's Phase 1
+# (bootstrap SA creation) is skipped entirely. The auto-import-secret uses the
+# permanent SA token instead of a throwaway one.
+
+- name: "[STAGE 00 - ONBOARD] | 0.4.1) Set facts for spoke_prep (token, URL, cleanup policy)"
+  ansible.builtin.set_fact:
+    # Pre-set the SA token and API URL so spoke_prep's Phase 1 (bootstrap SA
+    # creation on the Spoke) is skipped. The permanent SA token is used for
+    # the auto-import-secret instead of a throwaway spoke-admin-sa.
+    acm_dr_spoke_manager_api_token: "{{ acm_dr_spoke_manager_onboard_sa_token }}"
+    acm_dr_spoke_manager_api_url: "{{ acm_dr_spoke_manager_onboard_spoke_host }}"
+    # Initialize iteration variables that spoke_prep references (normally set
+    # by the sanitization task at 1.1.0, which is skipped for action=onboard)
+    acm_dr_spoke_manager_spoke_sa_secret_info: {}
+    acm_dr_spoke_manager_spoke_api_url_raw: {}
+    # No ephemeral bootstrap SA to clean up: the onboard action provisions the
+    # permanent SA directly, not the throwaway spoke-admin-sa.
+    acm_dr_spoke_manager_cleanup_bootstrap_sa: false
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - ONBOARD] | 0.4.2) Run spoke_prep (Hub-side RHACM registration)"
+  ansible.builtin.include_tasks:
+    file: 01_spoke_prep.yml
+    apply:
+      tags:
+        - spoke_onboard
+        - onboard
+      # Neutralize the built-in credential's K8S_AUTH env vars so
+      # kubernetes.core.k8s falls back to the kubeconfig+context for both
+      # the connection and API discovery. Without this, the module queries
+      # the Spoke (K8S_AUTH_HOST) for RHACM CRDs that only exist on the Hub.
+      # Empty strings are Python-falsy so the module treats them as unset.
+      # K8S_AUTH_VERIFY_SSL is forced to "False" because the Hub's ARO API
+      # uses a self-signed cert that the EE trust store does not include.
+      environment:
+        K8S_AUTH_HOST: ""
+        K8S_AUTH_API_KEY: ""
+        K8S_AUTH_VERIFY_SSL: "False"
+
+# =============================================================================
+# PHASE 4.5: PROVISION MSA INFRASTRUCTURE (OPT-IN)
+# =============================================================================
+# Calls acm_dr_msa_provisioner to create a ManagedServiceAccount CR and the
+# accompanying ManifestWork ClusterRoleBinding on the Hub. The klusterlet then
+# creates the SA on the Spoke and writes the token Secret back to the Hub.
+# Opt-in via acm_dr_spoke_manager_msa_enabled: true.
+# Requires the managed-serviceaccount addon enabled in MultiClusterEngine.
+
+- name: "[STAGE 00 - ONBOARD] | 0.4.3) Provision MSA infrastructure on Hub (opt-in: acm_dr_spoke_manager_msa_enabled)"
+  ansible.builtin.include_role:
+    name: acm_dr_msa_provisioner
+  vars:
+    acm_dr_msa_provisioner_hub_context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    acm_dr_msa_provisioner_spoke_name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  when: acm_dr_spoke_manager_msa_enabled | default(false) | bool
+
+# =============================================================================
+# PHASE 5: ONBOARDING REPORT
+# =============================================================================
+# Display a summary with the fleet Secret status and instructions for creating
+# a standalone AAP credential for individual Spoke operations (detach, manual
+# prep). This credential is optional: the fleet Secret already covers failover.
+
+- name: "[STAGE 00 - ONBOARD] | 0.5.1) Display onboarding report"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_spoke_manager_banner_sep_char: "-"
+    acm_dr_spoke_manager_banner_title: "📋 ONBOARDING COMPLETE: Spoke '{{ acm_dr_spoke_manager_cluster_name }}' fully onboarded"
+    acm_dr_spoke_manager_banner_lines:
+      - ""
+      - "🎛️  Hub:            {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+      - "🎯 Spoke:          {{ acm_dr_spoke_manager_cluster_name }}"
+      - "📍 Fleet context:  {{ acm_dr_spoke_manager_sa_context_name }}"
+      - "📦 Fleet size:     {{ acm_dr_spoke_manager_fleet_context_count }} Spoke(s)"
+      - "🔐 Mirror Secret:  {{ acm_dr_spoke_manager_hub_token_mirror_namespace }}/{{ acm_dr_spoke_manager_hub_token_mirror_prefix }}{{ acm_dr_spoke_manager_cluster_name }}-sa-token (OADP fallback)"
+      - "🏷️  Vendor:         {{ acm_dr_spoke_manager_cluster_vendor }}"
+      - "☁️  Cloud:          {{ acm_dr_spoke_manager_cluster_cloud if (acm_dr_spoke_manager_cluster_cloud | default('', true) | length > 0) else (acm_dr_spoke_manager_detected_cloud | default('Other')) }}"
+      - ""
+      - "For individual Spoke operations (detach, manual prep), create an"
+      - "'ACM DR - Spoke Cluster' credential in AAP with:"
+      - "  Name:    Spoke-{{ acm_dr_spoke_manager_cluster_name }}"
+      - "  Host:    {{ acm_dr_spoke_manager_onboard_spoke_host }}"
+      - "  Context: {{ acm_dr_spoke_manager_sa_context_name }}"
+      - "  Token:   extract from the Spoke with:"
+      - "    kubectl get secret {{ acm_dr_spoke_manager_automation_secret_name }} \\"
+      - "      -n {{ acm_dr_spoke_manager_automation_namespace }} \\"
+      - "      -o jsonpath='{.data.token}' | base64 -d"
+  run_once: true
+...

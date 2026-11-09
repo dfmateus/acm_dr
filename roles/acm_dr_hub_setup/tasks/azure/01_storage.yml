@@ -1,0 +1,246 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 01 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 01 - Azure Storage] | Display Storage provisioning metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "☁️ STAGE 01 - Azure Blob Storage Provisioning"
+    acm_dr_hub_setup_banner_lines:
+      - "📦 RESOURCE GROUP:   {{ acm_dr_hub_setup_azure_resource_group }}"
+      - "💾 STORAGE ACCOUNT:  {{ acm_dr_hub_setup_azure_storage_account_name }}"
+      - "🗄️ CONTAINER BACKUP: {{ acm_dr_hub_setup_azure_container_backup }}"
+      - "📊 CONTAINER OBS:    {{ acm_dr_hub_setup_azure_container_observability }}"
+      - "🔄 ALLOW REUSE:      {{ acm_dr_hub_setup_azure_storage_allow_reuse }}"
+  run_once: true
+
+# =============================================================================
+# STEP 1.1: AZURE AUTHENTICATION (MODULE-BASED, NO CLI)
+# =============================================================================
+# azure.azcollection modules authenticate via env vars (AZURE_CLIENT_ID,
+# AZURE_SECRET, AZURE_TENANT, AZURE_SUBSCRIPTION_ID) or module-level params.
+# No explicit "az login" step needed. The env vars are set by:
+#   - AAP: built-in "Microsoft Azure Resource Manager" credential type
+#   - CLI: source .local/cloud/azure/env-setup.sh (exports SUBSCRIPTION, TENANT, etc.)
+#   - defaults/main.yml: reads both AAP and legacy env var names
+#
+# All azure.azcollection calls in this file use an environment: block that
+# maps role variables to the env vars the SDK expects, so auth works
+# regardless of how the credentials were injected.
+
+- name: "[STAGE 01 - Azure Storage] | 1.1.1) Validate Azure credentials via subscription info query"
+  azure.azcollection.azure_rm_subscription_info:
+    # Queries the subscription to confirm the SP credentials are valid.
+    # Equivalent of the old "az login --service-principal" + "az account set".
+    id: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_azure_auth_check
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# =============================================================================
+# STEP 1.2: EXISTING RESOURCE CHECKS AND SECURITY VALIDATION
+# =============================================================================
+
+- name: "[STAGE 01 - Azure Storage] | 1.2.1) Check for pre-existing Storage Account in Azure"
+  azure.azcollection.azure_rm_storageaccount_info:
+    resource_group: "{{ acm_dr_hub_setup_azure_resource_group }}"
+    name: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_sa_check
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# Set a boolean for readability in subsequent conditions.
+# The module returns an empty list when the account does not exist.
+- name: "[STAGE 01 - Azure Storage] | 1.2.1b) Determine if Storage Account exists"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_sa_exists: "{{ (acm_dr_hub_setup_sa_check.storageaccounts | default([]) | length) > 0 }}"
+
+- name: "[STAGE 01 - Azure Storage] | 1.2.2a) Check for pre-existing Backup Container (Velero)"
+  # azure_rm_storageblob_info is a data-plane module: it accesses the storage
+  # service directly (not ARM). auth_mode: login makes it use the SP's Azure AD
+  # credentials from env vars instead of requiring a storage account key.
+  # If the container does not exist, the module fails; failed_when: false
+  # lets us check the result without aborting the play.
+  azure.azcollection.azure_rm_storageblob_info:
+    resource_group: "{{ acm_dr_hub_setup_azure_resource_group }}"
+    storage_account_name: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+    container_name: "{{ acm_dr_hub_setup_azure_container_backup }}"
+    auth_mode: login
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_container_backup_check
+  failed_when: false
+  when: acm_dr_hub_setup_sa_exists | bool
+
+- name: "[STAGE 01 - Azure Storage] | 1.2.2b) Check for pre-existing Observability Container (Thanos)"
+  azure.azcollection.azure_rm_storageblob_info:
+    resource_group: "{{ acm_dr_hub_setup_azure_resource_group }}"
+    storage_account_name: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+    container_name: "{{ acm_dr_hub_setup_azure_container_observability }}"
+    auth_mode: login
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_container_obs_check
+  failed_when: false
+  when: acm_dr_hub_setup_sa_exists | bool
+
+- name: "[STAGE 01 - Azure Storage] | 1.2.3) 🛡️ SAFETY LOCK - Block execution if infrastructure already exists without reuse flag"
+  ansible.builtin.fail:
+    msg:
+      - "🛑 [SAFETY MECHANISM ACTIVATED]: Storage resources have already been detected in Azure!"
+      - "---------------------------------------------------------------------------------------------------"
+      - " Storage Account : {{ acm_dr_hub_setup_azure_storage_account_name }} (Exists: {{ acm_dr_hub_setup_sa_exists }})"
+      - " Container Backup: {{ acm_dr_hub_setup_azure_container_backup }} (Exists: {{ _backup_exists }})"
+      - " Container Obs   : {{ acm_dr_hub_setup_azure_container_observability }} (Exists: {{ _obs_exists }})"
+      - "---------------------------------------------------------------------------------------------------"
+      - " AVAILABLE OPTIONS TO CONTINUE:"
+      - " 1. To REUSE these existing resources in the environment, re-run the command adding the flag:"
+      - "    -e acm_dr_hub_setup_azure_storage_allow_reuse=true"
+      - ""
+      - " 2. To CHANGE the names, adjust the variables in the 'defaults/main.yml' file."
+      - "---------------------------------------------------------------------------------------------------"
+  vars:
+    # Container existence check: the storageblob_info module returns a non-failed
+    # result when the container exists. A failure (or skip) means it does not exist.
+    _backup_exists: "{{ acm_dr_hub_setup_container_backup_check is defined and acm_dr_hub_setup_container_backup_check is not failed and acm_dr_hub_setup_container_backup_check is not skipped }}"
+    _obs_exists: "{{ acm_dr_hub_setup_container_obs_check is defined and acm_dr_hub_setup_container_obs_check is not failed and acm_dr_hub_setup_container_obs_check is not skipped }}"
+  when:
+    - not acm_dr_hub_setup_azure_storage_allow_reuse | bool
+    - (acm_dr_hub_setup_sa_exists | bool) or
+      (_backup_exists | default(false) | bool) or
+      (_obs_exists | default(false) | bool)
+
+# =============================================================================
+# STEP 1.3: IDEMPOTENT PROVISIONING OF STORAGE ACCOUNT AND BLOB CONTAINERS
+# =============================================================================
+
+- name: "[STAGE 01 - Azure Storage] | 1.3.1) Provision Storage Account in Azure"
+  azure.azcollection.azure_rm_storageaccount:
+    resource_group: "{{ acm_dr_hub_setup_azure_resource_group }}"
+    name: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+    location: "{{ acm_dr_hub_setup_azure_location }}"
+    account_type: Standard_LRS
+    kind: StorageV2
+    allow_blob_public_access: false
+    state: present
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not (acm_dr_hub_setup_sa_exists | bool)
+
+- name: "[STAGE 01 - Azure Storage] | 1.3.2) Create Blob Container for OADP/Velero Backups"
+  # azure_rm_storageblob with state=present and no blob/src creates the
+  # container idempotently. auth_mode: login authenticates via Azure AD
+  # (SP env vars) instead of requiring a storage account key.
+  azure.azcollection.azure_rm_storageblob:
+    resource_group: "{{ acm_dr_hub_setup_azure_resource_group }}"
+    storage_account_name: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+    container: "{{ acm_dr_hub_setup_azure_container_backup }}"
+    auth_mode: login
+    state: present
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: acm_dr_hub_setup_container_backup_check is not defined or acm_dr_hub_setup_container_backup_check is failed or acm_dr_hub_setup_container_backup_check is skipped
+
+- name: "[STAGE 01 - Azure Storage] | 1.3.3) Create Blob Container for Thanos Observability History"
+  azure.azcollection.azure_rm_storageblob:
+    resource_group: "{{ acm_dr_hub_setup_azure_resource_group }}"
+    storage_account_name: "{{ acm_dr_hub_setup_azure_storage_account_name }}"
+    container: "{{ acm_dr_hub_setup_azure_container_observability }}"
+    auth_mode: login
+    state: present
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: acm_dr_hub_setup_container_obs_check is not defined or acm_dr_hub_setup_container_obs_check is failed or acm_dr_hub_setup_container_obs_check is skipped
+
+# =============================================================================
+# STEP 1.4: ACCESS PERMISSION ASSIGNMENT (AZURE RBAC)
+# =============================================================================
+
+# The azure_rm_roleassignment module needs the SP's directory object_id, not
+# the client/application ID. The az CLI auto-resolved this; with modules we
+# look it up explicitly via azure_rm_adserviceprincipal_info.
+- name: "[STAGE 01 - Azure Storage] | 1.4.0) Resolve Service Principal object_id from client_id"
+  azure.azcollection.azure_rm_adserviceprincipal_info:
+    app_id: "{{ acm_dr_hub_setup_azure_client_id }}"
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_sp_info
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not (acm_dr_hub_setup_sa_exists | bool)
+
+# Look up the role definition ID for "Storage Blob Data Contributor" so we
+# don't hardcode the well-known GUID (ba92f5b4-...). The lookup scopes to the
+# subscription level so it finds the built-in role definition.
+- name: "[STAGE 01 - Azure Storage] | 1.4.0b) Look up role definition ID for Storage Blob Data Contributor"
+  azure.azcollection.azure_rm_roledefinition_info:
+    scope: "/subscriptions/{{ acm_dr_hub_setup_azure_subscription_id }}"
+    role_name: "Storage Blob Data Contributor"
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_role_def_info
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not (acm_dr_hub_setup_sa_exists | bool)
+
+- name: "[STAGE 01 - Azure Storage] | 1.4.1) Assign Storage Blob Data Contributor Role to the Service Principal"
+  azure.azcollection.azure_rm_roleassignment:
+    scope: "{{ _azure_storage_scope }}"
+    assignee_object_id: "{{ acm_dr_hub_setup_sp_info.service_principals[0].object_id }}"
+    role_definition_id: "{{ acm_dr_hub_setup_role_def_info.roledefinitions[0].id }}"
+    state: present
+  vars:
+    _azure_storage_scope: >-
+      {{ '/subscriptions/' ~ acm_dr_hub_setup_azure_subscription_id ~
+          '/resourceGroups/' ~ acm_dr_hub_setup_azure_resource_group ~
+          '/providers/Microsoft.Storage/storageAccounts/' ~ acm_dr_hub_setup_azure_storage_account_name }}
+  environment:
+    AZURE_CLIENT_ID: "{{ acm_dr_hub_setup_azure_client_id }}"
+    AZURE_SECRET: "{{ acm_dr_hub_setup_azure_client_secret }}"
+    AZURE_TENANT: "{{ acm_dr_hub_setup_azure_tenant_id }}"
+    AZURE_SUBSCRIPTION_ID: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+  register: acm_dr_hub_setup_role_assign
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not (acm_dr_hub_setup_sa_exists | bool)
+
+# =============================================================================
+# STEP 1.5: COMPLETION SUMMARY AND STAGE 01 FINISH STATUS
+# =============================================================================
+
+- name: "[STAGE 01 - Azure Storage] | Display Azure Storage provisioning completion status"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/azure/01_storage_summary.j2').split('\n') }}"
+  run_once: true
+...

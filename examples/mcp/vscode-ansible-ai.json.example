@@ -1,0 +1,29 @@
+{
+  "_comment": "VS Code Automation intelligent assistant (Red Hat) - connection notes",
+
+  "_setup_notes": [
+    "The Red Hat Ansible extension uses a different connection path than mcp.json.",
+    "This file is a reference for settings to check, not a drop-in config.",
+    "",
+    "Consult the Red Hat docs before configuring:",
+    "  - extend-proc_configure_vs_code_containerized_install",
+    "  - extend-enable_the_vs_code_extension_ai_assistant",
+    "",
+    "The MCP server URL and token follow the same pattern as Claude Code and Cursor.",
+    "See docs/02-clients.md for the full configuration guide."
+  ],
+
+  "_mcp_server_info": {
+    "url_pattern": "https://<MCP_SERVER_ROUTE>/<toolset>/mcp",
+    "transport": "http",
+    "auth_header": "Authorization: Bearer <AIOPS_TOKEN>",
+    "toolsets_for_this_collection": [
+      "job_management",
+      "inventory_management",
+      "system_monitoring"
+    ]
+  },
+
+  "_token_source": ".local/aap/aiops_mcp.env - AIOPS_TOKEN field",
+  "_route_source": ".local/aap/aiops_mcp.env - MCP_SERVER_ROUTE field"
+}

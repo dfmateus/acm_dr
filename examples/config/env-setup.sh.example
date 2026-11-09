@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ENVIRONMENT VARIABLE CONFIGURATION - ACM DR LAB
+# =============================================================================
+# Copy this file to '.local/env-setup.sh' and fill in your credentials.
+# Then source it before running any playbook:
+#   source .local/env-setup.sh
+#
+# The .local/ directory is gitignored at both project and global level,
+# so credentials placed there will never reach the repository.
+#
+# IMPORTANT: NEVER COMMIT the real 'env-setup.sh' with credentials!
+# =============================================================================
+#
+# TWO CREDENTIAL MODELS - pick one (or both for backward compatibility):
+#
+#   MODEL A (legacy): a single multi-context kubeconfig file holds every cluster.
+#       Set K8S_AUTH_KUBECONFIG / KUBECONFIG and leave ACM_DR_* vars empty.
+#
+#   MODEL B (per-cluster, recommended): one set of env vars per cluster role.
+#       Set ACM_DR_TARGET_* / ACM_DR_SOURCE_* / ACM_DR_DEST_* / ACM_DR_SPOKE_*
+#       and leave K8S_AUTH_KUBECONFIG / KUBECONFIG empty. The
+#       acm_dr_kubeconfig_resolver role assembles a runtime kubeconfig from
+#       these vars at playbook start.
+#
+#   If both are set, per-cluster vars take precedence.
+#
+#   For per-cluster vars, you can also use the helper script instead of
+#   setting them here:
+#       source examples/scripts/lib/load_cluster_env.sh target ~/.kube/clusters/hub-01.env
+#
+# =============================================================================
+
+# --- Credential model selector -----------------------------------------------
+# Set to "monolithic" or "per-cluster" to enable the corresponding section.
+# When "per-cluster" is selected, K8S_AUTH_KUBECONFIG / KUBECONFIG are left
+# unset and the resolver role builds the kubeconfig from ACM_DR_* vars.
+ACM_DR_CREDENTIAL_MODEL="monolithic"  # "monolithic" or "per-cluster"
+
+# =============================================================================
+# MODEL A - Legacy monolithic KUBECONFIG
+# =============================================================================
+# Only applied when ACM_DR_CREDENTIAL_MODEL="monolithic".
+
+if [[ "${ACM_DR_CREDENTIAL_MODEL}" == "monolithic" ]]; then
+    # Path to the multi-context kubeconfig with *-sa ServiceAccount contexts
+    export K8S_AUTH_KUBECONFIG="${HOME}/.kube/config-acm-lab-dr"
+    export KUBECONFIG="${K8S_AUTH_KUBECONFIG}"
+fi
+
+# =============================================================================
+# MODEL B - Per-cluster credentials
+# =============================================================================
+# Only applied when ACM_DR_CREDENTIAL_MODEL="per-cluster".
+# Fill in the sections that match the playbook you intend to run.
+# Fields marked (optional) can be left empty for public-CA clusters like ARO.
+
+if [[ "${ACM_DR_CREDENTIAL_MODEL}" == "per-cluster" ]]; then
+
+    # --- Target cluster (Lab Setup, Cleanup, ArgoCD, Spoke Manager Hub-side) --
+    export ACM_DR_TARGET_HOST=""          # API endpoint (e.g. https://api.hub-01...:6443)
+    export ACM_DR_TARGET_TOKEN=""         # SA bearer token from provision_automation_sa.sh
+    export ACM_DR_TARGET_CA_DATA=""       # base64 CA bundle (optional)
+    export ACM_DR_TARGET_CONTEXT=""       # context name (e.g. acmdr-aro-lab-hub-02-sa)
+
+    # --- Source Hub (Failover Orchestrator - origin, currently ACTIVE) --------
+    export ACM_DR_SOURCE_HOST=""
+    export ACM_DR_SOURCE_TOKEN=""
+    export ACM_DR_SOURCE_CA_DATA=""       # optional
+    export ACM_DR_SOURCE_CONTEXT=""
+
+    # --- Destination Hub (Failover Orchestrator - target, currently PASSIVE) --
+    export ACM_DR_DEST_HOST=""
+    export ACM_DR_DEST_TOKEN=""
+    export ACM_DR_DEST_CA_DATA=""         # optional
+    export ACM_DR_DEST_CONTEXT=""
+
+    # --- Individual Spoke (Spoke Manager - Spoke-side operations) -------------
+    export ACM_DR_SPOKE_HOST=""
+    export ACM_DR_SPOKE_TOKEN=""
+    export ACM_DR_SPOKE_CA_DATA=""        # optional
+    export ACM_DR_SPOKE_CONTEXT=""
+
+    # --- Spoke Fleet kubeconfig (optional - not required for failover) ---------
+    # The failover pipeline reconnects Spokes via Operation C (mirrored SA token
+    # Secrets on the Hub) without needing a pre-staged fleet kubeconfig.
+    # Set this only if you want to exercise the kubeconfig-context path in Stage 01.
+    export ACM_DR_SPOKE_FLEET_KUBECONFIG=""  # optional; e.g. ${HOME}/.kube/spoke-fleet.kubeconfig
+fi
+
+# =============================================================================
+# CLOUD PROVIDER - selects which cloud-specific credentials to export
+# =============================================================================
+# Set to "azure" or "aws". This controls which block of cloud-specific
+# variables is exported and validated below. Hub clusters on Azure use
+# "azure"; Hub clusters on AWS (ROSA) use "aws".
+ACM_DR_CLOUD_PROVIDER="azure"  # "azure" or "aws"
+
+# =============================================================================
+# AZURE - Subscription, Entra ID (Service Principal), and Storage
+# =============================================================================
+# Only applied when ACM_DR_CLOUD_PROVIDER="azure".
+
+if [[ "${ACM_DR_CLOUD_PROVIDER}" == "azure" ]]; then
+
+    # --- Azure Subscription and Entra ID (Service Principal) -----------------
+    export SUBSCRIPTION=""
+    export TENANT=""
+    export CLIENT_ID=""
+    export PASSWORD=""
+    export RESOURCEGROUP=""
+
+    # --- Azure Storage (direct naming, preferred over GUID) ------------------
+    # Provide the Storage Account name directly. Overrides the GUID-derived
+    # 'acmsa<guid>' default. Must be 3-24 chars, lowercase + digits only,
+    # globally unique across Azure. Both Hubs share the same account.
+    export AZURE_STORAGE_ACCOUNT=""
+
+    # Optional: provide the Storage Account key directly to skip the 'az storage
+    # account keys list' call during OADP/Thanos setup. When omitted, the role
+    # retrieves the key via the Azure CLI using SUBSCRIPTION, TENANT, and CLIENT_ID.
+    # export AZURE_STORAGE_KEY=""
+
+    # Optional: Red Hat Open Environment shorthand. When set, constructs the
+    # Storage Account name as 'acmsa<guid>' and the Resource Group fallback
+    # as 'openenv-<guid>'. Not needed when AZURE_STORAGE_ACCOUNT and
+    # RESOURCEGROUP are provided directly.
+    # export GUID=""
+fi
+
+# =============================================================================
+# AWS - IAM Credentials and S3 Storage (ROSA HCP Hubs)
+# =============================================================================
+# Only applied when ACM_DR_CLOUD_PROVIDER="aws".
+# Used by ROSA HCP Hub clusters. The amazon.aws Ansible modules read
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION from
+# the environment (roles/acm_dr_lab_setup/defaults/main.yml env lookups).
+#
+# TIP: for a cleaner setup, use the provider-specific file instead:
+#   source .local/aws/env-setup.sh
+
+if [[ "${ACM_DR_CLOUD_PROVIDER}" == "aws" ]]; then
+
+    # --- AWS IAM authentication (env vars or named profile) ------------------
+    # From the RHDP "AWS with ROSA Open Environment" sandbox email, or
+    # from an IAM user with S3 and (optionally) ROSA permissions.
+    export AWS_ACCESS_KEY_ID=""       # IAM access key
+    export AWS_SECRET_ACCESS_KEY=""   # IAM secret key
+    export AWS_DEFAULT_REGION=""      # target region (e.g. us-east-1)
+
+    # --- AWS S3 Storage (shared across DR Hub pair) --------------------------
+    # Both Hubs in a DR pair MUST point to the SAME S3 buckets so OADP
+    # backups and Thanos history are visible from either side. Names must
+    # be globally unique across all AWS accounts.
+    export ACM_DR_AWS_S3_BUCKET_BACKUP=""        # OADP/Velero backup bucket
+    export ACM_DR_AWS_S3_BUCKET_OBSERVABILITY="" # Thanos observability bucket
+fi
+
+# --- ACM operator channel (optional override) --------------------------------
+# Controls which ACM version OLM installs via the ManagedHub Subscription.
+# Defaults to 'release-2.14' in roles/acm_dr_lab_setup/defaults/main.yml.
+# Set here to pin the channel environment-wide instead of passing -e each run.
+# export ACM_CHANNEL="release-2.17"
+
+# --- GitHub (GitOps / Argo CD synchronization) ------------------------------
+export GITHUB_USER=""
+export GITHUB_PAT=""
+# GitOps repository URL for ArgoCD ApplicationSet generators.
+# Required by acm_dr_lab_setup Stage 04 and acm_argocd_instance_setup.
+# Format: https://github.com/<org>/<repo>.git
+export GITHUB_REPO=""
+
+# --- Ansible governance -----------------------------------------------------
+export ANSIBLE_ROLES_PATH="./roles"
+
+# =============================================================================
+# VALIDATION - checks that required variables are non-empty after export
+# =============================================================================
+_env_errors=0
+
+# Cloud-agnostic vars (always required regardless of provider or credential model)
+_common_vars=(GITHUB_USER GITHUB_PAT ANSIBLE_ROLES_PATH)
+
+# Cloud-specific required vars (depend on ACM_DR_CLOUD_PROVIDER)
+if [[ "${ACM_DR_CLOUD_PROVIDER}" == "azure" ]]; then
+    _cloud_vars=(SUBSCRIPTION TENANT CLIENT_ID PASSWORD RESOURCEGROUP)
+elif [[ "${ACM_DR_CLOUD_PROVIDER}" == "aws" ]]; then
+    _cloud_vars=(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION ACM_DR_AWS_S3_BUCKET_BACKUP ACM_DR_AWS_S3_BUCKET_OBSERVABILITY)
+else
+    echo -e "\033[0;31m❌ Unknown ACM_DR_CLOUD_PROVIDER: '${ACM_DR_CLOUD_PROVIDER}'. Use 'azure' or 'aws'.\033[0m"
+    _env_errors=1
+    _cloud_vars=()
+fi
+
+# Credential-model-specific vars
+if [[ "${ACM_DR_CREDENTIAL_MODEL}" == "monolithic" ]]; then
+    _check_vars=(K8S_AUTH_KUBECONFIG KUBECONFIG "${_common_vars[@]}" "${_cloud_vars[@]}")
+elif [[ "${ACM_DR_CREDENTIAL_MODEL}" == "per-cluster" ]]; then
+    # Only TARGET is always required; SOURCE/DEST/SPOKE depend on the playbook
+    _check_vars=(ACM_DR_TARGET_HOST ACM_DR_TARGET_TOKEN ACM_DR_TARGET_CONTEXT "${_common_vars[@]}" "${_cloud_vars[@]}")
+else
+    echo -e "\033[0;31m❌ Unknown ACM_DR_CREDENTIAL_MODEL: '${ACM_DR_CREDENTIAL_MODEL}'. Use 'monolithic' or 'per-cluster'.\033[0m"
+    _env_errors=1
+    _check_vars=("${_common_vars[@]}" "${_cloud_vars[@]}")
+fi
+
+# Portable indirect expansion: eval works in both bash and zsh, unlike ${!var} (bash-only)
+for _var in "${_check_vars[@]}"; do
+    eval "_val=\"\${${_var}}\""
+    if [ -z "${_val}" ]; then
+        echo -e "\033[0;31m❌ MISSING: ${_var} is not set or empty.\033[0m"
+        _env_errors=$((_env_errors + 1))
+    fi
+done
+
+if [ "$_env_errors" -gt 0 ]; then
+    echo -e "\n\033[1;33m⚠️  ${_env_errors} variable(s) missing. Some playbooks may fail.\033[0m"
+else
+    echo -e "\033[0;32m✅ Cloud provider: ${ACM_DR_CLOUD_PROVIDER} | Credential model: ${ACM_DR_CREDENTIAL_MODEL}\033[0m"
+    if [[ "${ACM_DR_CREDENTIAL_MODEL}" == "monolithic" ]]; then
+        if [ -f "${K8S_AUTH_KUBECONFIG}" ]; then
+            echo -e "\033[0;32m✅ Kubeconfig found at: ${K8S_AUTH_KUBECONFIG}\033[0m"
+        else
+            echo -e "\033[1;33m⚠️  Kubeconfig not found at: ${K8S_AUTH_KUBECONFIG}\033[0m"
+            echo -e "\033[1;33m   Run examples/scripts/cluster-onboarding/02_provision_automation_sa.sh to create it.\033[0m"
+        fi
+    else
+        # Count how many per-cluster prefixes have all 3 required fields set
+        _cluster_count=0
+        for _prefix in ACM_DR_TARGET ACM_DR_SOURCE ACM_DR_DEST ACM_DR_SPOKE; do
+            eval "_h=\"\${${_prefix}_HOST}\""
+            eval "_t=\"\${${_prefix}_TOKEN}\""
+            eval "_c=\"\${${_prefix}_CONTEXT}\""
+            if [ -n "${_h}" ] && [ -n "${_t}" ] && [ -n "${_c}" ]; then
+                _cluster_count=$((_cluster_count + 1))
+            fi
+        done
+        echo -e "\033[0;32m✅ ${_cluster_count} per-cluster credential set(s) configured.\033[0m"
+    fi
+fi
+
+unset _env_errors _var _val _check_vars _common_vars _cloud_vars _cluster_count _prefix _h _t _c ACM_DR_CREDENTIAL_MODEL ACM_DR_CLOUD_PROVIDER

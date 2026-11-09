@@ -1,0 +1,18 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 01 - AWS S3 STORAGE PROVISIONED & READY
+{{ _sep }}
+ 🌐 AWS REGION:           {{ acm_dr_hub_setup_aws_region }}
+ 🪣 BACKUP BUCKET:        {{ acm_dr_hub_setup_aws_s3_bucket_backup }} (Velero/OADP)
+ 📊 OBSERVABILITY BUCKET: {{ acm_dr_hub_setup_aws_s3_bucket_observability }} (Thanos)
+{% if acm_dr_hub_setup_aws_kms_key_id | default('') | length > 0 %}
+ 🔐 SSE ENCRYPTION:       KMS ({{ acm_dr_hub_setup_aws_kms_key_id }})
+{% else %}
+ 🔐 SSE ENCRYPTION:       AES-256 (AWS default)
+{% endif %}
+{{ _sep }}
+ ⚠️  SECURITY NOTE:
+ S3 buckets are created with public access blocked by default.
+ The IAM identity has been validated but IAM policies are managed
+ externally (Terraform, CloudFormation, or manual assignment).
+{{ _sep }}

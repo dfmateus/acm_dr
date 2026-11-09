@@ -1,0 +1,34 @@
+---
+# examples/playbooks/run-failover.yml
+# Execute a DR failover in dry-run mode (safe default).
+# Transfers managed cluster ownership from the active (source) Hub to the
+# passive (destination) Hub. Dry-run uses Kubernetes dryRun=All against
+# real clusters, so you need valid credentials, but nothing is mutated.
+#
+# Required extra vars:
+#   active_hub                  - kubeconfig context for the currently active Hub
+#   passive_hub                 - kubeconfig context for the passive Hub
+#   acm_dr_failover_action      - "failover" or "failback"
+#
+# Usage:
+#   ansible-playbook examples/playbooks/run-failover.yml \
+#     -e active_hub="acm-primary-hub-sa" \
+#     -e passive_hub="acm-dr-hub-sa" \
+#     -e acm_dr_failover_action="failover"
+
+- name: DR failover orchestration (dry-run)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    # Resolve kubeconfig from per-cluster credentials or fall back to KUBECONFIG env var
+    - role: dfmateus.acm_dr.acm_dr_kubeconfig_resolver
+
+    # Run the 9-stage failover pipeline in dry-run mode
+    - role: dfmateus.acm_dr.acm_dr_failover_manager
+      vars:
+        active_hub: "acm-primary-hub-sa"  # source Hub (currently active)
+        passive_hub: "acm-dr-hub-sa"  # destination Hub (will become active)
+        acm_dr_failover_action: "failover"  # "failover" or "failback"
+        acm_dr_failover_manager_dry_run: true  # safe default, no mutations
+...

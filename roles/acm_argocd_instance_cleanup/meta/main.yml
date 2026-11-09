@@ -1,0 +1,30 @@
+---
+galaxy_info:
+  role_name: acm_argocd_instance_cleanup
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Inverse operation of acm_argocd_instance: fully removes a named Red Hat
+    OpenShift GitOps (ArgoCD) instance - Applications/ApplicationSet, managed
+    namespaces, cluster-scoped RBAC, ConsoleLink, and the instance itself - in
+    the correct order to prevent orphaned finalizers, without affecting the
+    shared Operator or other instances.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - gitops
+    - argocd
+    - openshift
+    - kubernetes
+    - cleanup
+    - teardown
+
+dependencies: []
+...

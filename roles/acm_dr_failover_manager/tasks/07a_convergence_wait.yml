@@ -1,0 +1,212 @@
+---
+# roles/acm_dr_failover_manager/tasks/07a_convergence_wait.yml
+# =============================================================================
+# STAGE 07a: CONVERGENCE WAIT (PRE-COMPLIANCE REPORT STABILIZATION)
+# =============================================================================
+# After failover completes and the old Hub is detached, the new leader Hub needs
+# time to propagate Governance Policies, reconcile ArgoCD Applications, and
+# stabilize the MultiClusterHub operator. This stage polls those subsystems
+# before the Stage 08 compliance report, so the report reflects actual
+# steady-state rather than a mid-reconciliation snapshot.
+#
+# All polling tasks use failed_when: false; convergence is best-effort. If a
+# resource type does not converge within the timeout, the pipeline continues and
+# Stage 08 will surface whatever has not settled yet.
+# =============================================================================
+
+- name: "[STAGE 07a - Convergence Wait] | Display convergence wait metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "⏳ STAGE 07a - Convergence Wait (Pre-Compliance Stabilization)"
+    acm_dr_failover_manager_banner_lines:
+      - "✅ NEW HUB: {{ passive_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+      - >-
+        ⏱️  MAX WAIT PER CHECK: {{ acm_dr_failover_manager_converge_retries | int *
+        acm_dr_failover_manager_converge_delay | int }}s
+        ({{ acm_dr_failover_manager_converge_retries }} retries × {{ acm_dr_failover_manager_converge_delay }}s)
+  run_once: true
+
+# -----------------------------------------------------------------------------
+# 7a.1) MULTICLUSTERHUB READINESS POLL
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.1) ⏳ Waiting for MultiClusterHub to reach Running on {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+  register: acm_dr_failover_manager_converge_mch
+  retries: "{{ acm_dr_failover_manager_converge_retries }}"
+  delay: "{{ acm_dr_failover_manager_converge_delay }}"
+  until: >-
+    (acm_dr_failover_manager_converge_mch.resources | default([]) | length > 0)
+    and
+    (acm_dr_failover_manager_converge_mch.resources[0].status.phase | default('') == 'Running')
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  failed_when: false
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.1.1) MCH convergence result"
+  ansible.builtin.debug:
+    msg: >-
+      {% if acm_dr_failover_manager_converge_mch.resources | default([]) | length > 0
+            and acm_dr_failover_manager_converge_mch.resources[0].status.phase | default('') == 'Running' %}
+      ✅ MultiClusterHub is Running on {{ passive_hub }}
+      (v{{ acm_dr_failover_manager_converge_mch.resources[0].status.currentVersion | default('?') }})
+      {% else %}
+      ⚠️ MultiClusterHub did NOT reach Running within timeout on {{ passive_hub }}
+      (current phase: {{ acm_dr_failover_manager_converge_mch.resources[0].status.phase | default('Unknown')
+      if acm_dr_failover_manager_converge_mch.resources | default([]) | length > 0 else 'NOT FOUND' }})
+      {% endif %}
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+# Enriched diagnostic: when MCH did not converge, list which conditions
+# are not True so the operator knows what specific component is stuck.
+- name: "[STAGE 07a - Convergence Wait] | 7a.1.2) ⚠️ MCH condition details (when not Running)"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ MCH conditions on {{ passive_hub }}:
+      {% for c in acm_dr_failover_manager_converge_mch.resources[0].status.conditions | default([]) %}
+      {{ c.type }}: {{ c.status }}{% if c.status != 'True' %} - {{ c.message | default('(no message)') }}{% endif %};
+      {% endfor %}
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_converge_mch.resources | default([]) | length > 0
+    - acm_dr_failover_manager_converge_mch.resources[0].status.phase | default('') != 'Running'
+
+# -----------------------------------------------------------------------------
+# 7a.2) GOVERNANCE POLICY STATUS CHECK (single read, no polling)
+# -----------------------------------------------------------------------------
+# Policies that remain Pending indefinitely (e.g. virt-related policies when
+# OpenShift Virtualization is not installed) would cause the old polling loop
+# to burn the entire convergence timeout for nothing. Instead, read once and
+# report. NonCompliant is a valid operational state; Pending is informational.
+# Stage 08 already produces the full compliance audit.
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.2) Read Governance Policy status on {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: policy.open-cluster-management.io/v1
+    kind: Policy
+  register: acm_dr_failover_manager_converge_policies
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  failed_when: false
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.2.1) Policy status summary"
+  ansible.builtin.set_fact:
+    # Count policies by compliance state so the operator gets a quick breakdown
+    acm_dr_failover_manager_converge_pending_policies: >-
+      {{ acm_dr_failover_manager_converge_policies.resources | default([])
+         | map(attribute='status.compliant', default='Pending')
+         | select('equalto', 'Pending')
+         | list | length }}
+    acm_dr_failover_manager_converge_noncompliant_policies: >-
+      {{ acm_dr_failover_manager_converge_policies.resources | default([])
+         | map(attribute='status.compliant', default='Pending')
+         | select('equalto', 'NonCompliant')
+         | list | length }}
+    # Extract names of Pending policies so the operator can investigate
+    acm_dr_failover_manager_converge_pending_policy_names: >-
+      {% set ns = namespace(items=[]) %}
+      {% for p in acm_dr_failover_manager_converge_policies.resources | default([]) %}
+      {%   if p.status.compliant | default('Pending') == 'Pending' %}
+      {%     set _ = ns.items.append(p.metadata.namespace ~ '/' ~ p.metadata.name) %}
+      {%   endif %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.2.2) Policy convergence status"
+  ansible.builtin.debug:
+    msg: >-
+      {% set total = acm_dr_failover_manager_converge_policies.resources | default([]) | length %}
+      {% set pending = acm_dr_failover_manager_converge_pending_policies | default('0') | int %}
+      {% set noncompliant = acm_dr_failover_manager_converge_noncompliant_policies | default('0') | int %}
+      {% set compliant = total - pending - noncompliant %}
+      {% if pending == 0 %}
+      ✅ All {{ total }} Governance Policies evaluated on {{ passive_hub }}
+      ({{ compliant }} Compliant, {{ noncompliant }} NonCompliant)
+      {% else %}
+      ⚠️ {{ total }} Policies on {{ passive_hub }}: {{ compliant }} Compliant,
+      {{ noncompliant }} NonCompliant, {{ pending }} Pending.
+      Pending: {{ acm_dr_failover_manager_converge_pending_policy_names | default('[]') | from_json | join(', ') }}.
+      Pending policies may require a missing operator (e.g. OpenShift Virtualization)
+      or need manual investigation. Stage 08 will include the full breakdown
+      {% endif %}
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+# -----------------------------------------------------------------------------
+# 7a.3) ARGOCD APPLICATION STATUS CHECK (single read, no polling)
+# -----------------------------------------------------------------------------
+# ArgoCD apps that are not Healthy after the Restore + reconciliation need
+# investigation, not more waiting. Read once and report. Degraded/Missing
+# apps are not blockers for the failover pipeline; the operator can triage
+# them after the compliance report in Stage 08.
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.3) Read ArgoCD Application status on {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+  register: acm_dr_failover_manager_converge_gitops
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  failed_when: false
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.3.1) ArgoCD status summary"
+  ansible.builtin.set_fact:
+    # Include health, sync status, and operation message for each unhealthy
+    # app so the operator can see why the app is degraded without running
+    # extra oc commands.
+    acm_dr_failover_manager_converge_unhealthy_apps: >-
+      {% set ns = namespace(items=[]) %}
+      {% for app in (acm_dr_failover_manager_converge_gitops.resources | default([])) %}
+        {% set health = app.status.health.status | default('Unknown') %}
+        {% if health not in ['Healthy', 'Suspended'] %}
+          {% set sync = app.status.sync.status | default('Unknown') %}
+          {% set op_msg = app.status.operationState.message | default('') if app.status.operationState is defined else '' %}
+          {% set entry = app.metadata.namespace ~ '/' ~ app.metadata.name ~ ' (health=' ~ health ~ ', sync=' ~ sync %}
+          {% if op_msg | length > 0 %}
+          {%   set entry = entry ~ ', msg=' ~ op_msg[:120] %}
+          {% endif %}
+          {% set _ = ns.items.append(entry ~ ')') %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.3.2) ArgoCD convergence status"
+  ansible.builtin.debug:
+    msg: >-
+      {% set unhealthy = acm_dr_failover_manager_converge_unhealthy_apps | default('[]') | from_json %}
+      {% set total = acm_dr_failover_manager_converge_gitops.resources | default([]) | length %}
+      {% if unhealthy | length == 0 %}
+      ✅ All {{ total }} ArgoCD Applications are Healthy on {{ passive_hub }}
+      {% else %}
+      ⚠️ {{ unhealthy | length }}/{{ total }} ArgoCD Application(s) not Healthy on {{ passive_hub }}:
+      {{ unhealthy | join('; ') }}.
+      These apps may need manual investigation. Stage 08 will include them
+      {% endif %}
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+# -----------------------------------------------------------------------------
+# 7a.4) DRY-RUN PREVIEW
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 07a - Convergence Wait] | 7a.4) 🔎 [DRY-RUN] Convergence check preview"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        🔎 [DRY-RUN] Would check the following subsystems on {{ passive_hub }}:
+      - >-
+           1. MultiClusterHub: poll up to {{ acm_dr_failover_manager_converge_retries | int *
+           acm_dr_failover_manager_converge_delay | int }}s for phase Running
+      - "   2. Governance Policies: single read, report Compliant/NonCompliant/Pending breakdown"
+      - "   3. ArgoCD Applications: single read, report Healthy/Degraded/Unknown breakdown"
+      - >-
+        Non-blocking: MCH polling and status checks do not block the pipeline.
+        Stage 08 produces the full compliance audit.
+  when: acm_dr_failover_manager_dry_run | default(false) | bool
+...

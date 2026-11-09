@@ -1,0 +1,24 @@
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-gitops-operator-group
+  namespace: {{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}
+spec:
+  upgradeStrategy: Default
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-gitops-operator
+  namespace: {{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}
+  labels:
+    operators.coreos.com/openshift-gitops-operator.openshift-gitops-operator: ''
+spec:
+  channel: {{ acm_dr_hub_setup_gitops_resolved_channel }}
+  installPlanApproval: {{ acm_dr_hub_setup_gitops_approval | default('Automatic') }}
+  name: openshift-gitops-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+{% if acm_dr_hub_setup_gitops_starting_csv is defined and acm_dr_hub_setup_gitops_starting_csv | length > 0 %}
+  startingCSV: {{ acm_dr_hub_setup_gitops_starting_csv }}
+{% endif %}

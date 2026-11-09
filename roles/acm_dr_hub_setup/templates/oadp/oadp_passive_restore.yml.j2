@@ -1,0 +1,29 @@
+---
+# Passive sync Restore CR - continuously pulls credentials and resources from
+# shared backup storage on passive/DR hubs, keeping them pre-positioned for
+# faster failover activation.
+# Per RHACM 2.17 official docs:
+# https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index#active-passive-config
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Restore
+metadata:
+  name: "{{ acm_dr_hub_setup_passive_restore_name | default('restore-passive-sync') }}"
+  namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+spec:
+  # Enable continuous pull - the Restore controller periodically checks for new
+  # backups in the shared storage and applies them automatically on this passive hub
+  syncRestoreWithNewBackups: true
+  # How often to check for new backups from the active hub (default: 30m per official docs)
+  restoreSyncInterval: "{{ acm_dr_hub_setup_passive_restore_sync_interval | default('30m') }}"
+  # CleanupRestored: recommended by official docs - removes only resources that were
+  # previously restored before applying the new backup, preserving hub-local resources
+  cleanupBeforeRestore: CleanupRestored
+  # Restore credentials (Secrets, ServiceAccounts) from the latest available backup
+  veleroCredentialsBackupName: latest
+  # Restore resources (ConfigMaps, Policies, Applications metadata) from the latest backup
+  veleroResourcesBackupName: latest
+  # CRITICAL: must be 'skip' on passive hubs - restoring managed clusters activation data
+  # would transfer cluster management to this hub prematurely. Only set to 'latest' (or
+  # an explicit backup name) during an actual failover activation via acm_dr_failover_manager
+  veleroManagedClustersBackupName: skip
+...

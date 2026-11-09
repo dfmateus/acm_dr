@@ -1,0 +1,10 @@
+---
+# examples/scripts/testing/mock_data/all_green.yml
+# Scenario 1: Perfect state. 7 Spokes all JOINED+AVAILABLE, no anomalies,
+# 2-hub topology, backup fresh. Expects "ABSOLUTE SUCCESS" in the report.
+#
+# No overrides needed: _base.yml already represents the all-green state.
+# This file exists so every scenario has an explicit vars file.
+_scenario_name: "all_green"
+
+...

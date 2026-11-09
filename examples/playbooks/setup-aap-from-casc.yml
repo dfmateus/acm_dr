@@ -1,0 +1,385 @@
+---
+# examples/playbooks/setup-aap-from-casc.yml
+# =============================================================================
+# ONE-COMMAND AAP OBJECT IMPORT
+# =============================================================================
+# Runs all infra.controller_configuration roles in the correct import order.
+# On first run, credentials are skipped - their values come from the Bootstrap
+# JT (see docs/aap/aap-setup.md, section 5). After bootstrap, run a second
+# pass with --tags credentials to create permanent cluster credentials.
+#
+# REQUIRED VARIABLES (copy examples/aap/import-vars.yml to .local/aap/ and fill in):
+#   controller_hostname           AAP Gateway URL (https://...)
+#   controller_oauthtoken         API token of a user with org-admin on the target org.
+#                                 Generate in AAP UI: Access Management > Users > <user> > Tokens > Create
+#   aap_organization              Organization name - "Default" to use built-in (skip creation),
+#                                 or a custom name (e.g., "ACM DR Operations") to create one.
+#   aap_project                   Project name    (e.g., "ACM DR Collection (main)")
+#   aap_inventory                 Inventory name  (e.g., "ACM DR - LAB")
+#   aap_execution_environment     EE display name (e.g., "EE - ACM DR 1.0.0")
+#   aap_ee_image                  EE pull URL (full image reference including tag)
+#   aap_scm_url                   Project SCM URL
+#
+# OPTIONAL VARIABLES:
+#   controller_validate_certs     Defaults to true; set false for self-signed certs
+#
+# NOTE: ansible-core 2.19+ changed how -e "key=value with spaces" is parsed.
+# Always use a vars file (.local/aap/import-vars.yml is gitignored via .local/):
+#
+# FIRST RUN (before bootstrap):
+#   cp examples/aap/import-vars.yml .local/aap/import-vars.yml
+#   # edit .local/aap/import-vars.yml with your values
+#   ansible-playbook examples/playbooks/setup-aap-from-casc.yml \
+#     -e @.local/aap/import-vars.yml
+#
+# SECOND RUN (after all clusters are bootstrapped - creates credentials):
+#   ansible-playbook examples/playbooks/setup-aap-from-casc.yml \
+#     -e @.local/aap/import-vars.yml \
+#     --tags credentials
+#
+# DEPENDENCIES:
+#   ansible-galaxy collection install infra.controller_configuration
+
+- name: "Import ACM DR objects into Ansible Automation Platform"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # AAP connection - read from env vars, overridable via -e or @import-vars.yml
+    controller_hostname: "{{ lookup('ansible.builtin.env', 'CONTROLLER_HOST', default='') }}"
+    controller_oauthtoken: "{{ lookup('ansible.builtin.env', 'CONTROLLER_OAUTH_TOKEN', default='') }}"
+    controller_validate_certs: true    # override to false for lab/dev with self-signed certs
+
+    # Absolute path to the CasC directory - all controller_*.yml files live here
+    _casc_dir: "{{ playbook_dir }}/aap-config"
+
+  pre_tasks:
+    - name: "[PREFLIGHT] | Validate all required variables before touching the AAP API"
+      ansible.builtin.assert:
+        that:
+          - controller_hostname | length > 0
+          - controller_oauthtoken | length > 0
+          - aap_organization | default('') | length > 0
+          - aap_project | default('') | length > 0
+          - aap_inventory | default('') | length > 0
+          - aap_execution_environment | default('') | length > 0
+          - aap_ee_image | default('') | length > 0
+          - aap_scm_url | default('') | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => One or more required variables are missing. Pass at minimum:
+          controller_hostname, controller_oauthtoken, aap_organization, aap_project,
+          aap_inventory, aap_execution_environment, aap_ee_image, aap_scm_url.
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => All required variables present.
+          Connecting to {{ controller_hostname }} with API token.
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Step 1: Organizations - must exist before any other object references them
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 1) Load organizations"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_organizations.yml"
+
+    - name: "[CASC] | 1) Import organizations"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.organizations
+      # "Default" is the built-in AAP organization - it already exists, do not try to create it
+      when: aap_organization | default('Default') != 'Default'
+
+    # -------------------------------------------------------------------------
+    # Step 2: Execution Environments - referenced by job templates
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 2) Load execution environments"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_execution_environments.yml"
+
+    - name: "[CASC] | 2) Import execution environments"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.execution_environments
+
+    # -------------------------------------------------------------------------
+    # Step 3: Inventories
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 3) Load inventories"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_inventories.yml"
+
+    - name: "[CASC] | 3) Import inventories"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.inventories
+
+    # -------------------------------------------------------------------------
+    # Step 4: Projects - must exist before job templates reference them;
+    #         this also triggers the first SCM sync
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 4) Load projects"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_projects.yml"
+
+    - name: "[CASC] | 4) Import projects"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.projects
+
+    # -------------------------------------------------------------------------
+    # Step 5: Credential Types - must exist before any credential of that type
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 5) Load credential types"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_credential_types.yml"
+
+    - name: "[CASC] | 5) Import credential types"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.credential_types
+
+    # -------------------------------------------------------------------------
+    # Step 6: Credentials - skipped by default on first import
+    # -------------------------------------------------------------------------
+    # Credential values (SA bearer tokens) only exist after the Bootstrap JT
+    # runs on each cluster. Skip on first run; re-run with --tags credentials
+    # once all clusters are bootstrapped and tokens are known.
+    - name: "[CASC] | 6) Load credentials"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_credentials.yml"
+      tags:
+        - credentials
+        - never    # skipped unless --tags credentials is explicitly passed
+
+    - name: "[CASC] | 6) Import credentials"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.credentials
+        apply:
+          tags:
+            - credentials
+            - never    # propagate tags to role-internal tasks so --tags credentials reaches them
+      tags:
+        - credentials
+        - never
+
+    # Attach the AAP Bootstrap Automation (API Token) credential to the Bootstrap JT permanently.
+    # Runs after the credential instance is created (step 6 above). The AAP association
+    # API is idempotent: attaching an already-attached credential is a no-op.
+    - name: "[CASC] | 6b) Look up Bootstrap JT ID for credential attachment"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/job_templates/?name=JT+-+ACM+DR+-+LAB+-+Cluster+Bootstrap"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        status_code: [200]
+      register: _casc_bootstrap_jt_lookup
+      tags:
+        - credentials
+        - never
+
+    - name: "[CASC] | 6b) Look up AAP Bootstrap Automation (API Token) credential ID"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/credentials/?name=AAP+Bootstrap+Automation+%28API+Token%29"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        status_code: [200]
+      register: _casc_aap_token_cred_lookup
+      tags:
+        - credentials
+        - never
+
+    - name: "[CASC] | 6b) Attach AAP Bootstrap Automation (API Token) credential to Bootstrap JT"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/job_templates/{{ _casc_bootstrap_jt_lookup.json.results[0].id }}/credentials/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          id: "{{ _casc_aap_token_cred_lookup.json.results[0].id | int }}"
+        status_code: [204]
+      when:
+        - _casc_bootstrap_jt_lookup.json.count == 1
+        - _casc_aap_token_cred_lookup.json.count == 1
+      tags:
+        - credentials
+        - never
+
+    # Attach the Notification Webhook and AAP Automation Token credentials to JT-10 and JT-12
+    # permanently. These JTs are reused across multiple WJT failure paths and need their
+    # credentials pre-attached rather than injected at node level.
+    # JT-10: Check Approval Outcome  - needs AAP Automation Token + Notification Webhook
+    # JT-12: Notify Workflow Event   - needs Notification Webhook only
+    - name: "[CASC] | 6c) Look up JT-10 (Check Approval Outcome) ID"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/job_templates/?name=JT+-+ACM+DR+-+LAB+-+Check+Approval+Outcome"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        status_code: [200]
+      register: _casc_jt10_lookup
+      tags:
+        - credentials
+        - never
+
+    - name: "[CASC] | 6c) Look up JT-12 (Notify Workflow Event) ID"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/job_templates/?name=JT+-+ACM+DR+-+LAB+-+Notify+Workflow+Event"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        status_code: [200]
+      register: _casc_jt12_lookup
+      tags:
+        - credentials
+        - never
+
+    - name: "[CASC] | 6c) Look up ACM DR Notifications (Webhook) credential ID"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/credentials/?name=ACM+DR+Notifications+%28Webhook%29"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        status_code: [200]
+      register: _casc_notif_cred_lookup
+      tags:
+        - credentials
+        - never
+
+    - name: "[CASC] | 6c) Attach AAP Automation Token to JT-10 (Check Approval Outcome)"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/job_templates/{{ _casc_jt10_lookup.json.results[0].id }}/credentials/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          id: "{{ _casc_aap_token_cred_lookup.json.results[0].id | int }}"
+        status_code: [204]
+      when:
+        - _casc_jt10_lookup.json.count == 1
+        - _casc_aap_token_cred_lookup.json.count == 1
+      tags:
+        - credentials
+        - never
+
+    - name: "[CASC] | 6c) Attach Notification Webhook to JT-10 (Check Approval Outcome)"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/job_templates/{{ _casc_jt10_lookup.json.results[0].id }}/credentials/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          id: "{{ _casc_notif_cred_lookup.json.results[0].id | int }}"
+        status_code: [204]
+      when:
+        - _casc_jt10_lookup.json.count == 1
+        - _casc_notif_cred_lookup.json.count == 1
+      tags:
+        - credentials
+        - never
+
+    - name: "[CASC] | 6c) Attach Notification Webhook to JT-12 (Notify Workflow Event)"
+      ansible.builtin.uri:
+        url: "{{ controller_hostname }}/api/controller/v2/job_templates/{{ _casc_jt12_lookup.json.results[0].id }}/credentials/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          id: "{{ _casc_notif_cred_lookup.json.results[0].id | int }}"
+        status_code: [204]
+      when:
+        - _casc_jt12_lookup.json.count == 1
+        - _casc_notif_cred_lookup.json.count == 1
+      tags:
+        - credentials
+        - never
+
+    # -------------------------------------------------------------------------
+    # Step 7: Job Templates - require project, inventory, EE and credential types
+    # infra.controller_configuration v3.x renamed: role reads controller_templates,
+    # not controller_job_templates (which is the variable name in the CasC file)
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 7) Load job templates"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_job_templates.yml"
+
+    - name: "[CASC] | 7) Import job templates"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.job_templates
+      vars:
+        controller_templates: "{{ controller_job_templates | default([]) }}"
+
+    # -------------------------------------------------------------------------
+    # Step 8: Workflow Job Templates - require all JTs to exist first
+    # infra.controller_configuration v3.x renamed: role reads controller_workflows,
+    # not controller_workflow_job_templates
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 8) Load workflow job templates"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_workflow_job_templates.yml"
+
+    - name: "[CASC] | 8) Import workflow job templates"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.workflow_job_templates
+      vars:
+        controller_workflows: "{{ controller_workflow_job_templates | default([]) }}"
+
+    # -------------------------------------------------------------------------
+    # Step 9: Schedules - all disabled by default (enabled: false in CasC file)
+    # Enable individually after verifying failover readiness
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 9) Load schedules"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_schedules.yml"
+
+    - name: "[CASC] | 9) Import schedules"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.schedules
+      when: controller_schedules | default([]) | length > 0
+
+    # -------------------------------------------------------------------------
+    # Step 10: Notification templates - optional; skip if none defined in CasC
+    # infra.controller_configuration v3.x uses controller_notification_templates;
+    # the CasC file defines controller_notifications, so we map them here
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | 10) Load notification templates"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_notifications.yml"
+      tags:
+        - notifications
+        - never    # skipped unless --tags notifications is explicitly passed
+
+    - name: "[CASC] | 10) Import notification templates"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.notification_templates
+      vars:
+        controller_notification_templates: "{{ controller_notifications | default([]) }}"
+      when: controller_notifications | default([]) | length > 0
+      tags:
+        - notifications
+        - never
+      # NOTE: infra.controller_configuration 3.4.1 has a compatibility issue with AAP 2.7 Gateway
+      # where the API returns the 'messages' field as a string but the module expects a dict.
+      # Create notification templates via the AAP UI until this is resolved upstream.
+
+    # -------------------------------------------------------------------------
+    # Done
+    # -------------------------------------------------------------------------
+    - name: "[CASC] | Import complete"
+      ansible.builtin.debug:
+        msg: >-
+          ✅ AAP object import complete. All objects are now registered in
+          {{ controller_hostname }}.
+          Next step: run the Bootstrap JT for each cluster to create the
+          ansible-dr-orchestrator ServiceAccount, then run this playbook again
+          with --tags credentials to import permanent cluster credentials.
+          See docs/aap/aap-setup.md for the full procedure.
+...

@@ -1,0 +1,1169 @@
+---
+# roles/acm_dr_failover_manager/tasks/00_preflight_check.yml
+
+- name: "[STAGE 00 - Preflight] | Display Preflight stage metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🔍 STAGE 00 - Preflight & Safety Guard Validation"
+    acm_dr_failover_manager_banner_lines:
+      - "🌐 SOURCE HUB:      {{ active_hub }}"
+      - "📡 DESTINATION HUB: {{ passive_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+- name: "[STAGE 00 - Preflight] | 0.1.0) Capture initial timestamp of the DR pipeline"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_start_datetime: "{{ now(utc=true) }}"
+    acm_dr_failover_manager_start_time_fmt: "{{ now(fmt='%d/%m/%Y %H:%M:%S UTC') }}"
+    # Epoch seconds as integer - avoids datetime-vs-string type mismatch when
+    # computing elapsed time in Stage 08 (set_fact stringifies datetime objects)
+    acm_dr_failover_manager_start_epoch: "{{ '%s' | strftime }}"
+  run_once: true
+  when: acm_dr_failover_manager_start_datetime is not defined
+
+- name: "[STAGE 00 - Preflight] | 0.1.1) Validate that required variables are defined"
+  ansible.builtin.assert:
+    that:
+      - vars[item.name] is defined
+      - vars[item.name] | length > 0
+    fail_msg: "❌ FAILED! Oh. No! => Required variable '{{ item.name }}' is missing or empty."
+    success_msg: "✅ PASSED! Oh. Yes! => Variable '{{ item.name }}' validated successfully."
+  loop:
+    - { name: "active_hub" }
+    - { name: "passive_hub" }
+    - { name: "acm_dr_failover_manager_schedule_name" }
+    - { name: "acm_dr_failover_manager_backup_ns" }
+  loop_control:
+    label: "{{ item.name }}"  # variable name string
+
+# Normalize additional_passive_hubs to a list. When passed via CLI as
+# -e 'var=["hub-sa"]', Ansible receives a string because shell quoting
+# prevents YAML parsing. On AAP extra-vars (YAML textarea), the value is
+# already a parsed list. This coercion makes both paths work identically,
+# preventing "loop value must resolve to a list, not str" errors in
+# Stages 05a and 08.
+# Task 0.1.1b still helps when the variable comes from a vars file or inventory
+# (where set_fact can override it). When the value arrives via extra_vars or an
+# AAP survey, Ansible's variable precedence (extra_vars = highest) means
+# set_fact cannot override it - consumers inline-normalize instead (see 0.1.1c,
+# 0.1.1d, 0.1.1e, main.yml stage-06a gate, and all loops in stages 05a / 08).
+# Guard with length > 0 so an empty-string survey default does not invoke
+# from_yaml and produce None.
+- name: "[STAGE 00 - Preflight] | 0.1.1b) Normalize additional_passive_hubs type (string to list coercion)"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_additional_passive_hubs: "{{ acm_dr_failover_manager_additional_passive_hubs | from_yaml }}"
+  when:
+    - acm_dr_failover_manager_additional_passive_hubs is defined
+    - acm_dr_failover_manager_additional_passive_hubs is string
+    - acm_dr_failover_manager_additional_passive_hubs | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.1.1c) Assert additional_passive_hubs parses to a valid list"
+  ansible.builtin.assert:
+    that:
+      # Inline-normalize before asserting: handles string inputs ("[]", '["hub-sa"]')
+      # even when extra_vars precedence prevents set_fact from winning (task 0.1.1b).
+      - >-
+        (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+         if acm_dr_failover_manager_additional_passive_hubs is string
+         else acm_dr_failover_manager_additional_passive_hubs)
+        | default([], true) is not string
+      - >-
+        (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+         if acm_dr_failover_manager_additional_passive_hubs is string
+         else acm_dr_failover_manager_additional_passive_hubs)
+        | default([], true) is not mapping
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => acm_dr_failover_manager_additional_passive_hubs must be a list of
+      kubeconfig context strings, got {{ acm_dr_failover_manager_additional_passive_hubs | type_debug }}.
+      On the CLI, use the JSON object format:
+      -e '{"acm_dr_failover_manager_additional_passive_hubs": ["hub-01-sa", "hub-02-sa"]}'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => additional_passive_hubs parsed to a valid list
+      ({{ (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+           if acm_dr_failover_manager_additional_passive_hubs is string
+           else acm_dr_failover_manager_additional_passive_hubs)
+          | default([], true) | length }} hub(s)).
+  when:
+    - acm_dr_failover_manager_additional_passive_hubs is defined
+    - >-
+      (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+       if acm_dr_failover_manager_additional_passive_hubs is string
+       else acm_dr_failover_manager_additional_passive_hubs)
+      | default([], true) | length > 0
+
+# =============================================================================
+# STEP 0.1e: MULTI-HUB TOPOLOGY AUTO-DETECTION
+# =============================================================================
+# When additional_passive_hubs is empty, scans the kubeconfig for context names
+# matching the Hub naming pattern (containing "hub") beyond the active/passive
+# pair. Catches cases where a 3rd (or Nth) Hub exists but was not declared,
+# leaving it invisible to passive Restore recycling (Stage 05a) and the
+# compliance report. Only effective with the monolithic kubeconfig model;
+# per-cluster credentials on AAP inject only the explicitly declared clusters.
+
+- name: "[STAGE 00 - Preflight] | 0.1.1d) Read kubeconfig to scan for undeclared Hub contexts"
+  ansible.builtin.slurp:
+    src: "{{ _kubeconfig_path }}"
+  register: acm_dr_failover_manager_preflight_kubeconfig_raw
+  no_log: true  # kubeconfig contains bearer tokens
+  failed_when: false
+  vars:
+    _kubeconfig_path: >-
+      {{ acm_dr_kubeconfig_path
+         | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                   | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}
+  when:
+    - >-
+      (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+       if acm_dr_failover_manager_additional_passive_hubs is string
+       else acm_dr_failover_manager_additional_passive_hubs)
+      | default([], true) | length == 0
+
+- name: "[STAGE 00 - Preflight] | 0.1.1e) ⚠️ WARNING - Undeclared Hub-like contexts detected in kubeconfig"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [MULTI-HUB TOPOLOGY HINT]: The kubeconfig contains {{ _candidate_hubs | length }}
+      context(s) matching the Hub naming pattern beyond the current failover pair
+      ({{ active_hub }}, {{ passive_hub }}): {{ _candidate_hubs | join(', ') }}.
+      If these are additional passive Hubs, pass
+      -e '{"acm_dr_failover_manager_additional_passive_hubs": {{ _candidate_hubs | to_json }}}'
+      so they participate in passive Restore recycling (Stage 05a) and the compliance report.
+      This detection only works with the monolithic kubeconfig; per-cluster credentials
+      on AAP require setting the variable explicitly.
+  vars:
+    # Parse the kubeconfig YAML to extract context names. Defaults to {} if the
+    # slurp failed or was skipped (per-cluster credential model), so downstream
+    # filters evaluate to empty lists and the task self-skips via when.
+    _kubeconfig_data: >-
+      {{ (acm_dr_failover_manager_preflight_kubeconfig_raw.content | b64decode | from_yaml)
+         if (acm_dr_failover_manager_preflight_kubeconfig_raw is defined
+             and acm_dr_failover_manager_preflight_kubeconfig_raw.content is defined
+             and not acm_dr_failover_manager_preflight_kubeconfig_raw.failed | default(false))
+         else {} }}
+    _all_contexts: "{{ _kubeconfig_data.contexts | default([]) | map(attribute='name') | list }}"
+    # Filter for context names containing "hub" (project naming convention),
+    # then exclude the already-declared active and passive Hub contexts.
+    _candidate_hubs: >-
+      {{ _all_contexts
+         | select('search', 'hub')
+         | reject('equalto', active_hub)
+         | reject('equalto', passive_hub)
+         | list }}
+  when:
+    - >-
+      (acm_dr_failover_manager_additional_passive_hubs | from_yaml
+       if acm_dr_failover_manager_additional_passive_hubs is string
+       else acm_dr_failover_manager_additional_passive_hubs)
+      | default([], true) | length == 0
+    - _candidate_hubs | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.1.2) Validate connectivity to the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_active_hub_check
+  failed_when: false
+  check_mode: false  # connectivity check must run even in dry-run mode
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.1.3) Assert connectivity and access to the Source Hub - {{ active_hub }}"
+  ansible.builtin.assert:
+    that:
+      - not acm_dr_failover_manager_active_hub_check.failed | default(false)
+      - acm_dr_failover_manager_active_hub_check.resources is defined
+      - acm_dr_failover_manager_active_hub_check.resources | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [AUTHENTICATION / CONNECTION FAILURE]: Access to context
+      '{{ active_hub }}' failed (possible HTTP 401) or namespace
+      '{{ acm_dr_failover_manager_backup_ns }}' does not exist.
+      🛡️ ACTION REQUIRED: Verify whether your Red Hat OpenShift token
+      has expired. Run 'oc login' on the primary cluster and try again.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Connectivity, authentication, and namespace
+      '{{ acm_dr_failover_manager_backup_ns }}' existence on context
+      '{{ active_hub }}' validated.
+
+- name: "[STAGE 00 - Preflight] | 0.1.4) Check cluster-admin privileges on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Node
+  register: acm_dr_failover_manager_auth_active_check
+  failed_when: false
+  check_mode: false  # auth check must run even in dry-run mode
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.1.5) Assert administrative privileges on the Source Hub - {{ active_hub }}"
+  ansible.builtin.assert:
+    that:
+      - not acm_dr_failover_manager_auth_active_check.failed | default(false)
+      - acm_dr_failover_manager_auth_active_check.resources is defined
+      - acm_dr_failover_manager_auth_active_check.resources | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [PRIVILEGE FAILURE - RBAC]: The current ServiceAccount or Token
+      does not have global view permissions (e.g., read Nodes)
+      on cluster '{{ active_hub }}'.
+      🛡️ ACTION REQUIRED: Authenticate with an account that has the
+      'cluster-admin' ClusterRole.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Global privileges (ClusterRole) confirmed on
+      context '{{ active_hub }}'.
+
+- name: "[STAGE 00 - Preflight] | 0.1.6) Collect actual BackupSchedule state on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_schedule_name }}"
+  register: acm_dr_failover_manager_active_schedule_info
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.1.7) 🛡️ REVERSE DIRECTION GUARD - Validate that the Source Hub is ACTIVE"
+  # The guard blocks failover when the Source Hub looks passive (BackupSchedule
+  # paused or absent). allow_fenced_origin bypasses the entire BackupSchedule
+  # check, covering both "paused" (fenced after a previous failover) and
+  # "missing" (passive Hub that never had one). Without the override, the
+  # query result itself must succeed and contain at least one unpaused schedule.
+  ansible.builtin.assert:
+    that:
+      - not acm_dr_failover_manager_active_schedule_info.failed | default(false)
+      - acm_dr_failover_manager_active_schedule_info.resources is defined
+      - >-
+        (allow_fenced_origin | default(acm_dr_failover_manager_allow_fenced_origin | default(false)) | bool) or
+        (acm_dr_failover_manager_active_schedule_info.resources | length > 0)
+      - >-
+        (allow_fenced_origin | default(acm_dr_failover_manager_allow_fenced_origin | default(false)) | bool) or
+        not (acm_dr_failover_manager_active_schedule_info.resources[0].spec.paused | default(false) | bool)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [CRITICAL ARCHITECTURE ERROR]: The cluster designated as Source ({{ active_hub }}) is already in PASSIVE mode
+      (BackupSchedule paused or missing). If you are re-executing an interrupted failover,
+      pass the variable '-e allow_fenced_origin=true'.
+    success_msg: "✅ PASSED! Oh. Yes! => Source cluster ({{ active_hub }}) is validated to proceed with orchestration."
+
+# =============================================================================
+# STEP 0.1b: GITOPS BACKUP COVERAGE WARNING (LABELING)
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.1.8) Check for ArgoCD Applications on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+  register: acm_dr_failover_manager_origin_gitops_apps
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.1.9) Calculate activation backup label coverage on GitOps Applications"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_gitops_backup_label_count: >-
+      {% set ns = namespace(count=0) %}
+      {% for app in (acm_dr_failover_manager_origin_gitops_apps.resources | default([])) %}
+        {% set labels = app.metadata.labels | default({}) %}
+        {% if labels.get('cluster.open-cluster-management.io/backup', '') == 'cluster-activation' %}
+          {% set ns.count = ns.count + 1 %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.count }}
+
+- name: "[STAGE 00 - Preflight] | 0.1.10) ⚠️ WARNING - Insufficient GitOps backup coverage on Source Hub"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [BACKUP COVERAGE WARNING]: {{ acm_dr_failover_manager_origin_gitops_apps.resources | default([]) | length }}
+        ArgoCD Application(s) found on the Source Hub ({{ active_hub }}), but NONE have the label
+        'cluster.open-cluster-management.io/backup: cluster-activation'.
+      - "   This means the Restore on the destination Hub will NOT bring these Applications back -- GitOps will be empty after failover."
+      - "   See Section 6 of the main README ('GitOps Label Governance') to apply the correct label before proceeding."
+  when:
+    - acm_dr_failover_manager_origin_gitops_apps.resources | default([]) | length > 0
+    - (acm_dr_failover_manager_gitops_backup_label_count | int) == 0
+
+# =============================================================================
+# STEP 0.1c: CUSTOM DASHBOARD BACKUP COVERAGE WARNING (GRAFANA)
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.1.11) Check for custom Grafana Dashboards on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ acm_dr_failover_manager_observability_ns }}"
+    label_selectors:
+      - "{{ acm_dr_failover_manager_custom_dashboard_label }}"
+  register: acm_dr_failover_manager_origin_custom_dashboards
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.1.12) Calculate backup label coverage on custom Dashboards"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_dashboard_backup_label_count: >-
+      {% set ns = namespace(count=0) %}
+      {% for cm in (acm_dr_failover_manager_origin_custom_dashboards.resources | default([])) %}
+        {% set labels = cm.metadata.labels | default({}) %}
+        {% if labels.get('cluster.open-cluster-management.io/backup', '') != '' %}
+          {% set ns.count = ns.count + 1 %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.count }}
+
+- name: "[STAGE 00 - Preflight] | 0.1.13) ⚠️ WARNING - Custom Dashboards without backup label on Source Hub"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [BACKUP COVERAGE WARNING]: {{ acm_dr_failover_manager_origin_custom_dashboards.resources | default([]) | length }}
+        custom Grafana Dashboard(s) found on the Source Hub ({{ active_hub }}) via label
+        '{{ acm_dr_failover_manager_custom_dashboard_label }}', of which
+        {{ (acm_dr_failover_manager_origin_custom_dashboards.resources | default([]) | length) - (acm_dr_failover_manager_dashboard_backup_label_count | int) }}
+        do NOT have the 'cluster.open-cluster-management.io/backup' label.
+      - "   Dashboards without this label will NOT be restored on the destination Hub after failover -- they will be lost."
+      - "   See the 'Observability and Custom Dashboards' section of the main README to apply the correct label."
+  when:
+    - acm_dr_failover_manager_origin_custom_dashboards.resources | default([]) | length > 0
+    - (acm_dr_failover_manager_dashboard_backup_label_count | int) < (acm_dr_failover_manager_origin_custom_dashboards.resources | default([]) | length)
+
+# =============================================================================
+# STEP 0.1d: MSA BACKUP COVERAGE WARNING (MANAGEDSERVICEACCOUNT TOKENS)
+# =============================================================================
+# ManagedServiceAccount (MSA) token Secrets created by the MSA addon can be
+# momentarily unlabeled between creation and the backup controller's labeling
+# pass. If a failover fires in that window, these Secrets are excluded from
+# the OADP backup, causing spoke auto-import to fail on the destination Hub.
+# This check audits current labeling coverage and emits a warning, not a
+# blocking failure. Guarded by acm_dr_failover_manager_check_msa_labels
+# (default true) and skipped during dry-run since it queries live state.
+
+- name: "[STAGE 00 - Preflight] | 0.1.14) Query ManagedServiceAccount objects for backup label audit"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: authentication.open-cluster-management.io/v1beta1
+    kind: ManagedServiceAccount
+  register: acm_dr_failover_manager_msa_objects
+  failed_when: false
+  when:
+    - acm_dr_failover_manager_check_msa_labels | default(true) | bool
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 00 - Preflight] | 0.1.15) Query MSA-associated Secrets for backup label coverage"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Secret
+    label_selectors:
+      # Secrets created by the MSA addon carry this label key, which identifies
+      # them as MSA token Secrets regardless of the ManagedCluster namespace.
+      - "authentication.open-cluster-management.io/managed-serviceaccount"
+  register: acm_dr_failover_manager_msa_secrets
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"  # response contains Bearer tokens
+  when:
+    - acm_dr_failover_manager_check_msa_labels | default(true) | bool
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_msa_objects.resources | default([]) | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.1.16) Calculate backup label coverage on MSA Secrets"
+  ansible.builtin.set_fact:
+    # Count of MSA Secrets that already have the backup label (safe for backup)
+    acm_dr_failover_manager_msa_backup_label_count: >-
+      {% set ns = namespace(count=0) %}
+      {% for secret in (acm_dr_failover_manager_msa_secrets.resources | default([])) %}
+        {% set labels = secret.metadata.labels | default({}) %}
+        {% if labels.get('cluster.open-cluster-management.io/backup', '') != '' %}
+          {% set ns.count = ns.count + 1 %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.count }}
+    # Comma-separated names of MSA Secrets missing the backup label
+    acm_dr_failover_manager_msa_unlabeled_names: >-
+      {% set ns = namespace(names=[]) %}
+      {% for secret in (acm_dr_failover_manager_msa_secrets.resources | default([])) %}
+        {% set labels = secret.metadata.labels | default({}) %}
+        {% if labels.get('cluster.open-cluster-management.io/backup', '') == '' %}
+          {% set ns.names = ns.names + [secret.metadata.name] %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.names | join(', ') }}
+  when:
+    - acm_dr_failover_manager_check_msa_labels | default(true) | bool
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_msa_secrets.resources is defined
+    - acm_dr_failover_manager_msa_secrets.resources | default([]) | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.1.17) ⚠️ WARNING - MSA Secrets missing backup label on Source Hub"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [BACKUP COVERAGE WARNING]: {{ acm_dr_failover_manager_msa_secrets.resources | default([]) | length }}
+        ManagedServiceAccount Secret(s) found on the Source Hub ({{ active_hub }}), of which
+        {{ (acm_dr_failover_manager_msa_secrets.resources | default([]) | length) - (acm_dr_failover_manager_msa_backup_label_count | int) }}
+        do NOT have the 'cluster.open-cluster-management.io/backup' label.
+      - >-
+        These Secrets will NOT be included in OADP backups. If a failover occurs before
+        the ACM backup controller labels them, spoke auto-import may fail on the
+        destination Hub. Unlabeled: {{ acm_dr_failover_manager_msa_unlabeled_names }}.
+      - >-
+        See KCS 7039710 (https://access.redhat.com/solutions/7039710) for the MSA token
+        restore issue this check helps catch early.
+  when:
+    - acm_dr_failover_manager_check_msa_labels | default(true) | bool
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_msa_secrets.resources is defined
+    - (acm_dr_failover_manager_msa_backup_label_count | default(0) | int) < (acm_dr_failover_manager_msa_secrets.resources | default([]) | length)
+
+# =============================================================================
+# STEP 0.2: DESTINATION HUB READINESS VALIDATION (PASSIVE_HUB)
+# =============================================================================
+
+# Poll until MCH is Running. When the Planned Maintenance WF runs the failback
+# node immediately after the upgrade node, the MCH can be in Updating for 1-2
+# minutes while the operator finalizes reconciliation. A single instantaneous
+# check fails the preflight spuriously. The poll absorbs the post-upgrade
+# settling window without blocking normal failovers.
+- name: "[STAGE 00 - Preflight] | 0.2.1) Wait for MultiClusterHub Running on the Destination Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+  register: acm_dr_failover_manager_dest_mch_check
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  retries: "{{ acm_dr_failover_manager_mch_ready_retries }}"
+  delay: "{{ acm_dr_failover_manager_mch_ready_delay }}"
+  until: >-
+    acm_dr_failover_manager_dest_mch_check.resources | default([]) | length > 0
+    and (acm_dr_failover_manager_dest_mch_check.resources[0].status.phase | default('')) == 'Running'
+
+- name: "[STAGE 00 - Preflight] | 0.2.2) Check for DataProtectionApplication (OADP) on the Destination Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: oadp.openshift.io/v1alpha1
+    kind: DataProtectionApplication
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_dest_dpa_check
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+
+# Poll until BSL phase is Available. A transient Azure Management API 503 or a
+# Velero pod restart after an OLM channel upgrade can leave the BSL in
+# Unavailable state for up to a few minutes before Velero retries connectivity.
+- name: "[STAGE 00 - Preflight] | 0.2.3) Wait for BackupStorageLocation to become Available on the Destination Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: velero.io/v1
+    kind: BackupStorageLocation
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_dest_bsl_check
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  retries: "{{ acm_dr_failover_manager_bsl_ready_retries }}"
+  delay: "{{ acm_dr_failover_manager_bsl_ready_delay }}"
+  until: >-
+    acm_dr_failover_manager_dest_bsl_check.resources | default([]) | length > 0
+    and (acm_dr_failover_manager_dest_bsl_check.resources[0].status.phase | default('')) == 'Available'
+
+- name: "[STAGE 00 - Preflight] | 0.2.4) 🛡️ READINESS GATE - Validate that the Destination Hub has the required DR infrastructure"
+  ansible.builtin.assert:
+    that:
+      - not (acm_dr_failover_manager_dest_mch_check.failed | default(false))
+      - acm_dr_failover_manager_dest_mch_check.resources | default([]) | length > 0
+      - (acm_dr_failover_manager_dest_mch_check.resources[0].status.phase | default('')) == 'Running'
+      - not (acm_dr_failover_manager_dest_dpa_check.failed | default(false))
+      - acm_dr_failover_manager_dest_dpa_check.resources | default([]) | length > 0
+      - not (acm_dr_failover_manager_dest_bsl_check.failed | default(false))
+      - acm_dr_failover_manager_dest_bsl_check.resources | default([]) | length > 0
+      - (acm_dr_failover_manager_dest_bsl_check.resources[0].status.phase | default('')) == 'Available'
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [DESTINATION ENVIRONMENT NOT PREPARED]: The destination Hub '{{ passive_hub }}' does not have
+      the Disaster Recovery infrastructure required to assume leadership -- it must have
+      MultiClusterHub in 'Running' state, a configured DataProtectionApplication (OADP), and
+      a BackupStorageLocation in 'Available' state in namespace '{{ acm_dr_failover_manager_backup_ns }}'.
+
+      🛠️ ACTION REQUIRED: Provision the destination Hub before attempting failover by running:
+        ansible-playbook playbooks/setup-acm-dr-hub.yml \
+          -e k8s_target_context={{ passive_hub }} \
+          -e is_primary_hub=<true|false>
+
+      📚 For more details on prerequisites and the DR architecture, see the README.md
+      of the acm_dr_failover_manager role (roles/acm_dr_failover_manager/README.md).
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => The destination Hub '{{ passive_hub }}' has the complete DR infrastructure
+      (MultiClusterHub, OADP/DataProtectionApplication, and BackupStorageLocation) and is ready
+      to receive the failover.
+
+# =============================================================================
+# STEP 0.3: VERSION COMPATIBILITY CHECKS (PLANNED MAINTENANCE FAILOVER AWARENESS)
+# =============================================================================
+# Non-blocking checks that query OCP and RHACM versions on both Hubs and warn
+# about version skew. Critical for Planned Maintenance Failover scenarios where
+# one Hub is being upgraded while the other manages the fleet. These checks
+# NEVER block the pipeline -- they are informational warnings only.
+
+# Version data collection: all 5 k8s_info calls fire async in parallel.
+# 0.3.3z collects results; 0.3.3z+1 restores original variable names.
+# Index map: 0=source_cv  1=dest_cv  2=source_mch  3=source_mce  4=dest_mce
+- name: "[STAGE 00 - Preflight] | 0.3.1) Collect OCP ClusterVersion on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterVersion
+    name: version
+  register: acm_dr_failover_manager_source_clusterversion
+  failed_when: false
+  async: 60   # fire-and-forget; collected at 0.3.3z
+  poll: 0
+  check_mode: false
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.2) Collect OCP ClusterVersion on the Destination Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterVersion
+    name: version
+  register: acm_dr_failover_manager_dest_clusterversion
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.3) Collect MultiClusterHub version on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+  register: acm_dr_failover_manager_source_mch_check
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.3b) Collect MultiClusterEngine version on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: multicluster.openshift.io/v1
+    kind: MultiClusterEngine
+  register: acm_dr_failover_manager_source_mce_check
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.3c) Collect MultiClusterEngine version on the Destination Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: multicluster.openshift.io/v1
+    kind: MultiClusterEngine
+  register: acm_dr_failover_manager_dest_mce_check
+  failed_when: false
+  async: 60
+  poll: 0
+  check_mode: false
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.3z) Wait for parallel version queries to complete"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop:
+    - "{{ acm_dr_failover_manager_source_clusterversion }}"
+    - "{{ acm_dr_failover_manager_dest_clusterversion }}"
+    - "{{ acm_dr_failover_manager_source_mch_check }}"
+    - "{{ acm_dr_failover_manager_source_mce_check }}"
+    - "{{ acm_dr_failover_manager_dest_mce_check }}"
+  register: acm_dr_failover_manager_00_version_collector
+  until: acm_dr_failover_manager_00_version_collector.finished
+  retries: 20   # 20 x 3s = 60s max; all calls should finish in < 5s
+  delay: 3
+  loop_control:
+    label: "{{ item.ansible_job_id | default('unknown') }}"
+  check_mode: false
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+# Restore original variable names in the same index order as the loop above.
+- name: "[STAGE 00 - Preflight] | 0.3.3z+1) Restore named version query results"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_source_clusterversion: "{{ acm_dr_failover_manager_00_version_collector.results[0] }}"
+    acm_dr_failover_manager_dest_clusterversion: "{{ acm_dr_failover_manager_00_version_collector.results[1] }}"
+    acm_dr_failover_manager_source_mch_check: "{{ acm_dr_failover_manager_00_version_collector.results[2] }}"
+    acm_dr_failover_manager_source_mce_check: "{{ acm_dr_failover_manager_00_version_collector.results[3] }}"
+    acm_dr_failover_manager_dest_mce_check: "{{ acm_dr_failover_manager_00_version_collector.results[4] }}"
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+  # Guard each extraction against empty resources list (e.g., non-OCP clusters
+  # where ClusterVersion or MCH/MCE may not exist). Without this, Jinja2 raises
+  # an IndexError on resources[0] when the list is empty.
+- name: "[STAGE 00 - Preflight] | 0.3.4) Extract version metadata from both Hubs"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_source_ocp_version: >-
+      {{ (acm_dr_failover_manager_source_clusterversion.resources | default([]))[0].status.desired.version
+         | default('Unknown')
+         if (acm_dr_failover_manager_source_clusterversion.resources | default([]) | length > 0)
+         else 'Unknown' }}
+    acm_dr_failover_manager_dest_ocp_version: >-
+      {{ (acm_dr_failover_manager_dest_clusterversion.resources | default([]))[0].status.desired.version
+         | default('Unknown')
+         if (acm_dr_failover_manager_dest_clusterversion.resources | default([]) | length > 0)
+         else 'Unknown' }}
+    acm_dr_failover_manager_source_acm_version: >-
+      {{ (acm_dr_failover_manager_source_mch_check.resources | default([]))[0].status.currentVersion
+         | default('Unknown')
+         if (acm_dr_failover_manager_source_mch_check.resources | default([]) | length > 0)
+         else 'Unknown' }}
+    acm_dr_failover_manager_dest_acm_version: >-
+      {{ (acm_dr_failover_manager_dest_mch_check.resources | default([]))[0].status.currentVersion
+         | default('Unknown')
+         if (acm_dr_failover_manager_dest_mch_check.resources | default([]) | length > 0)
+         else 'Unknown' }}
+    acm_dr_failover_manager_source_mce_version: >-
+      {{ (acm_dr_failover_manager_source_mce_check.resources | default([]))[0].status.currentVersion
+         | default('Unknown')
+         if (acm_dr_failover_manager_source_mce_check.resources | default([]) | length > 0)
+         else 'Unknown' }}
+    acm_dr_failover_manager_dest_mce_version: >-
+      {{ (acm_dr_failover_manager_dest_mce_check.resources | default([]))[0].status.currentVersion
+         | default('Unknown')
+         if (acm_dr_failover_manager_dest_mce_check.resources | default([]) | length > 0)
+         else 'Unknown' }}
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+# =============================================================================
+# STEP 0.3.4x: BLOCKING VERSION COMPATIBILITY GATES
+# =============================================================================
+# Unlike the informational warnings below (0.3.5-0.3.8), these gates are
+# blocking assert checks that prevent the pipeline from proceeding when a
+# version incompatibility is detected. All gates are overridable via
+# -e acm_dr_failover_manager_skip_version_gate=true.
+
+- name: "[STAGE 00 - Preflight] | 0.3.4a) Extract major.minor versions for compatibility matrix lookup"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_source_acm_minor: >-
+      {{ 'Unknown'
+         if (acm_dr_failover_manager_source_acm_version | default('Unknown') | trim == 'Unknown')
+         else (acm_dr_failover_manager_source_acm_version | trim).split('.')[:2] | join('.') }}
+    acm_dr_failover_manager_dest_acm_minor: >-
+      {{ 'Unknown'
+         if (acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim == 'Unknown')
+         else (acm_dr_failover_manager_dest_acm_version | trim).split('.')[:2] | join('.') }}
+    acm_dr_failover_manager_source_ocp_minor: >-
+      {{ 'Unknown'
+         if (acm_dr_failover_manager_source_ocp_version | default('Unknown') | trim == 'Unknown')
+         else (acm_dr_failover_manager_source_ocp_version | trim).split('.')[:2] | join('.') }}
+    acm_dr_failover_manager_dest_ocp_minor: >-
+      {{ 'Unknown'
+         if (acm_dr_failover_manager_dest_ocp_version | default('Unknown') | trim == 'Unknown')
+         else (acm_dr_failover_manager_dest_ocp_version | trim).split('.')[:2] | join('.') }}
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.4b) 🛡️ VERSION GATE - Validate RHACM versions are within the supported range"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_source_acm_minor | default('Unknown') | trim == 'Unknown') or
+        ((acm_dr_failover_manager_source_acm_minor | trim) in acm_dr_failover_manager_supported_acm_versions)
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim == 'Unknown') or
+        ((acm_dr_failover_manager_dest_acm_minor | trim) in acm_dr_failover_manager_supported_acm_versions)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [VERSION GATE FAILURE - UNSUPPORTED RHACM VERSION]: One or both Hubs run an RHACM version
+      outside the tested range ({{ acm_dr_failover_manager_supported_acm_versions | join(', ') }}).
+
+        🌐 Source Hub ({{ active_hub }}): RHACM {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }}
+        📡 Dest Hub ({{ passive_hub }}):  RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+
+      🛡️ This automation has only been validated against the RHACM versions listed above.
+         Running against an untested version may produce unpredictable results due to
+         API changes, CRD schema evolution, or behavioral differences.
+
+      🔧 TO OVERRIDE: Pass '-e acm_dr_failover_manager_skip_version_gate=true' if you accept the risk.
+      📚 Reference: RHACM/OCP compatibility matrix in README section 7.3.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Both Hubs run a supported RHACM version
+      (Source: {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }},
+       Dest: {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}).
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.4c) 🛡️ VERSION GATE - Validate RHACM/OCP compatibility on each Hub"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_source_acm_minor | default('Unknown') | trim == 'Unknown') or
+        (acm_dr_failover_manager_source_ocp_minor | default('Unknown') | trim == 'Unknown') or
+        ((acm_dr_failover_manager_source_ocp_minor | trim) in
+         acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_source_acm_minor | trim] | default([]))
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim == 'Unknown') or
+        (acm_dr_failover_manager_dest_ocp_minor | default('Unknown') | trim == 'Unknown') or
+        ((acm_dr_failover_manager_dest_ocp_minor | trim) in
+         acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_dest_acm_minor | trim] | default([]))
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [VERSION GATE FAILURE - RHACM/OCP INCOMPATIBILITY]: At least one Hub runs an RHACM version
+      that does NOT support its installed OCP version per the official compatibility matrix.
+
+        🌐 Source Hub ({{ active_hub }}):
+           RHACM {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }}
+           on OCP {{ acm_dr_failover_manager_source_ocp_version | default('Unknown') | trim }}
+           → Supported OCP: {{ acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_source_acm_minor | trim] | default(['matrix entry missing']) | join(', ') }}
+        📡 Dest Hub ({{ passive_hub }}):
+           RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+           on OCP {{ acm_dr_failover_manager_dest_ocp_version | default('Unknown') | trim }}
+           → Supported OCP: {{ acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_dest_acm_minor | trim] | default(['matrix entry missing']) | join(', ') }}
+
+      🛡️ Running RHACM on an unsupported OCP version can cause operator failures,
+         API incompatibilities, and unsupported Restore operations.
+
+      🔧 TO OVERRIDE: Pass '-e acm_dr_failover_manager_skip_version_gate=true' if you accept the risk.
+      📚 Reference: RHACM/OCP compatibility matrix in README section 7.3
+         and https://access.redhat.com/support/policy/updates/advanced-cluster-management
+    success_msg: "✅ PASSED! Oh. Yes! => RHACM/OCP compatibility validated on both Hubs."
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.4d) 🛡️ VERSION GATE - Backward restore detection (dest RHACM older than source)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_source_acm_minor | default('Unknown') | trim == 'Unknown') or
+        (acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim == 'Unknown') or
+        (acm_dr_failover_manager_dest_acm_version | trim is
+         version(acm_dr_failover_manager_source_acm_version | trim, '>='))
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [VERSION GATE FAILURE - BACKWARD RESTORE DETECTED]: The destination Hub runs an OLDER RHACM
+      version than the source Hub. This means the Restore would attempt to apply a backup produced by
+      RHACM {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }} onto
+      RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }} -- a BACKWARD restore.
+
+        🌐 Source Hub ({{ active_hub }}): RHACM {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }}
+        📡 Dest Hub ({{ passive_hub }}):  RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+
+      🛡️ Backward restores (newer → older RHACM) are NOT guaranteed to work. The newer RHACM version
+         may have introduced schema changes, new CRD fields, or API versions that the older version
+         cannot handle. This is the highest-risk cross-version operation.
+
+      🔧 TO OVERRIDE: Pass '-e acm_dr_failover_manager_skip_version_gate=true' ONLY after consulting
+         the RHACM release notes for cross-version restore compatibility.
+      📚 Reference: README section 7.3 'Cross-Version Backup/Restore Caveat'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Forward restore direction confirmed
+      (dest RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }} >=
+       source RHACM {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }}).
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.4e) 🛡️ VERSION GATE - RHACM version gap between Hubs"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_source_acm_minor | default('Unknown') | trim == 'Unknown') or
+        (acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim == 'Unknown') or
+        (((acm_dr_failover_manager_source_acm_minor | trim).split('.')[1] | int -
+          (acm_dr_failover_manager_dest_acm_minor | trim).split('.')[1] | int) | abs
+         <= (acm_dr_failover_manager_max_acm_version_gap | int))
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [VERSION GATE FAILURE - EXCESSIVE RHACM VERSION GAP]: The RHACM versions on the two Hubs
+      differ by more than {{ acm_dr_failover_manager_max_acm_version_gap }} minor version(s).
+
+        🌐 Source Hub ({{ active_hub }}): RHACM {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }}
+        📡 Dest Hub ({{ passive_hub }}):  RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+
+      🛡️ Cross-version backup/restore has only been validated for adjacent RHACM versions
+         (e.g., 2.14 ↔ 2.15). Larger gaps may introduce cumulative schema changes that break
+         the Restore operation.
+
+      🔧 TO OVERRIDE: Pass '-e acm_dr_failover_manager_skip_version_gate=true' if you have validated
+         this version combination manually.
+         Alternatively, adjust the threshold: '-e acm_dr_failover_manager_max_acm_version_gap=2'.
+      📚 Reference: RHACM/OCP compatibility matrix in README section 7.3.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => RHACM version gap within the allowed range
+      (max {{ acm_dr_failover_manager_max_acm_version_gap }} minor version(s)).
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+# ---------------------------------------------------------------------------
+# 0.3.4f-i - Target RHACM version gates (Planned Maintenance Failover)
+# Active only when acm_dr_failover_manager_target_acm_version is set.
+# ---------------------------------------------------------------------------
+
+- name: "[STAGE 00 - Preflight] | 0.3.4f) Extract target RHACM minor version"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_target_acm_minor: >-
+      {{ 'Unknown'
+         if (acm_dr_failover_manager_target_acm_version | default('') | trim in ['', 'Unknown'])
+         else (acm_dr_failover_manager_target_acm_version | trim).split('.')[:2] | join('.') }}
+  when:
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - acm_dr_failover_manager_target_acm_version | default('') | trim | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.3.4g) 🎯 TARGET VERSION GATE - Validate target RHACM is not already installed"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim == 'Unknown') or
+        (acm_dr_failover_manager_target_acm_minor | trim != acm_dr_failover_manager_dest_acm_minor | trim)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [TARGET VERSION GATE FAILURE - ALREADY INSTALLED]: The destination Hub ({{ passive_hub }})
+      is already running RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }},
+      which matches the target version {{ acm_dr_failover_manager_target_acm_version | trim }}.
+
+        📡 Dest Hub ({{ passive_hub }}): RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+        🎯 Target RHACM Version: {{ acm_dr_failover_manager_target_acm_version | trim }}
+
+      🛡️ The upgrade target is the same version that is already installed. Please verify the
+         target version and re-run the automation with the correct value.
+
+      🔧 TO OVERRIDE: Pass '-e acm_dr_failover_manager_skip_version_gate=true'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Target RHACM {{ acm_dr_failover_manager_target_acm_version | trim }} differs from
+      the currently installed {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+      on the destination Hub. Upgrade path validated.
+  when:
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - acm_dr_failover_manager_target_acm_minor is defined
+    - acm_dr_failover_manager_target_acm_minor | trim != 'Unknown'
+    # For failback in Planned Maintenance, the destination hub was intentionally
+    # upgraded to the target version before the failback runs. Destination already
+    # at target is the correct state -- do not block.
+    - (acm_dr_failover_action | default('failover') | trim) != 'failback'
+
+- name: "[STAGE 00 - Preflight] | 0.3.4h) 🎯 TARGET VERSION GATE - Validate target RHACM is in the supported list"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        ((acm_dr_failover_manager_target_acm_minor | trim) in acm_dr_failover_manager_supported_acm_versions)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [TARGET VERSION GATE FAILURE - UNSUPPORTED TARGET VERSION]: Target RHACM version
+      {{ acm_dr_failover_manager_target_acm_version | trim }}
+      (minor: {{ acm_dr_failover_manager_target_acm_minor | trim }}) is not in the list of
+      RHACM versions supported by this automation: {{ acm_dr_failover_manager_supported_acm_versions | join(', ') }}.
+
+      🔧 TO OVERRIDE: Pass '-e acm_dr_failover_manager_skip_version_gate=true'.
+         Or add the version to '-e acm_dr_failover_manager_supported_acm_versions=[...]'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Target RHACM {{ acm_dr_failover_manager_target_acm_version | trim }} is in the
+      supported versions list.
+  when:
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - acm_dr_failover_manager_target_acm_minor is defined
+    - acm_dr_failover_manager_target_acm_minor | trim != 'Unknown'
+
+- name: "[STAGE 00 - Preflight] | 0.3.4i) 🎯 TARGET VERSION GATE - Validate target RHACM/OCP compatibility on both Hubs"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_source_ocp_minor | default('Unknown') | trim == 'Unknown') or
+        ((acm_dr_failover_manager_source_ocp_minor | trim) in
+         acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_target_acm_minor | trim] | default([]))
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false) | bool) or
+        (acm_dr_failover_manager_dest_ocp_minor | default('Unknown') | trim == 'Unknown') or
+        ((acm_dr_failover_manager_dest_ocp_minor | trim) in
+         acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_target_acm_minor | trim] | default([]))
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [TARGET VERSION GATE FAILURE - OCP INCOMPATIBILITY WITH TARGET RHACM]:
+      At least one Hub runs an OCP version that is NOT supported by the target RHACM
+      {{ acm_dr_failover_manager_target_acm_version | trim }}.
+
+        🌐 Source Hub ({{ active_hub }}):
+           RHACM {{ acm_dr_failover_manager_source_acm_version | default('Unknown') | trim }}
+           on OCP {{ acm_dr_failover_manager_source_ocp_version | default('Unknown') | trim }}
+        📡 Dest Hub ({{ passive_hub }}):
+           RHACM {{ acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+           on OCP {{ acm_dr_failover_manager_dest_ocp_version | default('Unknown') | trim }}
+        🎯 Target RHACM {{ acm_dr_failover_manager_target_acm_version | trim }}
+           → Supported OCP: {{ acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_target_acm_minor | trim] | default(['matrix entry missing']) | join(', ') }}
+
+      🛡️ Before upgrading RHACM to {{ acm_dr_failover_manager_target_acm_version | trim }},
+         upgrade OCP on the affected Hub(s) to a version in the supported range.
+
+      🔧 TO OVERRIDE: Pass '-e acm_dr_failover_manager_skip_version_gate=true'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Both Hubs' OCP versions are compatible with target RHACM
+      {{ acm_dr_failover_manager_target_acm_version | trim }}
+      (supported OCP: {{ acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_target_acm_minor | trim] | default(['N/A']) | join(', ') }}).
+  when:
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - acm_dr_failover_manager_target_acm_minor is defined
+    - acm_dr_failover_manager_target_acm_minor | trim != 'Unknown'
+
+- name: "[STAGE 00 - Preflight] | 0.3.4j) Set effective RHACM version for downstream fleet compatibility check"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_effective_acm_minor: >-
+      {{ acm_dr_failover_manager_target_acm_minor | trim
+         if (acm_dr_failover_manager_target_acm_minor is defined and
+             acm_dr_failover_manager_target_acm_minor | trim != 'Unknown')
+         else acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim }}
+    acm_dr_failover_manager_effective_acm_version: >-
+      {{ acm_dr_failover_manager_target_acm_version | trim
+         if (acm_dr_failover_manager_target_acm_version | default('') | trim | length > 0)
+         else acm_dr_failover_manager_dest_acm_version | default('Unknown') | trim }}
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.5) 🔎 VERSION SUMMARY - Hub Version Comparison"
+  ansible.builtin.debug:
+    msg:
+      - "========================================================================"
+      - " 🔎 HUB VERSION COMPARISON (Planned Maintenance Failover Awareness)"
+      - "========================================================================"
+      - ""
+      - "  🌐 SOURCE HUB ({{ active_hub }}):"
+      - "     ├─ OCP Version:   {{ acm_dr_failover_manager_source_ocp_version }}"
+      - "     ├─ RHACM Version: {{ acm_dr_failover_manager_source_acm_version }}"
+      - "     └─ MCE Version:   {{ acm_dr_failover_manager_source_mce_version }}"
+      - ""
+      - "  📡 DESTINATION HUB ({{ passive_hub }}):"
+      - "     ├─ OCP Version:   {{ acm_dr_failover_manager_dest_ocp_version }}"
+      - "     ├─ RHACM Version: {{ acm_dr_failover_manager_dest_acm_version }}"
+      - "     └─ MCE Version:   {{ acm_dr_failover_manager_dest_mce_version }}"
+      - ""
+      - "  {{ '✅ Versions are identical across both Hubs.'
+              if (acm_dr_failover_manager_source_ocp_version == acm_dr_failover_manager_dest_ocp_version
+                  and acm_dr_failover_manager_source_acm_version == acm_dr_failover_manager_dest_acm_version)
+              else '⚠️  Version differences detected -- see warnings below.' }}"
+      - "========================================================================"
+  when: acm_dr_failover_manager_version_check | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.3.6) ⚠️ WARNING - RHACM version mismatch between Hubs (Planned Maintenance Failover)"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [VERSION SKEW WARNING - RHACM]: The Source Hub ({{ active_hub }}) runs
+        RHACM {{ acm_dr_failover_manager_source_acm_version }} while the Destination Hub
+        ({{ passive_hub }}) runs RHACM {{ acm_dr_failover_manager_dest_acm_version }}.
+      - >-
+        This is expected during a Planned Maintenance Failover scenario (e.g., upgrading
+        RHACM on one Hub while the other manages the fleet). Backup/Restore across RHACM
+        versions is generally supported in the forward direction (restoring an older backup
+        on a newer RHACM), but restoring a newer backup on an older RHACM (backward restore
+        during failback) requires caution -- consult the RHACM release notes for cross-version
+        restore compatibility.
+      - >-
+        📚 Reference: RHACM Lifecycle & Support Matrices at
+        https://access.redhat.com/support/policy/updates/advanced-cluster-management
+  when:
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - acm_dr_failover_manager_source_acm_version | default('Unknown') != acm_dr_failover_manager_dest_acm_version | default('Unknown')
+    - acm_dr_failover_manager_source_acm_version | default('Unknown') != 'Unknown'
+    - acm_dr_failover_manager_dest_acm_version | default('Unknown') != 'Unknown'
+
+- name: "[STAGE 00 - Preflight] | 0.3.7) ⚠️ WARNING - OCP version mismatch between Hubs (Planned Maintenance Failover)"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [VERSION SKEW WARNING - OCP]: The Source Hub ({{ active_hub }}) runs
+        OCP {{ acm_dr_failover_manager_source_ocp_version }} while the Destination Hub
+        ({{ passive_hub }}) runs OCP {{ acm_dr_failover_manager_dest_ocp_version }}.
+      - >-
+        This is expected during a Planned Maintenance Failover scenario where the OCP
+        platform is being upgraded on one Hub. Ensure that the RHACM version installed
+        on BOTH Hubs is compatible with BOTH OCP versions -- consult the RHACM support
+        matrix for OCP version compatibility per RHACM release.
+      - >-
+        📚 Reference: RHACM Lifecycle & Support Matrices at
+        https://access.redhat.com/support/policy/updates/advanced-cluster-management
+  when:
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - acm_dr_failover_manager_source_ocp_version | default('Unknown') != acm_dr_failover_manager_dest_ocp_version | default('Unknown')
+    - acm_dr_failover_manager_source_ocp_version | default('Unknown') != 'Unknown'
+    - acm_dr_failover_manager_dest_ocp_version | default('Unknown') != 'Unknown'
+
+- name: "[STAGE 00 - Preflight] | 0.3.8) ⚠️ WARNING - Significant OCP version gap between Hubs (>1 minor version)"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [SIGNIFICANT VERSION GAP - OCP]: The Source and Destination Hubs differ by more
+        than one minor OCP version ({{ acm_dr_failover_manager_source_ocp_version }} vs
+        {{ acm_dr_failover_manager_dest_ocp_version }}). A multi-version OCP upgrade is being
+        performed across the Hub pair.
+      - >-
+        Verify that the RHACM version on BOTH Hubs supports BOTH OCP versions. Example:
+        RHACM 2.13 supports OCP 4.16-4.19, while RHACM 2.14 supports OCP 4.17-4.20 --
+        if your Spokes run OCP 4.20, the Hub must run at least RHACM 2.14 regardless
+        of its own OCP version.
+      - >-
+        📚 Full RHACM/OCP compatibility matrix in README section 7.3.
+  when:
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - acm_dr_failover_manager_source_ocp_version | default('Unknown') != 'Unknown'
+    - acm_dr_failover_manager_dest_ocp_version | default('Unknown') != 'Unknown'
+    - acm_dr_failover_manager_source_ocp_version != acm_dr_failover_manager_dest_ocp_version
+    - >-
+      ((acm_dr_failover_manager_source_ocp_version.split('.')[1] | default('0') | int) -
+       (acm_dr_failover_manager_dest_ocp_version.split('.')[1] | default('0') | int)) | abs > 1
+
+# =============================================================================
+# STEP 0.3.9: BACKUP AGE VALIDATION (RPO GATE)
+# =============================================================================
+# Queries the most recent completed Backup originated from the source Hub and
+# computes its age in hours. A stale backup means the Restore would recover
+# data from further in the past, increasing the effective RPO. Uses the same
+# clusterID label filter as Stage 03's explicit backup resolution to ensure
+# we check the SOURCE Hub's backups, not a peer Hub's. Requires version_check
+# to be enabled (the ClusterVersion query that extracts the clusterID runs in
+# task 0.3.1). Guarded by acm_dr_failover_manager_skip_backup_age_gate.
+
+- name: "[STAGE 00 - Preflight] | 0.3.9a) Query completed Backups from the Source Hub by clusterID"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: velero.io/v1
+    kind: Backup
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    label_selectors:
+      - "cluster.open-cluster-management.io/backup-cluster={{ _source_cluster_id }}"
+  register: acm_dr_failover_manager_source_backups
+  failed_when: false
+  vars:
+    _source_cluster_id: >-
+      {{ (acm_dr_failover_manager_source_clusterversion.resources[0].spec.clusterID | default(''))
+         if (acm_dr_failover_manager_source_clusterversion is defined
+             and acm_dr_failover_manager_source_clusterversion.resources | default([]) | length > 0)
+         else '' }}
+  when:
+    - not (acm_dr_failover_manager_skip_backup_age_gate | default(false) | bool)
+    - acm_dr_failover_manager_version_check | default(true) | bool
+    - _source_cluster_id | default('') | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.3.9b) Calculate age of the most recent completed Backup"
+  ansible.builtin.set_fact:
+    # Age in hours, rounded to 1 decimal place. -1 means no backup found.
+    acm_dr_failover_manager_backup_age_hours: >-
+      {{ (((now(utc=true) - (_newest_ts | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() / 3600) | round(1))
+         if _newest_ts != ''
+         else -1 }}
+    acm_dr_failover_manager_newest_backup_name: "{{ _newest_name }}"
+    acm_dr_failover_manager_newest_backup_ts: "{{ _newest_ts }}"
+  vars:
+    # Filter for Completed backups, sort by timestamp, pick the most recent
+    _completed: >-
+      {{ acm_dr_failover_manager_source_backups.resources | default([])
+         | selectattr('status.phase', 'defined')
+         | selectattr('status.phase', 'equalto', 'Completed')
+         | sort(attribute='metadata.creationTimestamp')
+         | list }}
+    _newest_name: "{{ (_completed | last).metadata.name | default('') if _completed | length > 0 else '' }}"
+    _newest_ts: "{{ (_completed | last).metadata.creationTimestamp | default('') if _completed | length > 0 else '' }}"
+  when:
+    - not (acm_dr_failover_manager_skip_backup_age_gate | default(false) | bool)
+    - acm_dr_failover_manager_source_backups is defined
+    - not acm_dr_failover_manager_source_backups.failed | default(false)
+    - acm_dr_failover_manager_source_backups.resources | default([]) | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.3.9c) ⚠️ WARNING - Backup age exceeds warning threshold (RPO risk)"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [BACKUP AGE WARNING]: The most recent completed Backup from the Source Hub
+      ({{ active_hub }}) is {{ acm_dr_failover_manager_backup_age_hours }}h old
+      (backup: {{ acm_dr_failover_manager_newest_backup_name }},
+      timestamp: {{ acm_dr_failover_manager_newest_backup_ts }}).
+      Warning threshold: {{ acm_dr_failover_manager_backup_max_age_warn }}h.
+      The Restore will recover data from {{ acm_dr_failover_manager_backup_age_hours }}h
+      ago, not from now. Verify that the BackupSchedule is running and the BSL is
+      accessible on {{ active_hub }}.
+  when:
+    - not (acm_dr_failover_manager_skip_backup_age_gate | default(false) | bool)
+    - acm_dr_failover_manager_backup_age_hours is defined
+    - (acm_dr_failover_manager_backup_age_hours | float) >= 0
+    - (acm_dr_failover_manager_backup_age_hours | float) > (acm_dr_failover_manager_backup_max_age_warn | float)
+
+- name: "[STAGE 00 - Preflight] | 0.3.9d) 🛡️ ASSERT - Backup age exceeds critical threshold (optional RPO gate)"
+  ansible.builtin.assert:
+    that:
+      - (acm_dr_failover_manager_backup_age_hours | float) <= (acm_dr_failover_manager_backup_max_age_fail | float)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => [BACKUP AGE GATE FAILURE]: The most recent completed Backup
+      is {{ acm_dr_failover_manager_backup_age_hours }}h old, exceeding the critical
+      threshold of {{ acm_dr_failover_manager_backup_max_age_fail }}h.
+      Backup: {{ acm_dr_failover_manager_newest_backup_name }}
+      ({{ acm_dr_failover_manager_newest_backup_ts }}).
+      The Restore would recover data from {{ acm_dr_failover_manager_backup_age_hours }}h
+      ago. Verify BackupSchedule health on the Source Hub ({{ active_hub }}) or pass
+      -e acm_dr_failover_manager_skip_backup_age_gate=true to override.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Backup age ({{ acm_dr_failover_manager_backup_age_hours }}h)
+      is within the critical threshold ({{ acm_dr_failover_manager_backup_max_age_fail }}h).
+  when:
+    - not (acm_dr_failover_manager_skip_backup_age_gate | default(false) | bool)
+    - (acm_dr_failover_manager_backup_max_age_fail | default(0) | int) > 0
+    - acm_dr_failover_manager_backup_age_hours is defined
+    - (acm_dr_failover_manager_backup_age_hours | float) >= 0
+
+# =============================================================================
+# 0.4) STALE STATE DETECTION ON TARGET HUB
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.4.1) 🔎 Discover Terminating namespaces on Destination Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: v1
+    kind: Namespace
+    field_selectors:
+      - status.phase=Terminating
+  register: acm_dr_failover_manager_dest_terminating_ns
+
+- name: "[STAGE 00 - Preflight] | 0.4.2) 🔎 Discover stale Restore CRs on Destination Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_dest_stale_restores
+
+- name: "[STAGE 00 - Preflight] | 0.4.3) ⚠️ WARNING - Terminating namespaces detected on Destination Hub"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [STALE STATE WARNING]: {{ acm_dr_failover_manager_dest_terminating_ns.resources | length }}
+        namespace(s) stuck in Terminating on the Destination Hub ({{ passive_hub }}):
+      - >-
+        {{ acm_dr_failover_manager_dest_terminating_ns.resources
+           | map(attribute='metadata.name') | list | join(', ') }}
+      - >-
+        These will be force-purged before the Restore to prevent Velero stalls.
+  when: (acm_dr_failover_manager_dest_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 00 - Preflight] | 0.4.4) ⚠️ WARNING - Stale Restore CRs detected on Destination Hub"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        ⚠️ [STALE STATE WARNING]: {{ acm_dr_failover_manager_dest_stale_restores.resources | length }}
+        stale Restore CR(s) found on the Destination Hub ({{ passive_hub }}):
+      - >-
+        {{ acm_dr_failover_manager_dest_stale_restores.resources
+           | map(attribute='metadata.name') | list | join(', ') }}
+      - >-
+        These will be removed before the new Restore is applied.
+  when: (acm_dr_failover_manager_dest_stale_restores.resources | default([]) | length) > 0
+
+# =============================================================================
+# STEP 0.5: OPTIONAL DR READINESS PRE-GATE
+# =============================================================================
+# When acm_dr_failover_manager_run_readiness_check is true, the
+# acm_dr_readiness_check role runs here as a read-only health assessment of
+# the DR topology before any mutation. The role checks BackupSchedule health,
+# BSL availability, RPO, Spoke count, and passive Restore CR state, and fails
+# the pipeline if any hard condition is not met. Off by default to avoid
+# breaking existing pipelines that call the failover role without the
+# readiness role installed.
+
+- name: "[STAGE 00 - Preflight] | 0.5.1) 🛡️ OPTIONAL GATE: Run DR readiness check before failover"
+  ansible.builtin.include_role:
+    name: acm_dr_readiness_check
+  vars:
+    # Cross-role vars: the readiness check role accepts k8s_source_context /
+    # k8s_dest_context as its external interface (same convention as
+    # k8s_target_context elsewhere in this project).
+    k8s_source_context: "{{ active_hub }}"  # noqa var-naming[no-role-prefix]
+    k8s_dest_context: "{{ passive_hub }}"  # noqa var-naming[no-role-prefix]
+  when: acm_dr_failover_manager_run_readiness_check | default(false) | bool
+...

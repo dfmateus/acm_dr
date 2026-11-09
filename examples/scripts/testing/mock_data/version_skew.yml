@@ -1,0 +1,15 @@
+---
+# examples/scripts/testing/mock_data/version_skew.yml
+# Scenario 6: Version skew between Source and Destination Hubs. Source runs
+# ACM 2.13.x / OCP 4.17.x, Destination runs ACM 2.14.x / OCP 4.18.x.
+# Simulates a Planned Maintenance Switchover with version change.
+_scenario_name: "version_skew"
+
+acm_dr_failover_manager_source_acm_version: "2.13.6"
+acm_dr_failover_manager_source_ocp_version: "4.17.22"
+acm_dr_failover_manager_source_mce_version: "2.13.6"
+acm_dr_failover_manager_dest_acm_version: "2.14.2"
+acm_dr_failover_manager_dest_ocp_version: "4.18.34"
+acm_dr_failover_manager_dest_mce_version: "2.14.2"
+
+...

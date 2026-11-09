@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: acm_dr_upgrade_manager
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Patches the Advanced Cluster Management operator Subscription to a new OLM
+    channel on the target Hub and waits for the MultiClusterHub to reach Running.
+    Used inside WF - ACM DR - LAB - Planned Maintenance Switchover to upgrade the
+    idle Hub automatically, without operator manual intervention.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - disasterrecovery
+    - openshift
+    - upgrade
+    - olm
+
+dependencies: []
+...

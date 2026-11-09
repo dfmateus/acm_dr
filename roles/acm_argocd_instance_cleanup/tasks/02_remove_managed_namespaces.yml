@@ -1,0 +1,41 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/02_remove_managed_namespaces.yml
+# =============================================================================
+# STAGE 02: REMOVE MANAGED NAMESPACES (APPLICATION TARGETS)
+# =============================================================================
+# Note: with the Applications already removed in Stage 01 (controller up,
+# clean prune), these namespaces should already be free of the resources
+# the instance managed. This stage only removes the "shell" (Namespace) itself.
+
+- name: "[REMOVE MANAGED NAMESPACES] | 2.1) Remove managed Namespaces - {{ acm_argocd_instance_cleanup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    kind: Namespace
+    name: "{{ item.name }}"
+    wait: true
+    wait_timeout: "{{ acm_argocd_instance_cleanup_namespace_delete_timeout | default(300) }}"
+  loop: "{{ acm_argocd_instance_cleanup_managed_namespaces | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: acm_argocd_instance_cleanup_managed_ns_removal
+  check_mode: "{{ acm_argocd_instance_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  ignore_errors: true
+
+# Namespace removal diagnostic (looped task - check .results for partial failures).
+- name: "[REMOVE MANAGED NAMESPACES DIAGNOSTIC] | ❌ Managed namespace removal timed out"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => {{ acm_argocd_instance_cleanup_managed_ns_removal.results | default([])
+      | selectattr('failed', 'defined') | selectattr('failed') | list | length }}
+      managed namespace(s) did not terminate within
+      {{ acm_argocd_instance_cleanup_namespace_delete_timeout | default(300) }}s
+      on context '{{ k8s_target_context }}'.
+      Stuck: {{ acm_argocd_instance_cleanup_managed_ns_removal.results | default([])
+      | selectattr('failed', 'defined') | selectattr('failed')
+      | map(attribute='item') | map(attribute='name') | list | join(', ') }}.
+      Check for stuck finalizers: oc get ns -o yaml --context {{ k8s_target_context }}.
+      Use examples/scripts/break-glass/force_delete_namespace.sh if needed.
+  when: acm_argocd_instance_cleanup_managed_ns_removal is failed
+...

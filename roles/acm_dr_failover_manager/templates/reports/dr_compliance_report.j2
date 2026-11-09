@@ -1,0 +1,252 @@
+{% set raw_residual = acm_dr_failover_manager_residual_spokes | default([]) %}
+{% set raw_addons = acm_dr_failover_manager_degraded_addons_list | default([]) %}
+{% set clean_residual = (raw_residual | from_json if raw_residual is string and raw_residual != '' else raw_residual) | select('truthy') | reject('equalto', '') | list %}
+{% set clean_addons = (raw_addons | from_json if raw_addons is string and raw_addons != '' else raw_addons) | select('truthy') | reject('equalto', '') | list %}
+{# Per-Spoke addon breakdown for the detailed SUBSYSTEM ANALYSIS section #}
+{% set raw_addons_by_spoke = acm_dr_failover_manager_degraded_addons_by_spoke | default([]) %}
+{% set addons_by_spoke = (raw_addons_by_spoke | from_json if raw_addons_by_spoke is string and raw_addons_by_spoke != '' else raw_addons_by_spoke) | default([]) %}
+{# Parse topology-wide hub schedule data early for use in both Executive Summary and Audit sections #}
+{% set topology_hubs = acm_dr_failover_manager_topology_hub_schedules | default([]) %}
+{% if topology_hubs is string and topology_hubs | trim | length > 0 %}{% set topology_hubs = topology_hubs | from_json %}{% endif %}
+{% set active_count = acm_dr_failover_manager_active_hub_count | default(0) | int %}
+{% set active_list = acm_dr_failover_manager_active_hub_list | default([]) %}
+{% if active_list is string and active_list | trim | length > 0 %}{% set active_list = active_list | from_json %}{% endif %}
+{% set total_hubs = topology_hubs | length if topology_hubs | length > 0 else 2 %}
+{# trim removes leading whitespace from the >- block scalar before bool conversion #}
+{% set is_split_brain = acm_dr_failover_manager_is_split_brain_detected | default(false) | trim | bool %}
+{% set is_dry_run = acm_dr_failover_manager_dry_run | default(false) | bool %}
+{% set policy_summary = (acm_dr_failover_manager_policy_summary | default('{}')) | from_json %}
+{% set policy_total = policy_summary.total | default(0) %}
+{% set policy_noncompliant = policy_summary.noncompliant | default([]) %}
+{% set gitops_summary = (acm_dr_failover_manager_gitops_summary | default('{}')) | from_json %}
+{% set gitops_total = gitops_summary.total | default(0) %}
+{% set gitops_unhealthy = gitops_summary.unhealthy | default([]) %}
+{% set placement_summary = (acm_dr_failover_manager_placement_summary | default('{}')) | from_json %}
+{% set placement_total = placement_summary.total | default(0) %}
+{% set placement_empty = placement_summary.empty | default([]) %}
+{% set dashboard_summary = (acm_dr_failover_manager_dashboard_summary | default('{}')) | from_json %}
+{% set dashboard_total = dashboard_summary.total | default(0) %}
+{% set dashboard_unprotected = dashboard_summary.unprotected | default([]) %}
+{% set version_check_enabled = acm_dr_failover_manager_version_check | default(true) | bool %}
+{% set src_acm = acm_dr_failover_manager_source_acm_version | default('N/A') | trim %}
+{% set dst_acm = acm_dr_failover_manager_dest_acm_version | default('N/A') | trim %}
+{% set src_ocp = acm_dr_failover_manager_source_ocp_version | default('N/A') | trim %}
+{% set dst_ocp = acm_dr_failover_manager_dest_ocp_version | default('N/A') | trim %}
+{% set src_mce = acm_dr_failover_manager_source_mce_version | default('N/A') | trim %}
+{% set dst_mce = acm_dr_failover_manager_dest_mce_version | default('N/A') | trim %}
+{% set fleet_compat = acm_dr_failover_manager_fleet_compat | default([]) %}
+{% set fleet_all_ok = acm_dr_failover_manager_fleet_compat_all_ok | default(true) | bool %}
+{% set fleet_incompatible_count = acm_dr_failover_manager_fleet_compat_incompatible_count | default(0) | int %}
+{% set dst_acm_minor = acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim %}
+{% set matrix = acm_dr_failover_manager_acm_ocp_matrix | default({}) %}
+{% set dst_supported_range = matrix[dst_acm_minor] | default([]) %}
+{% set skip_version_gate = acm_dr_failover_manager_skip_version_gate | default(false) | bool %}
+{% set target_acm = acm_dr_failover_manager_target_acm_version | default('') | trim %}
+{% set effective_minor = acm_dr_failover_manager_effective_acm_minor | default(dst_acm_minor) | trim %}
+{% set effective_version = acm_dr_failover_manager_effective_acm_version | default(dst_acm) | trim %}
+{% set has_target = (target_acm | length > 0) %}
+{% set effective_supported_range = matrix[effective_minor] | default([]) %}
+{% set acm_changed = version_check_enabled and src_acm != dst_acm and src_acm != 'N/A' and dst_acm != 'N/A' and src_acm != 'Unknown' and dst_acm != 'Unknown' %}
+{% set ocp_changed = version_check_enabled and src_ocp != dst_ocp and src_ocp != 'N/A' and dst_ocp != 'N/A' and src_ocp != 'Unknown' and dst_ocp != 'Unknown' %}
+{% set mce_changed = version_check_enabled and src_mce != dst_mce and src_mce != 'N/A' and dst_mce != 'N/A' and src_mce != 'Unknown' and dst_mce != 'Unknown' %}
+{% set hub_health = (acm_dr_failover_manager_new_hub_health | default('{}')) | from_json %}
+{% set h_mch_version = hub_health.mch_version | default('N/A') %}
+{% set h_mch_phase = hub_health.mch_phase | default('N/A') %}
+{% set h_mce_version = hub_health.mce_version | default('N/A') %}
+{% set h_mce_phase = hub_health.mce_phase | default('N/A') %}
+{% set h_csv_name = hub_health.csv_name | default('N/A') %}
+{% set h_csv_phase = hub_health.csv_phase | default('N/A') %}
+{% set h_oadp_total = hub_health.oadp_total | default(0) %}
+{% set h_oadp_running = hub_health.oadp_running | default(0) %}
+{% set h_oadp_not_running = hub_health.oadp_not_running | default([]) %}
+{% set unreachable_spokes = acm_dr_failover_manager_unreachable_spoke_list | default([]) %}
+{% set reachable_spokes = acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list | default([])) %}
+{# Backup age (RPO gate) - computed by preflight task 0.3.9b; -1 means no backup found #}
+{% set backup_age_hours = acm_dr_failover_manager_backup_age_hours | default(-1) | float %}
+{% set backup_warn_threshold = acm_dr_failover_manager_backup_max_age_warn | default(4) | float %}
+{% set backup_age_stale = (backup_age_hours >= 0) and (backup_age_hours > backup_warn_threshold) %}
+{% set backup_newest_name = acm_dr_failover_manager_newest_backup_name | default('N/A') %}
+{% set has_anomalies = is_split_brain or (not is_dry_run and clean_residual | length > 0) or (clean_addons | length > 0) or (policy_noncompliant | length > 0) or (gitops_unhealthy | length > 0) or (placement_empty | length > 0) or (dashboard_unprotected | length > 0) or (version_check_enabled and not fleet_all_ok) or (unreachable_spokes | length > 0) or backup_age_stale %}
+{% set total_sec = acm_dr_failover_manager_elapsed_seconds | default(0) | int %}
+{% set hours = total_sec // 3600 %}
+{% set minutes = (total_sec % 3600) // 60 %}
+{% set seconds = total_sec % 60 %}
+{% set duration_str = (hours > 0) | ternary(hours ~ 'h ' ~ minutes ~ 'm ' ~ seconds ~ 's', minutes ~ 'm ' ~ seconds ~ 's') %}
+========================================================================
+  DISASTER RECOVERY (DR) TEST REPORT – RED HAT ACM
+========================================================================
+
+1. EXECUTIVE SUMMARY
+------------------------------------------------------------------------
+ * Execution Mode:                   {{ is_dry_run | ternary('🔎 DRY-RUN (simulation - no real changes applied)', '🔥 PRODUCTION (real changes applied)') }}
+ * Source Cluster (Former Leader):   {{ active_hub }}
+ * Destination Cluster (New Leader): {{ passive_hub }}
+ * Hub Topology:                     {{ total_hubs }}-HUB FLEET ({{ active_count }} active, {{ total_hubs - active_count }} passive)
+ * Spoke Fleet Processed:            {{ acm_dr_failover_manager_spoke_list | default([]) | length }} cluster(s)
+ * Reachable (participated):        {{ reachable_spokes | length }} - {{ reachable_spokes | join(', ') if reachable_spokes | length > 0 else 'none' }}
+{% if unreachable_spokes | length > 0 %}
+ * ⚠️  Unreachable (SKIPPED):         {{ unreachable_spokes | length }} - {{ unreachable_spokes | join(', ') }}
+{% endif %}
+ * Start Date and Time:              {{ acm_dr_failover_manager_start_time_fmt | default('N/A') }}
+ * Total Operation Duration (RTO):   {{ duration_str }}
+{% if backup_age_hours >= 0 %}
+ * Last Backup Age (RPO):            {{ backup_age_hours }}h {{ backup_age_stale | ternary('⚠️ STALE (threshold: ' ~ backup_warn_threshold ~ 'h)', '✅') }} - {{ backup_newest_name }}
+{% else %}
+ * Last Backup Age (RPO):            ⚪ N/A (no completed backup found or check skipped)
+{% endif %}
+ * Test Status:                      {{ has_anomalies | ternary('⚠️ COMPLETED WITH ANOMALIES DETECTED', '✅ ABSOLUTE SUCCESS (100% COMPLIANT)') }}
+{% if version_check_enabled %}
+
+ [VERSION LANDSCAPE]
+   * Source Hub ({{ active_hub }}):       RHACM {{ src_acm }} / OCP {{ src_ocp }} / MCE {{ src_mce }}
+   * Destination Hub ({{ passive_hub }}): RHACM {{ dst_acm }} / OCP {{ dst_ocp }} / MCE {{ dst_mce }}
+{% if acm_changed or ocp_changed or mce_changed %}
+   * 🔄 VERSION CHANGE DETECTED:
+{% if acm_changed %}
+   *   RHACM: {{ src_acm }} ➜ {{ dst_acm }} (fleet now managed by the {{ (dst_acm > src_acm) | ternary('newer', 'older') }} version)
+{% endif %}
+{% if mce_changed %}
+   *   MCE:   {{ src_mce }} ➜ {{ dst_mce }}
+{% endif %}
+{% if ocp_changed %}
+   *   OCP:   {{ src_ocp }} ➜ {{ dst_ocp }}
+{% endif %}
+{% if acm_changed or ocp_changed %}
+   * ⚠️  Review the RHACM/OCP Compatibility Matrix before failback (see README Section 7.3).
+{% endif %}
+{% else %}
+   * ✅ Versions identical across both Hubs - no version skew.
+{% endif %}
+
+ [NEW LEADER HUB HEALTH ({{ passive_hub }})]
+   * MCH (MultiClusterHub):     {{ h_mch_version }}, {{ h_mch_phase }} {{ (h_mch_phase == 'Running') | ternary('✅', '⚠️') }}
+   * MCE (MultiClusterEngine):  {{ h_mce_version }}, {{ h_mce_phase }} {{ (h_mce_phase == 'Available') | ternary('✅', '⚠️') }}
+   * CSV (Operator):            {{ h_csv_name }}, {{ h_csv_phase }} {{ (h_csv_phase == 'Succeeded') | ternary('✅', '⚠️') }}
+   * OADP/Velero:               {{ h_oadp_running }}/{{ h_oadp_total }} pods Running {{ (h_oadp_not_running | length == 0) | ternary('✅', '⚠️') }}
+{% if h_oadp_not_running | length > 0 %}
+   * ⚠️  Not Running: {{ h_oadp_not_running | join(', ') }}
+{% endif %}
+
+ [FLEET COMPATIBILITY - MANAGED CLUSTERS vs {{ has_target | ternary('TARGET', 'DESTINATION') }} RHACM {{ effective_version }}]
+{% if not version_check_enabled or fleet_compat | length == 0 %}
+   * Status: ⚪ N/A: Fleet compatibility check not enabled or no Spoke data available.
+{% else %}
+{% if has_target %}
+   * 🎯 Target RHACM Version: {{ target_acm }} (upgrade validation)
+{% endif %}
+   * {{ has_target | ternary('Target', 'Destination') }} RHACM: {{ effective_version }} ({{ effective_minor }})
+{% if effective_supported_range | length > 0 %}
+   * Supported OCP Range: {{ effective_supported_range | join(', ') }}
+{% endif %}
+{% for spoke in fleet_compat %}
+{% if spoke.ocp_minor != 'N/A' %}
+   * {{ spoke.dest_rhacm_supported | ternary('✅', '❌') }} {{ spoke.name }}: OCP {{ spoke.openshift_version }} ({{ spoke.product }}) - {{ spoke.dest_rhacm_supported | ternary('Compatible', 'NOT SUPPORTED by RHACM ' ~ effective_minor) }}
+{% else %}
+   * ⚪ {{ spoke.name }}: K8s {{ spoke.kubernetes_version }} ({{ spoke.product }}) - Non-OCP (outside matrix scope)
+{% endif %}
+{% endfor %}
+   * Fleet Status: {{ fleet_all_ok | ternary('🟢 ALL SPOKES COMPATIBLE with ' ~ (has_target | ternary('target', 'destination')) ~ ' RHACM ' ~ effective_version, '🚨 ' ~ fleet_incompatible_count | string ~ ' SPOKE(S) INCOMPATIBLE with ' ~ (has_target | ternary('target', 'destination')) ~ ' RHACM ' ~ effective_version) }}
+{% if not fleet_all_ok %}
+   * ⚠️  ACTION REQUIRED: Upgrade incompatible Spokes to OCP {{ effective_supported_range | first | default('?') }}+ before proceeding with this RHACM version.
+{% if skip_version_gate %}
+   * 🔓 OVERRIDE ACTIVE: Pipeline proceeded despite incompatibility (acm_dr_failover_manager_skip_version_gate=true).
+{% else %}
+   * 🛡️  To proceed despite incompatibility, re-run with: -e acm_dr_failover_manager_skip_version_gate=true
+{% endif %}
+{% endif %}
+{% endif %}
+{% endif %}
+
+2. AUDIT AND SECURITY DETAIL
+------------------------------------------------------------------------
+ [SECURITY ANALYSIS - SPLIT-BRAIN]
+   * Status: {{ is_split_brain | ternary('🚨 MAXIMUM ALERT: ACTIVE SPLIT-BRAIN DETECTED!', '🟢 SECURE: Only one Hub leads data writes.') }}
+   * Active Hubs: {{ active_count }} / {{ total_hubs }} total {{ (active_count == 1) | ternary('✅', (active_count == 0) | ternary('⚠️', '🚨')) }}
+{% if active_list | length > 0 %}
+   * Writing Backups: {{ active_list | join(', ') }}
+{% endif %}
+{% if topology_hubs | length > 0 %}
+   * Per-Hub BackupSchedule:
+{% for hub in topology_hubs %}
+   *   {{ hub.is_active | ternary('🔥', '⏸️ ') }} {{ hub.context }}: {{ 'ACTIVE (writing backups)' if hub.is_active else ('PAUSED' if hub.schedule_exists else 'NO SCHEDULE') }}
+{% endfor %}
+{% endif %}
+   * Recommended Action: {{ is_split_brain | ternary('Pause the BackupSchedule on: ' ~ (active_list | reject('equalto', passive_hub) | join(', ')) ~ '.', 'No action required. Environment successfully isolated ✅') }}
+
+ [PURGE ANALYSIS - RESIDUAL STATE]
+   * Status: {{ '⚪ NOT EVALUATED: in DRY-RUN the old Hub is not actually purged (expected behavior).' if is_dry_run else ((clean_residual | length > 0) | ternary('⚠️ ANOMALY: Incomplete removal on the old Hub.', '🟢 SECURE: Old Hub purged successfully.')) }}
+   * Affected Clusters: {{ ('Not applicable in DRY-RUN - ' ~ (clean_residual | join(', ')) ~ ' still present, as expected.') if is_dry_run else ((clean_residual | length > 0) | ternary(clean_residual | join(', '), 'No orphan records detected (Cleanup 100% OK) ✅')) }}
+
+ [SUBSYSTEM ANALYSIS - SPOKE ADD-ONS]
+{% if clean_addons | length == 0 %}
+   * Status: 🟢 SECURE: All Add-ons report Available: True.
+   * Detail: No failures detected. All subsystems operational 🚀
+{% else %}
+   * Status: ⚠️ DEGRADED: {{ clean_addons | length }} addon(s) not Available across {{ addons_by_spoke | length }} Spoke(s).
+{% for entry in addons_by_spoke %}
+   * ⚠️ {{ entry.spoke }}: {{ entry.count }}/{{ entry.total }} addon(s) degraded - {{ entry.addons | join(', ') }}
+{% endfor %}
+   * Recommended Action: check ManagedClusterAddon status on the Hub (oc get managedclusteraddon -n <spoke-name>) and verify addon pod scheduling on affected Spokes (node resources, tolerations, Pending pods).
+{% endif %}
+
+ [FLEET REACHABILITY - UNREACHABLE SPOKES]
+{% if unreachable_spokes | length == 0 %}
+   * Status: 🟢 ALL SPOKES REACHABLE: Every cluster in the fleet responded to the API probe.
+{% else %}
+   * Status: ⚠️ {{ unreachable_spokes | length }} SPOKE(S) UNREACHABLE: These clusters did not respond to the API probe and were excluded from sanitization (Stage 07) and verification (Stage 04).
+{% for spoke in unreachable_spokes %}
+   * ❌ {{ spoke }}: API unreachable during connectivity probe (Stage 01, task 1.4)
+{% endfor %}
+   * Recommended Action: verify each cluster's status (network, API server, node health). If permanently deactivated, run a detach operation (acm_dr_spoke_manager_action=detach) to remove the ManagedCluster from the fleet and clean up the fleet Secret.
+{% endif %}
+
+ [GOVERNANCE ANALYSIS - POLICIES]
+   * Status: {{ '⚪ N/A: No Policies detected in this environment.' if policy_total == 0 else ((policy_noncompliant | length > 0) | ternary('⚠️ ATTENTION: Non-compliant Policies detected.', '🟢 SECURE: All Policies are Compliant.')) }}
+   * Detail: {{ (policy_total | string ~ ' root Policy(ies) audited.') if policy_total > 0 else 'Policy-based governance not in use (or not restored) on this Hub.' }}{{ (' Non-Compliant: ' ~ (policy_noncompliant | join(', '))) if policy_noncompliant | length > 0 else '' }}
+{% if is_dry_run and policy_total > 0 %}
+   * Note (DRY-RUN): reflects the ALREADY EXISTING state on the destination Hub, not a preview of what the Restore would bring.
+{% endif %}
+
+ [GITOPS ANALYSIS - ARGOCD APPLICATIONS]
+   * Status: {{ '⚪ N/A: No ArgoCD Applications detected in this environment.' if gitops_total == 0 else ((gitops_unhealthy | length > 0) | ternary('⚠️ ATTENTION: Applications not Synced/Healthy detected.', '🟢 SECURE: All Applications are Synced and Healthy.')) }}
+   * Detail: {{ (gitops_total | string ~ ' Application(s) audited.') if gitops_total > 0 else 'GitOps/ArgoCD not in use (or not restored) on this Hub.' }}{{ (' Issues: ' ~ (gitops_unhealthy | join(', '))) if gitops_unhealthy | length > 0 else '' }}
+{% if is_dry_run and gitops_total > 0 %}
+   * Note (DRY-RUN): reflects the ALREADY EXISTING state on the destination Hub, not a preview of what the Restore would bring.
+{% endif %}
+
+ [PLACEMENT ANALYSIS - CLUSTER DECISIONS]
+   * Status: {{ '⚪ N/A: No PlacementDecision detected in this environment.' if placement_total == 0 else ((placement_empty | length > 0) | ternary('⚠️ ATTENTION: PlacementDecision(s) with no resolved clusters.', '🟢 SECURE: All Placements resolved against the new Hub fleet.') ) }}
+   * Detail: {{ (placement_total | string ~ ' PlacementDecision(s) audited.') if placement_total > 0 else 'No Placement in use (or not restored) on this Hub.' }}{{ (' Empty: ' ~ (placement_empty | join(', '))) if placement_empty | length > 0 else '' }}
+{% if is_dry_run and placement_total > 0 %}
+   * Note (DRY-RUN): reflects the ALREADY EXISTING state on the destination Hub, not a preview of what the Restore would bring.
+{% endif %}
+
+ [OBSERVABILITY ANALYSIS - CUSTOM GRAFANA DASHBOARDS]
+   * Status: {{ '⚪ N/A: No custom Dashboard detected in this environment.' if dashboard_total == 0 else ((dashboard_unprotected | length > 0) | ternary('⚠️ ATTENTION: Dashboard(s) without backup label detected.', '🟢 SECURE: All custom Dashboards are protected by backup.')) }}
+   * Detail: {{ (dashboard_total | string ~ ' custom Dashboard(s) audited (label ' ~ acm_dr_failover_manager_custom_dashboard_label ~ ').') if dashboard_total > 0 else 'No custom Grafana Dashboard in use (default RHACM dashboards do not require backup).' }}{{ (' Without backup label: ' ~ (dashboard_unprotected | join(', '))) if dashboard_unprotected | length > 0 else '' }}
+{% if dashboard_unprotected | length > 0 %}
+   * Recommended Action: apply the 'cluster.open-cluster-management.io/backup: cluster' label on these ConfigMaps to protect them in the next failover (see the "Observability and Custom Dashboards" section of the README).
+{% endif %}
+{% if is_dry_run and dashboard_total > 0 %}
+   * Note (DRY-RUN): reflects the ALREADY EXISTING state on the destination Hub, not a preview of what the Restore would bring.
+{% endif %}
+
+ [MULTI-HUB TOPOLOGY - ADDITIONAL PASSIVE HUBS]
+{% set passive_hubs = acm_dr_failover_manager_passive_hub_status | default([]) %}
+{% if passive_hubs is string %}{% set passive_hubs = passive_hubs | from_json %}{% endif %}
+{% if passive_hubs | length == 0 %}
+   * Status: ⚪ N/A: No additional passive hubs configured (legacy 2-hub mode).
+{% else %}
+{% for hub in passive_hubs %}
+{# Restore CR status #}
+{% set restore_icon = '✅' if hub.restore_found else ('⚠️' if hub.reachable else '❌') %}
+{% set restore_text = 'Passive Sync Restore ACTIVE' if hub.restore_found else ('Restore NOT FOUND (recycle may have failed)' if hub.reachable else 'UNREACHABLE (skipped)') %}
+{# BackupSchedule status: active schedule on a passive hub is a split-brain risk #}
+{% set schedule_text = ', BackupSchedule ACTIVE ⚠️' if (hub.schedule_active | default(false)) else '' %}
+   * {{ restore_icon }} {{ hub.context }}: {{ restore_text }}{{ schedule_text }}
+{% endfor %}
+{% set all_ok = passive_hubs | selectattr('restore_found') | list | length == passive_hubs | length %}
+{% set any_schedule_active = passive_hubs | selectattr('schedule_active', 'defined') | selectattr('schedule_active') | list | length > 0 %}
+   * Fleet Status: {{ '🟢 ALL PASSIVE HUBS RECYCLED' if all_ok else '🚨 SOME PASSIVE HUBS NOT RECYCLED, check connectivity and re-run' }}{{ ' ⚠️ WARNING: BackupSchedule active on peer hub(s)' if any_schedule_active else '' }}
+{% endif %}
+========================================================================

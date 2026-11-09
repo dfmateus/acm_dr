@@ -1,0 +1,37 @@
+---
+# roles/acm_dr_spoke_manager/tasks/main.yml
+
+- name: "MAIN | Initializing Spoke (Managed Cluster) lifecycle management"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_spoke_manager_banner_title: "🔄 INITIALIZING: ACM DR SPOKE MANAGER (LIFECYCLE)"
+    acm_dr_spoke_manager_banner_lines:
+      - "🎯 HUB CONTEXT:    {{ acm_dr_spoke_manager_hub_context }}"
+      - "🎯 SPOKE CONTEXT:  {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+      - "📦 CLUSTER NAME:   {{ acm_dr_spoke_manager_cluster_name }}"
+  run_once: true
+  tags:
+    - always
+
+- name: "[SPOKE MANAGER] | Execute Full Onboarding (SA + Fleet + Import)"
+  ansible.builtin.import_tasks: 00_spoke_onboard.yml
+  when: acm_dr_spoke_manager_action | default('prep') == 'onboard'
+  tags:
+    - spoke_onboard
+    - onboard
+
+- name: "[SPOKE MANAGER] | Execute Onboarding / Preparation flow (Import)"
+  ansible.builtin.import_tasks: 01_spoke_prep.yml
+  when: acm_dr_spoke_manager_action | default('prep') == 'prep'
+  tags:
+    - spoke_prep
+    - attach
+
+- name: "[SPOKE MANAGER] | Execute Detach / Klusterlet Cleanup flow"
+  ansible.builtin.import_tasks: 02_spoke_detach.yml
+  when: acm_dr_spoke_manager_action | default('prep') == 'detach'
+  tags:
+    - spoke_detach
+    - detach
+...

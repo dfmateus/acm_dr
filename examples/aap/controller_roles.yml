@@ -1,0 +1,104 @@
+---
+# examples/aap/controller_roles.yml
+#
+# RBAC definitions for the MCP optional agent users.
+# Companion to controller_users.yml.
+#
+# IMPORT ORDER: roles must be imported after users and all AAP objects they
+# reference (JTs, WJTs) are created. Run this file last in the CasC sequence.
+#
+# PLACEHOLDER VARIABLES - the role object names below must match your environment.
+# The names below match the collection defaults. If you renamed JTs or WJTs
+# in your import-vars.yml, update the names here to match.
+#
+# HOW TO USE:
+#   # MCP read-only mode (default): import aiops-readonly roles only
+#   # MCP read-write mode: import both aiops-readonly and aiops-operator roles
+#   ansible-playbook examples/setup-aap-from-casc.yml \
+#     -e @examples/aap/import-vars.yml \
+#     --tags roles
+#
+# See examples/mcp/docs/03-read-write.md for a description of the RBAC
+# design decisions and the risk model for each permission grant.
+
+controller_roles:
+
+  # ===========================================================================
+  # aiops-readonly: view-only access, no execute on any JT or WJT
+  # ===========================================================================
+
+  # Organization membership (required for any access below)
+  - user: "aiops-readonly"
+    role: "member"
+    organization: "{{ aap_organization }}"
+
+  # Read access to all DR Job Templates
+  - user: "aiops-readonly"
+    role: "read"
+    job_templates:
+      - "JT - ACM DR - LAB - Hub Switchover"
+      - "JT - ACM DR - LAB - DR Readiness Check"
+      - "JT - ACM DR - LAB - Switchover State Diagnostics"
+      - "JT - ACM DR - LAB - Check Approval Outcome"
+      - "JT - ACM DR - LAB - Notify Workflow Event"
+      - "JT - ACM DR - LAB - Spoke Onboarding"
+
+  # Read access to all DR Workflow Job Templates
+  - user: "aiops-readonly"
+    role: "read"
+    workflow_job_templates:
+      - "WF - ACM DR - LAB - Hub Switchover"
+      - "WF - ACM DR - LAB - Planned Maintenance Switchover"
+      - "WF - ACM DR - LAB - Spoke Onboarding Batch"
+      - "WF - ACM DR - LAB - Full DR Drill"
+      - "WF - ACM DR - LAB - Full Lab Rebuild"
+
+  # ===========================================================================
+  # aiops-operator: execute on low-risk JTs only; WF-01 and WF-02 excluded
+  # ===========================================================================
+  # Use this user only when the MCP server is in read-write mode.
+  # The execute grants below allow the agent to launch DR support operations.
+  # WF-01 and WF-02 are restricted to read-only for this user to prevent
+  # the agent from initiating a production failover unintentionally.
+
+  # Organization membership
+  - user: "aiops-operator"
+    role: "member"
+    organization: "{{ aap_organization }}"
+
+  # Execute permission on low-risk JTs only
+  # DR Readiness Check: read-only operation, no state changes
+  # Notify Workflow Event: sends notifications, no cluster changes
+  # Spoke Onboarding: adds a spoke, reversible
+  - user: "aiops-operator"
+    role: "execute"
+    job_templates:
+      - "JT - ACM DR - LAB - DR Readiness Check"
+      - "JT - ACM DR - LAB - Notify Workflow Event"
+      - "JT - ACM DR - LAB - Spoke Onboarding"
+
+  # Execute permission on WF-05 (Full DR Drill) only.
+  # WF-05 has a mandatory human approval gate; the agent can start it
+  # but cannot complete the failover without a human approving the gate.
+  - user: "aiops-operator"
+    role: "execute"
+    workflow_job_templates:
+      - "WF - ACM DR - LAB - Full DR Drill"
+
+  # Read-only on all other JTs and WJTs including WF-01 and WF-02.
+  # The Controller returns HTTP 403 if the agent attempts to launch these.
+  - user: "aiops-operator"
+    role: "read"
+    job_templates:
+      - "JT - ACM DR - LAB - Hub Switchover"
+      - "JT - ACM DR - LAB - Switchover State Diagnostics"
+      - "JT - ACM DR - LAB - Check Approval Outcome"
+
+  - user: "aiops-operator"
+    role: "read"
+    workflow_job_templates:
+      - "WF - ACM DR - LAB - Hub Switchover"
+      - "WF - ACM DR - LAB - Planned Maintenance Switchover"
+      - "WF - ACM DR - LAB - Spoke Onboarding Batch"
+      - "WF - ACM DR - LAB - Full Lab Rebuild"
+...

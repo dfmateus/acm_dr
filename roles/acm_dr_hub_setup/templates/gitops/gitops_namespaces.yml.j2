@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ acm_dr_hub_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}
+  labels:
+    openshift.io/cluster-monitoring: "true"
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    security.openshift.io/scc.podSecurityLabelSync: "true"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ acm_dr_hub_setup_policies_namespace | default('acm-policies') }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}
+---
+# Real-world finding: the AppDemo ApplicationSet used the syncOption 'CreateNamespace=true' so
+# that ArgoCD itself would create these namespaces on demand. The 'in-cluster' Secret auto-generated
+# by the OpenShift GitOps operator for each additional (non-default) ArgoCD instance restricts the
+# gitops-engine to 'namespaced mode' for CLUSTER-SCOPED resources (Namespace, ClusterRole, etc.) -
+# creating a Namespace from scratch always fails with "cluster level Namespace ... can not be managed
+# when in namespaced mode", regardless of RBAC. The Governance instance never hits this issue
+# because it only writes Policies (a namespaced resource) inside the policies namespace, which
+# already exists (see above). Pre-creating the namespaces here, following the same pattern, avoids
+# the problem - but the 'argocd.argoproj.io/managed-by' label is also mandatory: it triggers the
+# automatic bootstrap (by the OpenShift GitOps operator) of the Role/RoleBinding that authorizes
+# this ArgoCD instance to manage NAMESPACED resources within the namespace; without it, ArgoCD
+# itself refuses to manage any resource there with "namespace ... is not managed", regardless of RBAC.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ acm_dr_hub_setup_demo_app1_name | default('demo-app-01') }}
+  labels:
+    argocd.argoproj.io/managed-by: {{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ acm_dr_hub_setup_demo_app2_name | default('demo-app-02') }}
+  labels:
+    argocd.argoproj.io/managed-by: {{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}

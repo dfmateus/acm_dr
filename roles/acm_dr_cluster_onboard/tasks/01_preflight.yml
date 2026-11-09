@@ -1,0 +1,62 @@
+---
+# =============================================================================
+# BOOTSTRAP PREFLIGHT - connectivity and variable validation
+# =============================================================================
+
+- name: "[BOOTSTRAP - Preflight] | 1.1.1) Assert the automation namespace is defined"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_cluster_onboard_namespace | default('', true) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => acm_dr_cluster_onboard_namespace is empty.
+      Pass it with -e acm_dr_cluster_onboard_namespace=<namespace> or accept the default 'aap'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Target namespace: {{ acm_dr_cluster_onboard_namespace }}
+
+- name: "[BOOTSTRAP - Preflight] | 1.1.2) Assert the ServiceAccount name is defined"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_cluster_onboard_sa_name | default('', true) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => acm_dr_cluster_onboard_sa_name is empty.
+      Accept the default 'ansible-dr-orchestrator' or pass -e acm_dr_cluster_onboard_sa_name=<name>.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => ServiceAccount name: {{ acm_dr_cluster_onboard_sa_name }}
+
+- name: "[BOOTSTRAP - Preflight] | 1.1.3) Assert at least one connection method is available"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (k8s_target_context | default('') | length > 0) or
+        (lookup('ansible.builtin.env', 'K8S_AUTH_HOST') | length > 0) or
+        (lookup('ansible.builtin.env', 'KUBECONFIG') | length > 0) or
+        (lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | length > 0)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => No cluster connection method found.
+      Provide one of: k8s_target_context (-e), K8S_AUTH_HOST + K8S_AUTH_API_KEY (AAP built-in credential),
+      or KUBECONFIG / K8S_AUTH_KUBECONFIG (local kubeconfig path).
+    success_msg: "✅ PASSED! Oh. Yes! => Cluster connection method detected."
+
+- name: "[BOOTSTRAP - Preflight] | 1.2.1) Verify cluster connectivity (read Namespace)"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context | default(omit) }}"
+    api_version: v1
+    kind: Namespace
+    name: kube-system
+  register: acm_dr_cluster_onboard_connectivity_check
+  ignore_errors: true
+  no_log: "{{ acm_dr_cluster_onboard_debug_no_log | bool }}"
+
+- name: "[BOOTSTRAP - Preflight] | 1.2.2) Assert cluster is reachable"
+  ansible.builtin.assert:
+    that:
+      - not acm_dr_cluster_onboard_connectivity_check.failed | default(false)
+      - acm_dr_cluster_onboard_connectivity_check.resources | default([]) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Cannot reach the cluster API.
+      Check that the credential is valid and the API endpoint is reachable.
+      Context used: {{ k8s_target_context | default('(native K8S_AUTH_* env vars)') }}
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Cluster API is reachable.
+      Context: {{ k8s_target_context | default('(native K8S_AUTH_* env vars)') }}
+...

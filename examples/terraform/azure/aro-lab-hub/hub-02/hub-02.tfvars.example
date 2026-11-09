@@ -1,0 +1,34 @@
+# hub-02.tfvars.example - ARO Lab Hub 02
+#
+# One of two interchangeable hub clusters for the ACM DR lab. Either hub can be
+# the active source (BackupSchedule enabled) or the passive destination (Restore).
+# The role (active vs passive) is determined at failover time, not by the cluster name.
+#
+# See README.md for setup steps.
+# =============================================================================
+
+cluster_name = "acmdr-lab-hub-02"
+domain       = "acmdrlabhub02"
+location     = "eastus"
+aro_version  = "4.20.15"
+
+# Hub 02 occupies the 10.1.x.x block - no overlap with Hub 01 or the spoke.
+aro_virtual_network_cidr_block = "10.1.0.0/20"
+aro_control_subnet_cidr_block  = "10.1.0.0/23"
+aro_machine_subnet_cidr_block  = "10.1.2.0/23"
+
+main_vm_size      = "Standard_D8s_v3"
+worker_vm_size    = "Standard_D8s_v3"
+worker_node_count = 3
+
+pull_secret_path = null
+
+api_server_profile = "Public"
+ingress_profile    = "Public"
+
+tags = {
+  environment = "lab"
+  owner       = "dfmateus"
+  project     = "dfmateus.acm_dr"
+  role        = "hub"
+}

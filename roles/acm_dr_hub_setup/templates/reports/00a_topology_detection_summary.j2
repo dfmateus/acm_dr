@@ -1,0 +1,33 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 75 %}
+{% set _thin = '-' * 75 %}
+{% set _role = acm_dr_hub_setup_detected_dr_role | default('none') | trim | upper %}
+{% set _role_emoji = {
+  'ACTIVE': '🟢', 'PASSIVE': '🔵', 'FENCED': '🟡', 'PARTIAL': '🟠', 'NONE': '⚪'
+} %}
+{% set _declared = acm_dr_hub_setup_is_primary_hub | bool | ternary('PRIMARY (ACTIVE)', 'SECONDARY (PASSIVE)') %}
+{% set _has_artifacts = acm_dr_hub_setup_detected_has_dr_artifacts | default(false) | bool %}
+{% set _mismatch = (
+  (acm_dr_hub_setup_is_primary_hub | bool and _role == 'PASSIVE') or
+  (not acm_dr_hub_setup_is_primary_hub | bool and _role == 'ACTIVE')
+) %}
+{{ _sep }}
+ 🔎 DR TOPOLOGY DETECTION RESULTS
+{{ _sep }}
+ 🎯 TARGET CONTEXT:       {{ k8s_target_context }}
+ 🎛️  DECLARED HUB TYPE:    {{ _declared }}
+ 🔍 DETECTED DR ROLE:     {{ _role_emoji.get(_role, '⚪') }} {{ _role }}
+{{ _thin }}
+ 📋 DETECTED ARTIFACTS:
+    BackupSchedule:          {{ acm_dr_hub_setup_detected_schedule_exists | bool | ternary('PRESENT', 'ABSENT') }}{{ (acm_dr_hub_setup_detected_schedule_exists | bool) | ternary(' (paused: ' ~ (acm_dr_hub_setup_detected_schedule_paused | bool | ternary('YES', 'NO')) ~ ')', '') }}
+    Passive Sync Restore:    {{ acm_dr_hub_setup_detected_sync_restore_count | default(0) }} CR(s)
+    DPA:                     {{ acm_dr_hub_setup_detected_dpa_exists | bool | ternary('PRESENT', 'ABSENT') }}
+    BSL:                     {{ acm_dr_hub_setup_detected_bsl_available | bool | ternary('AVAILABLE', 'NOT FOUND') }}
+{{ _thin }}
+{% if _mismatch %}
+ ⚠️  MISMATCH: Declared {{ _declared }} but detected {{ _role }}. Verify hub assignment.
+{% elif _has_artifacts %}
+ ✅ TOPOLOGY: Cluster has existing DR artifacts ({{ _role }}). Force flag required to re-provision.
+{% else %}
+ ✅ TOPOLOGY: No existing DR artifacts. Cluster is ready for provisioning.
+{% endif %}
+{{ _sep }}

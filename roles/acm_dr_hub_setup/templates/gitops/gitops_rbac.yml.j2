@@ -1,0 +1,59 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-admin-acm-ocp-{{ k8s_target_context }}
+subjects:
+  - kind: ServiceAccount
+    name: openshift-gitops-acm-argocd-application-controller
+    namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+# Real-world finding: the AppDemo ArgoCD instance had no ClusterRoleBinding equivalent to
+# the ACM Governance instance's. The AppDemo ApplicationSet uses the syncOption
+# 'CreateNamespace=true', which requires the application-controller to be able to manage
+# the cluster-scoped 'Namespace' resource - without this permission, the sync fails with
+# "cluster level Namespace ... can not be managed when in namespaced mode".
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-admin-appdemo-{{ k8s_target_context }}
+subjects:
+  - kind: ServiceAccount
+    name: openshift-gitops-appdemo-argocd-application-controller
+    namespace: {{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: applicationset-placement-reader
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+rules:
+  - apiGroups:
+      - cluster.open-cluster-management.io
+    resources:
+      - placementdecisions
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: applicationset-placement-reader
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+subjects:
+  - kind: ServiceAccount
+    name: openshift-gitops-acm-applicationset-controller
+    namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: applicationset-placement-reader

@@ -1,0 +1,31 @@
+---
+# examples/scripts/testing/mock_data/degraded_addons.yml
+# Scenario 3: Degraded ManagedClusterAddons on 3 Spokes. The per-Spoke
+# breakdown shows which addons are degraded on each Spoke.
+_scenario_name: "degraded_addons"
+
+acm_dr_failover_manager_degraded_addons_list:
+  - "iks-spoke-01/managed-serviceaccount"
+  - "aks-spoke-01/config-policy-controller"
+  - "aks-spoke-01/governance-policy-framework"
+  - "gke-spoke-01/work-manager"
+
+acm_dr_failover_manager_degraded_addons_by_spoke:
+  - spoke: "iks-spoke-01"
+    count: 1
+    total: 6
+    addons:
+      - "managed-serviceaccount"
+  - spoke: "aks-spoke-01"
+    count: 2
+    total: 6
+    addons:
+      - "config-policy-controller"
+      - "governance-policy-framework"
+  - spoke: "gke-spoke-01"
+    count: 1
+    total: 6
+    addons:
+      - "work-manager"
+
+...

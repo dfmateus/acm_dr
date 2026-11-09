@@ -1,0 +1,85 @@
+---
+# examples/playbooks/setup-mcp-users.yml
+# =============================================================================
+# CREATE MCP AGENT USERS AND RBAC FOR THE MCP OPTIONAL
+# =============================================================================
+# Creates the aiops-readonly and aiops-operator AAP users, then assigns the
+# RBAC roles defined in examples/aap/controller_roles.yml.
+#
+# Run this AFTER setup-aap-from-casc.yml has created all JTs and WJTs.
+# Roles that reference JTs or WJTs will fail if those objects do not exist yet.
+#
+# REQUIRED VARIABLES - add these to .local/aap/import-vars.yml before running:
+#   aiops_readonly_password    password for aiops-readonly (any strong value)
+#   aiops_operator_password    password for aiops-operator (any strong value)
+#
+# Usage:
+#   ansible-playbook examples/playbooks/setup-mcp-users.yml \
+#     -e @.local/aap/import-vars.yml
+
+- name: "Create MCP agent users and RBAC for the MCP optional"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    controller_hostname: "{{ lookup('ansible.builtin.env', 'CONTROLLER_HOST', default='') }}"
+    controller_oauthtoken: "{{ lookup('ansible.builtin.env', 'CONTROLLER_OAUTH_TOKEN', default='') }}"
+    controller_validate_certs: true    # override to false for lab/dev with self-signed certs
+
+    _casc_dir: "{{ playbook_dir }}/../aap-config"
+
+  pre_tasks:
+    - name: "[PREFLIGHT] | Validate required variables"
+      ansible.builtin.assert:
+        that:
+          - controller_hostname | length > 0
+          - controller_oauthtoken | length > 0
+          - aap_organization | default('') | length > 0
+          - aiops_readonly_password | default('') | length > 0
+          - aiops_operator_password | default('') | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Missing required variables. Add
+          aiops_readonly_password and aiops_operator_password to
+          .local/aap/import-vars.yml and pass it with -e @file.
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => All required variables present.
+          Connecting to {{ controller_hostname }}.
+      no_log: false
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Step 1: Users
+    # -------------------------------------------------------------------------
+    - name: "[MCP USERS] | 1) Load user definitions"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_users.yml"
+
+    - name: "[MCP USERS] | 1) Import aiops users"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.users
+      vars:
+        # infra.controller_configuration.users reads controller_user_accounts,
+        # not controller_users (same renaming pattern as job_templates/workflows)
+        controller_user_accounts: "{{ controller_users | default([]) }}"
+
+    # -------------------------------------------------------------------------
+    # Step 2: Roles (RBAC assignments)
+    # Requires: users created above + all JTs and WJTs already in AAP
+    # -------------------------------------------------------------------------
+    - name: "[MCP USERS] | 2) Load RBAC role assignments"
+      ansible.builtin.include_vars:
+        file: "{{ _casc_dir }}/controller_roles.yml"
+
+    - name: "[MCP USERS] | 2) Import RBAC role assignments"
+      ansible.builtin.include_role:
+        name: infra.controller_configuration.roles
+
+    - name: "[MCP USERS] | Done"
+      ansible.builtin.debug:
+        msg: >-
+          ✅ MCP agent users created and RBAC assigned.
+          Next step: generate a Personal Access Token for aiops-readonly via the AAP UI,
+          then run: bash examples/scripts/mcp/setup-mcp-server.sh --context <OCP_CONTEXT> --apply
+          See examples/mcp/docs/01-setup.md for the full procedure.
+...

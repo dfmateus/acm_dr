@@ -1,0 +1,18 @@
+---
+# examples/scripts/testing/mock_data/unreachable_spokes.yml
+# Scenario 5: 2 of 7 Spokes unreachable. Excluded from sanitization and
+# verification. Report shows the UNREACHABLE SPOKES section.
+_scenario_name: "unreachable_spokes"
+
+acm_dr_failover_manager_unreachable_spoke_list:
+  - "eks-spoke-01"
+  - "gke-spoke-01"
+
+acm_dr_failover_manager_reachable_spoke_list:
+  - "aro-spoke-01"
+  - "aro-spoke-02"
+  - "aro-spoke-03"
+  - "aks-spoke-01"
+  - "iks-spoke-01"
+
+...

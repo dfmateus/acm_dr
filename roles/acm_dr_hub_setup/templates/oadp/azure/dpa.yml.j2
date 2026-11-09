@@ -1,0 +1,57 @@
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataProtectionApplication
+metadata:
+  name: "{{ acm_dr_hub_setup_oadp_dpa_name | default('dpa-hub') }}"
+  namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+spec:
+  configuration:
+    velero:
+      defaultPlugins:
+        - azure
+        - openshift
+        - csi
+{# ---- Optional: DPA Velero pod resource limits for large fleets ----
+   Per RHACM 2.17 official docs:
+   - 2000+ managed clusters: requests cpu 2, memory 4Gi
+   - 3500+ managed clusters: limits cpu 4, memory 8Gi
+   When both dicts are empty (default), no podConfig block is rendered.
+   https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index #}
+{% if acm_dr_hub_setup_dpa_resource_requests or acm_dr_hub_setup_dpa_resource_limits %}
+      # Resource allocations for the Velero pod - only needed for large fleets
+      podConfig:
+        resourceAllocations:
+{% if acm_dr_hub_setup_dpa_resource_requests %}
+          # Minimum guaranteed CPU/memory for the Velero backup/restore pod
+          requests:
+{{ acm_dr_hub_setup_dpa_resource_requests | to_nice_yaml(indent=2) | indent(12, first=true) }}
+{% endif %}
+{% if acm_dr_hub_setup_dpa_resource_limits %}
+          # Maximum CPU/memory the Velero pod can consume (hard ceiling)
+          limits:
+{{ acm_dr_hub_setup_dpa_resource_limits | to_nice_yaml(indent=2) | indent(12, first=true) }}
+{% endif %}
+{% endif %}
+    nodeAgent:
+      enable: false
+      uploaderType: kopia
+  backupLocations:
+    - velero:
+        config:
+          resourceGroup: "{{ acm_dr_hub_setup_azure_resource_group }}"
+          storageAccount: "{{ acm_dr_hub_setup_computed_storage_account }}"
+          subscriptionId: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+        credential:
+          key: cloud
+          name: "{{ acm_dr_hub_setup_oadp_cloud_secret_name | default('cloud-credentials') }}"
+        provider: azure
+        default: true
+        objectStorage:
+          bucket: "{{ acm_dr_hub_setup_azure_container_backup | default('acm-backup') }}"
+          prefix: hub
+  snapshotLocations:
+    - velero:
+        config:
+          resourceGroup: "{{ acm_dr_hub_setup_azure_resource_group }}"
+          subscriptionId: "{{ acm_dr_hub_setup_azure_subscription_id }}"
+          incremental: "true"
+        provider: azure

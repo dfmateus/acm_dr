@@ -1,0 +1,31 @@
+---
+# roles/acm_dr_upgrade_manager/tasks/main.yml
+
+- name: "[ACM UPGRADE] | Display role initialization metadata"
+  ansible.builtin.debug:
+    msg:
+      - "========================================================================"
+      - "  ACM UPGRADE MANAGER - Planned Maintenance Channel Upgrade"
+      - "========================================================================"
+      - "  Target context : {{ k8s_target_context | default('NOT SET') }}"
+      - "  Target version : {{ acm_dr_upgrade_manager_target_acm_version | trim }}"
+      - "  Target channel : {{ acm_dr_upgrade_manager_target_channel | trim }}"
+      - "  Namespace      : {{ acm_dr_upgrade_manager_acm_namespace }}"
+      - "  Execution mode : {{ (acm_dr_upgrade_manager_dry_run | default(false) | bool) | ternary('DRY-RUN (no changes applied)', 'PRODUCTION') }}"
+      - "========================================================================"
+  run_once: true
+  tags:
+    - always
+
+- name: "[ACM UPGRADE] | Execute Stage 00 - Preflight and Safety Gates"
+  ansible.builtin.import_tasks: 00_preflight.yml
+  tags:
+    - preflight
+    - stage00
+
+- name: "[ACM UPGRADE] | Execute Stage 01 - Patch ACM Channel and Wait for MCH Running"
+  ansible.builtin.import_tasks: 01_channel_upgrade.yml
+  tags:
+    - channel_upgrade
+    - stage01
+...

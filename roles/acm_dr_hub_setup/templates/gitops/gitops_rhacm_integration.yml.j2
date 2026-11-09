@@ -1,0 +1,39 @@
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSetBinding
+metadata:
+  name: default
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+spec:
+  clusterSet: default
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: {{ acm_dr_hub_setup_placement_name | default('hub-governance-placement') }}
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+spec:
+  clusterSets:
+    - default
+  numberOfClusters: 1
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values:
+                - local-cluster
+---
+apiVersion: apps.open-cluster-management.io/v1beta1
+kind: GitOpsCluster
+metadata:
+  name: {{ acm_dr_hub_setup_gitops_cluster_name | default('hub-governance-gitops') }}
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+spec:
+  argoServer:
+    argoNamespace: {{ acm_dr_hub_setup_gitops_namespace_acm | default('openshift-gitops-acm') }}
+    cluster: local-cluster
+  placementRef:
+    apiVersion: cluster.open-cluster-management.io/v1beta1
+    kind: Placement
+    name: {{ acm_dr_hub_setup_placement_name | default('hub-governance-placement') }}

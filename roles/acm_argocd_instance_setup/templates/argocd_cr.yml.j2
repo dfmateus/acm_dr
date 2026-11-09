@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata:
+  name: {{ acm_argocd_instance_setup_name }}
+  namespace: {{ acm_argocd_instance_setup_namespace }}
+spec:
+{% if acm_argocd_instance_setup_resource_exclusions | default([]) | length > 0 %}
+  # Field Finding (inherited from acm_dr_hub_setup): required when the
+  # repository content declares a cluster-scoped resource (e.g., Namespace)
+  # that this instance will never actually be able to manage (gitops-engine
+  # namespaced mode). Excluding here prevents the reconciliation attempt and error.
+  resourceExclusions: |
+{% for excl in acm_argocd_instance_setup_resource_exclusions %}
+    - apiGroups:
+{% for group in excl.api_groups %}
+        - "{{ group }}"
+{% endfor %}
+      kinds:
+{% for kind in excl.kinds %}
+        - {{ kind }}
+{% endfor %}
+      clusters:
+        - "*"
+{% endfor %}
+{% endif %}
+  applicationSet:
+    enabled: true
+  server:
+    route:
+      enabled: true
+{% if acm_argocd_instance_setup_sso_enabled | default(true) | bool %}
+  sso:
+    provider: dex
+    dex:
+      openShiftOAuth: true
+{% endif %}
+  rbac:
+    defaultPolicy: "{{ acm_argocd_instance_setup_rbac_default_policy | default('') }}"
+    policy: |
+{{ acm_argocd_instance_setup_rbac_policy | indent(6, first=True) }}
+    scopes: '{{ acm_argocd_instance_setup_rbac_scopes | default("[groups]") }}'

@@ -1,0 +1,15 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 02 - RHACM MULTICLUSTERHUB DEPLOYED & OPERATIONAL
+{{ _sep }}
+ 🎯 TARGET CONTEXT:         {{ k8s_target_context }}
+ 📂 ACM NAMESPACE:         {{ acm_dr_hub_setup_mch_namespace }}
+ 📡 CHANNEL USED:          {{ acm_dr_hub_setup_mch_channel }}
+ ⚙️ CR MULTICLUSTERHUB:   {{ acm_dr_hub_setup_mch_name }}
+ 📊 PHASE STATUS:          Running
+{{ _sep }}
+ ⚠️  ARCHITECTURE NOTE:
+ The Red Hat ACM governance panel is active. The control pods
+ (submariner-addon, search, policy-engine) are reconciled
+ and ready for multi-cluster orchestration and Disaster Recovery.
+{{ _sep }}

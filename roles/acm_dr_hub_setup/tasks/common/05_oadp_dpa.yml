@@ -1,0 +1,456 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 05 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 05 - OADP] | Display OADP, DPA, and BackupSchedule metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "🛡️ STAGE 05 - OADP, DPA & Velero Backup Schedule Configuration"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT:        {{ k8s_target_context }}"
+      - "📂 OADP NAMESPACE:        {{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+      - "☁️ CLOUD PROVIDER:        {{ acm_dr_hub_setup_cloud_provider }}"
+      - >-
+        {{
+          (acm_dr_hub_setup_cloud_provider == 'aws')
+          | ternary(
+              '🪣 BACKUP BUCKET:         ' ~ (acm_dr_hub_setup_aws_s3_bucket_backup | default('NOT DEFINED')),
+              '💾 STORAGE ACCOUNT:       ' ~ acm_dr_hub_setup_azure_storage_account_name
+            )
+        }}
+      - "⚙️  DPA CR NAME:           {{ acm_dr_hub_setup_oadp_dpa_name | default('dpa-hub') }}"
+      - "📅 SCHEDULE NAME:         {{ acm_dr_hub_setup_schedule_name | default('acm-hub-schedule') }}"
+      - "🎛️  PRIMARY HUB?:         {{ acm_dr_hub_setup_is_primary_hub | bool }}"
+  run_once: true
+
+# =============================================================================
+# STEP 5.1: NAMESPACE, SANITIZATION, AND RED HAT OADP OPERATOR INSTALLATION (OLM)
+# =============================================================================
+
+- name: "[STAGE 05 - OADP] | 5.1.1) Create OADP Namespace (oadp_namespaces.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: oadp/oadp_namespaces.yml.j2
+
+# Note (Real-world Finding): the MultiClusterHub installed in Stage 02 enables the
+# 'cluster-backup' component, which ACM itself uses to AUTO-PROVISION its own
+# OperatorGroup + OADP Subscription in this same namespace. Creating a second
+# Subscription/OperatorGroup manually here competed for the same OperatorGroup
+# managed by ACM, locking OLM into ConstraintsNotSatisfiable on a clean
+# reinstallation (consistently reproduced in real-world testing -- see the
+# "Real-world Finding" section in the README). Therefore, this step NO LONGER
+# creates its own Subscription/OperatorGroup -- it only waits for the Operator
+# that ACM itself provisions to become ready, via the controller Deployment
+# readiness (a more reliable signal than the Subscription status, which can get
+# stuck in OLM resolution conflicts even when the operator is already healthy
+# underneath).
+#
+# EXCEPTION - AWS STS clusters (ROSA HCP): the MCH cluster-backup component does
+# NOT auto-provision OADP on AWS STS clusters. Per RHACM 2.17 Business Continuity
+# docs: "When your hub cluster uses AWS Security Token Service, install the OADP
+# operator before you enable the backup component." The tasks below (5.1.1a-c)
+# pre-create the OperatorGroup and Subscription manually, matching the names and
+# channel that MCH would use on a non-STS cluster. This way, if cluster-backup
+# ever starts supporting STS auto-provisioning, OLM sees an existing resource
+# and no-ops instead of conflicting.
+# https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index
+
+# --- AWS STS manual OADP install (5.1.1a-c) ---
+# Only runs when the platform is AWS. Skipped on Azure/other where cluster-backup
+# handles OADP provisioning automatically.
+
+- name: "[STAGE 05 - OADP] | 5.1.1a) Create OADP OperatorGroup for AWS STS (manual pre-install) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: oadp/aws/oadp_operatorgroup.yml.j2
+  # Only AWS STS clusters need manual OADP install; non-AWS clusters get it from MCH.
+  when: (acm_dr_platform | default('Unknown') | trim) == 'AWS'
+
+- name: "[STAGE 05 - OADP] | 5.1.1b) Resolve OADP channel from PackageManifest defaultChannel - {{ k8s_target_context }}"
+  # The OADP channel name varies between OCP versions: OCP 4.18 uses "stable-1.4",
+  # OCP 4.22+ uses "stable". Instead of hardcoding, query the PackageManifest to
+  # get the correct default channel for this cluster's OCP version.
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: packages.operators.coreos.com/v1
+    kind: PackageManifest
+    name: "{{ acm_dr_hub_setup_oadp_subscription_name }}"
+    namespace: openshift-marketplace
+  register: acm_dr_hub_setup_oadp_pkg_manifest
+  when: (acm_dr_platform | default('Unknown') | trim) == 'AWS'
+
+- name: "[STAGE 05 - OADP] | 5.1.1b-set) Set resolved OADP channel fact - {{ k8s_target_context }}"
+  # Use the PackageManifest's defaultChannel when available, fall back to the
+  # role default (acm_dr_hub_setup_oadp_channel) if the lookup fails.
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_oadp_resolved_channel: >-
+      {{ acm_dr_hub_setup_oadp_pkg_manifest.resources[0].status.defaultChannel
+         | default(acm_dr_hub_setup_oadp_channel) }}
+  when: (acm_dr_platform | default('Unknown') | trim) == 'AWS'
+
+- name: "[STAGE 05 - OADP] | 5.1.1b-log) Display resolved OADP channel - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ OADP channel resolved from PackageManifest: {{ acm_dr_hub_setup_oadp_resolved_channel }}
+      (default was: {{ acm_dr_hub_setup_oadp_channel }})
+  when: (acm_dr_platform | default('Unknown') | trim) == 'AWS'
+
+- name: "[STAGE 05 - OADP] | 5.1.1c) Create OADP Subscription for AWS STS (manual pre-install) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: oadp/aws/oadp_subscription.yml.j2
+  # Only AWS STS clusters need manual OADP install; non-AWS clusters get it from MCH.
+  when: (acm_dr_platform | default('Unknown') | trim) == 'AWS'
+
+- name: "[STAGE 05 - OADP] | 5.1.1d) ⏳ WAIT - OADP CSV reaches Succeeded phase (AWS STS manual install) - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+    label_selectors:
+      - "operators.coreos.com/{{ acm_dr_hub_setup_oadp_subscription_name }}.{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_oadp_csv
+  until:
+    - (acm_dr_hub_setup_oadp_csv.resources | default([])) | length > 0
+    - (acm_dr_hub_setup_oadp_csv.resources[0].status.phase | default('')) == 'Succeeded'
+  retries: 20  # 20 x 15s = 5 minutes max wait for OLM to install the OADP operator
+  delay: 15
+  # Only AWS STS clusters need manual OADP install; non-AWS clusters get it from MCH.
+  when: (acm_dr_platform | default('Unknown') | trim) == 'AWS'
+
+- name: "[STAGE 05 - OADP] | 5.1.2) ⏳ WAIT - OADP Controller Deployment (auto-provisioned by cluster-backup) - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+    name: openshift-adp-controller-manager
+  register: acm_dr_hub_setup_oadp_deployment
+  until:
+    - (acm_dr_hub_setup_oadp_deployment.resources | default([])) | length > 0
+    - acm_dr_hub_setup_oadp_deployment.resources[0].status.readyReplicas | default(0) | int > 0
+  retries: 60
+  delay: 15
+  ignore_errors: true
+
+# =============================================================================
+# STEP 5.2: TEMPLATE DEPLOYMENT (SECRET, DPA, AND BACKUPSCHEDULE)
+# =============================================================================
+
+# Provider-specific OADP credential Secret: Azure uses a 6-field key=value
+# format; AWS uses a 2-field INI [default] format. Templates live under
+# oadp/<provider>/. The Secret name is driven by cloud_provider via defaults.
+- name: "[STAGE 05 - OADP] | 5.2.1) Create cloud credentials Secret for OADP - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: "oadp/{{ acm_dr_hub_setup_cloud_provider }}/cloud_secret.yml.j2"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# Provider-specific DPA: Azure uses the azure plugin with resourceGroup/storageAccount
+# config; AWS uses the aws plugin with region/bucket config.
+- name: "[STAGE 05 - OADP] | 5.2.2) Create DataProtectionApplication CR - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: "oadp/{{ acm_dr_hub_setup_cloud_provider }}/dpa.yml.j2"
+
+- name: "[STAGE 05 - OADP] | 5.2.3) Create BackupSchedule CR on Primary Hub (oadp_backupschedule.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: oadp/oadp_backupschedule.yml.j2
+  when: acm_dr_hub_setup_is_primary_hub | bool
+
+# Active-to-passive conversion: when the operator re-runs lab setup with
+# is_primary_hub=false on a cluster that was previously provisioned as PRIMARY,
+# the old BackupSchedule is still present. Stage 06 validation (6.2.1) enforces
+# that passive hubs must NOT have a BackupSchedule. Remove it here so the cluster
+# enters a clean passive state before the passive sync Restore is created below.
+- name: "[STAGE 05 - OADP] | 5.2.3b) Remove BackupSchedule on Passive Hub (active-to-passive conversion) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+    name: "{{ acm_dr_hub_setup_schedule_name | default('schedule-acm-hub') }}"
+    state: absent
+  when: not (acm_dr_hub_setup_is_primary_hub | bool)
+
+# Per RHACM 2.17 official docs, passive hubs must run a continuous Restore with
+# syncRestoreWithNewBackups: true to keep credentials and resources pre-positioned.
+# This is the passive-hub counterpart of task 5.2.3 (BackupSchedule on primary).
+# The Restore CR is automatically cleaned up by Stage 03 of acm_dr_failover_manager
+# (tasks 3.1.1-3.1.2) before a failover activation - no conflict.
+- name: "[STAGE 05 - OADP] | 5.2.4) Create passive sync Restore CR on Passive Hub (oadp_passive_restore.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: oadp/oadp_passive_restore.yml.j2
+  when:
+    - not (acm_dr_hub_setup_is_primary_hub | bool)    # only on passive/DR hubs
+    - acm_dr_hub_setup_passive_restore_enabled | bool  # user-controllable opt-out
+
+# =============================================================================
+# STEP 5.3: RECONCILIATION, BSL VALIDATION, AND OADP/DPA ASSERTIONS
+# =============================================================================
+
+- name: "[STAGE 05 - OADP] | 5.3.1) ⏳ NOTICE: Waiting for Velero/Kopia Pod initialization - DO NOT CANCEL"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/05_oadp_pods_waiting.j2').split('\n') }}"
+  when: acm_dr_hub_setup_oadp_deployment is not failed
+
+- name: "[STAGE 05 - OADP] | 5.3.2) ⏳ WAIT - Validate Pod status in OADP Namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Pod
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_oadp_pods
+  until: >-
+    (acm_dr_hub_setup_oadp_pods.resources | default([])) | length > 0 and
+    (acm_dr_hub_setup_oadp_pods.resources | default([]) |
+      rejectattr('status.phase', 'in', ['Running', 'Succeeded']) | list | length) == 0
+  retries: 40
+  delay: 10
+  # Cascade-skip: no point waiting for pods if the OADP operator never started.
+  when: acm_dr_hub_setup_oadp_deployment is not failed
+  ignore_errors: true
+
+- name: "[STAGE 05 - OADP] | 5.3.3) 🕵️ Collect DataProtectionApplication Custom Resource status - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: oadp.openshift.io/v1alpha1
+    kind: DataProtectionApplication
+    name: "{{ acm_dr_hub_setup_oadp_dpa_name | default('dpa-hub') }}"
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_dpa_info
+  # Cascade-skip: DPA won't be reconciled if the operator isn't running.
+  when: acm_dr_hub_setup_oadp_deployment is not failed
+
+- name: "[STAGE 05 - OADP] | 5.3.4) ⏳ WAIT - Validate Velero BackupStorageLocation (BSL) Available phase - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: velero.io/v1
+    kind: BackupStorageLocation
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_bsl_info
+  until: >-
+    (acm_dr_hub_setup_bsl_info.resources | default([])) | length > 0 and
+    (acm_dr_hub_setup_bsl_info.resources[0].status.phase | default('')) == "Available"
+  retries: 30
+  delay: 10
+  # Cascade-skip: BSL requires both the operator and Velero pods to be running.
+  when:
+    - acm_dr_hub_setup_oadp_deployment is not failed
+    - acm_dr_hub_setup_oadp_pods is not defined or acm_dr_hub_setup_oadp_pods is not failed
+  ignore_errors: true
+
+# =============================================================================
+# OADP/DPA GROUPED DIAGNOSTIC SECTION
+# =============================================================================
+# Runs if any of the 3 OADP polls failed (5.1.2 through 5.3.4).
+# Identifies which checkpoint failed first and gathers OADP evidence.
+
+# D.1) Identify which OADP checkpoint failed first.
+- name: "[STAGE 05 - OADP DIAGNOSTIC] | D.1) Identify failed OADP checkpoint"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_oadp_failed_step: >-
+      {% if acm_dr_hub_setup_oadp_deployment is failed
+      %}OADP Controller Deployment (5.1.2){% elif acm_dr_hub_setup_oadp_pods is defined
+      and acm_dr_hub_setup_oadp_pods is failed
+      %}Pod readiness (5.3.2){% elif acm_dr_hub_setup_bsl_info is defined
+      and acm_dr_hub_setup_bsl_info is failed
+      %}BSL Available (5.3.4){% else %}unknown{% endif %}
+  when: >-
+    acm_dr_hub_setup_oadp_deployment is failed or
+    (acm_dr_hub_setup_oadp_pods is defined and acm_dr_hub_setup_oadp_pods is failed) or
+    (acm_dr_hub_setup_bsl_info is defined and acm_dr_hub_setup_bsl_info is failed)
+
+# D.2) Read DPA conditions and BSL status for diagnostic context.
+- name: "[STAGE 05 - OADP DIAGNOSTIC] | D.2) Read DPA status conditions"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: oadp.openshift.io/v1alpha1
+    kind: DataProtectionApplication
+    name: "{{ acm_dr_hub_setup_oadp_dpa_name | default('dpa-hub') }}"
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_diag_oadp_dpa
+  failed_when: false
+  when: >-
+    acm_dr_hub_setup_oadp_deployment is failed or
+    (acm_dr_hub_setup_oadp_pods is defined and acm_dr_hub_setup_oadp_pods is failed) or
+    (acm_dr_hub_setup_bsl_info is defined and acm_dr_hub_setup_bsl_info is failed)
+
+# D.3) Read Velero and Node Agent pod status.
+- name: "[STAGE 05 - OADP DIAGNOSTIC] | D.3) Read Velero/Node Agent pod status"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_diag_oadp_pods
+  failed_when: false
+  when: >-
+    acm_dr_hub_setup_oadp_deployment is failed or
+    (acm_dr_hub_setup_oadp_pods is defined and acm_dr_hub_setup_oadp_pods is failed) or
+    (acm_dr_hub_setup_bsl_info is defined and acm_dr_hub_setup_bsl_info is failed)
+
+# D.4) Build diagnostic summary and troubleshooting hints.
+- name: "[STAGE 05 - OADP DIAGNOSTIC] | D.4) Build OADP diagnostic"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_oadp_summary: >-
+      {% set dpa = acm_dr_hub_setup_diag_oadp_dpa.resources | default([]) %}
+      DPA: {% if dpa | length > 0 %}found.
+      {% for c in dpa[0].status.conditions | default([]) %}
+      {{ c.type }}: {{ c.status
+      }}{%- if c.status != 'True' %} ({{ c.message | default('no message') }}){% endif %};
+      {% endfor %}{% else %}not found.{% endif %}
+      BSL:
+      {% set bsl = acm_dr_hub_setup_bsl_info.resources | default([]) if acm_dr_hub_setup_bsl_info is defined else [] %}
+      {% if bsl | length > 0 %}phase={{ bsl[0].status.phase | default('Unknown')
+      }}{%- if bsl[0].status.message is defined %}, message={{ bsl[0].status.message
+      }}{% endif %}{% else %}not found{% endif %}.
+      {% set pods = acm_dr_hub_setup_diag_oadp_pods.resources | default([]) %}
+      {% set bad = pods | rejectattr('status.phase', 'in', ['Running', 'Succeeded']) | list %}
+      Unhealthy pods: {% if bad | length == 0 %}none (or namespace empty).{% else
+      %}{% for pod in bad %}{{ pod.metadata.name
+      }}={{ pod.status.phase | default('Unknown')
+      }}{%- for cs in pod.status.containerStatuses | default([])
+      %}{%- if cs.state.waiting is defined %} ({{ cs.name
+      }}: {{ cs.state.waiting.reason | default('Waiting') }}){% endif
+      %}{%- endfor %}; {% endfor %}{% endif %}
+    acm_dr_hub_setup_diag_oadp_hints: >-
+      {% set step = acm_dr_hub_setup_diag_oadp_failed_step | default('') | trim %}
+      {% set hints = [] %}
+      {% if 'OADP Controller' in step %}
+      {%   set _ = hints.append(
+             'OADP CONTROLLER NOT READY: The openshift-adp-controller-manager Deployment '
+             ~ 'did not start within 15 minutes. On non-STS clusters (ARO), the MCH cluster-backup '
+             ~ 'component auto-provisions this operator. On AWS STS clusters (ROSA HCP), the OADP '
+             ~ 'Subscription must be created manually (tasks 5.1.1a-c) before cluster-backup can use '
+             ~ 'it. Check that MCH reached Running and the cluster-backup component '
+             ~ 'is enabled: oc get mch -n open-cluster-management -o yaml --context '
+             ~ k8s_target_context ~ '. On AWS STS, also check the Subscription status: '
+             ~ 'oc get subscription.operators.coreos.com -n '
+             ~ (acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup'))
+             ~ ' --context ' ~ k8s_target_context ~ '.') %}
+      {% elif 'Pod readiness' in step %}
+      {%   set _ = hints.append(
+             'OADP PODS NOT READY: Velero/Node Agent pods did not reach Running. '
+             ~ 'Check pod events: oc describe pod -n '
+             ~ (acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup'))
+             ~ ' --context ' ~ k8s_target_context
+             ~ '. Common causes: ImagePullBackOff, CrashLoopBackOff on Velero.') %}
+      {% elif 'BSL Available' in step %}
+      {%   set _ = hints.append(
+             'BSL NOT AVAILABLE: The BackupStorageLocation did not reach Available phase. '
+             ~ 'Common causes: (1) Cloud credentials in '
+             ~ acm_dr_hub_setup_oadp_cloud_secret_name ~ ' Secret are wrong '
+             ~ '(provider: ' ~ acm_dr_hub_setup_cloud_provider ~ '), '
+             ~ '(2) the storage '
+             ~ ((acm_dr_hub_setup_cloud_provider == 'aws') | ternary('S3 bucket', 'Azure Blob container'))
+             ~ ' does not exist or is inaccessible, '
+             ~ '(3) the storage configuration has a mismatch. Check BSL status: '
+             ~ 'oc get bsl -n '
+             ~ (acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup'))
+             ~ ' -o yaml --context ' ~ k8s_target_context ~ '.') %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append(
+             'No specific pattern matched. Check DPA conditions and BSL status manually.') %}
+      {% endif %}
+      {{ hints }}
+  when: >-
+    acm_dr_hub_setup_oadp_deployment is failed or
+    (acm_dr_hub_setup_oadp_pods is defined and acm_dr_hub_setup_oadp_pods is failed) or
+    (acm_dr_hub_setup_bsl_info is defined and acm_dr_hub_setup_bsl_info is failed)
+
+# D.5) Print the structured diagnostic report.
+- name: "[STAGE 05 - OADP DIAGNOSTIC] | D.5) ❌ OADP FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ OADP/DPA SETUP FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "FAILED CHECKPOINT:"
+      - "  {{ acm_dr_hub_setup_diag_oadp_failed_step | default('unknown') | trim }}"
+      - ""
+      - "TARGET CLUSTER:"
+      - "  {{ k8s_target_context }}"
+      - ""
+      - "STATUS:"
+      - "{{ acm_dr_hub_setup_diag_oadp_summary | default('  (could not gather status)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_hub_setup_diag_oadp_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: >-
+    acm_dr_hub_setup_oadp_deployment is failed or
+    (acm_dr_hub_setup_oadp_pods is defined and acm_dr_hub_setup_oadp_pods is failed) or
+    (acm_dr_hub_setup_bsl_info is defined and acm_dr_hub_setup_bsl_info is failed)
+
+# D.6) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 05 - OADP DIAGNOSTIC] | D.6) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => OADP/DPA setup failed at checkpoint
+      '{{ acm_dr_hub_setup_diag_oadp_failed_step | default('unknown') | trim }}'
+      on context '{{ k8s_target_context }}'.
+      See the diagnostic report above for DPA conditions, BSL status, pod status,
+      and troubleshooting hints.
+  when: >-
+    acm_dr_hub_setup_oadp_deployment is failed or
+    (acm_dr_hub_setup_oadp_pods is defined and acm_dr_hub_setup_oadp_pods is failed) or
+    (acm_dr_hub_setup_bsl_info is defined and acm_dr_hub_setup_bsl_info is failed)
+
+- name: "[STAGE 05 - OADP] | 5.3.5) 🔍 ASSERT - Validate OADP, DPA, and BSL operational integrity - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_dpa_info.resources | length > 0
+      - acm_dr_hub_setup_bsl_info.resources | length > 0
+      - (acm_dr_hub_setup_bsl_info.resources[0].status.phase | default('')) == "Available"
+      - (acm_dr_hub_setup_oadp_pods.resources | rejectattr('status.phase', 'in', ['Running', 'Succeeded']) | list | length) == 0
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => The OADP Operator, DPA '{{ acm_dr_hub_setup_oadp_dpa_name }}', and Velero BackupStorageLocation
+      are fully validated with 'Available' status on context '{{ k8s_target_context }}'.
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => The OADP/Velero stack did not reach full readiness on context
+      '{{ k8s_target_context }}'.
+  # Cascade-skip: assert accesses registers that may not exist if polls were skipped.
+  when:
+    - acm_dr_hub_setup_oadp_deployment is not failed
+    - acm_dr_hub_setup_oadp_pods is defined and acm_dr_hub_setup_oadp_pods is not failed
+    - acm_dr_hub_setup_bsl_info is defined and acm_dr_hub_setup_bsl_info is not failed
+
+# =============================================================================
+# STEP 5.4: OPTIONAL BACKUP HEALTH MONITORING (PROMETHEUSRULE)
+# =============================================================================
+# Deploys a PrometheusRule that monitors the ACM backup pipeline health.
+# Disabled by default (acm_dr_hub_setup_prometheusrule_enabled: false).
+# Two alerts: ACMBackupPolicyNonCompliant (governance Policy non-compliance)
+# and VeleroBackupStale (validation backup age exceeds threshold).
+
+- name: "[STAGE 05 - OADP] | 5.4.1) Deploy backup health PrometheusRule (oadp_prometheusrule.yml.j2) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: oadp/oadp_prometheusrule.yml.j2
+  when:
+    - acm_dr_hub_setup_prometheusrule_enabled | default(false) | bool
+    - acm_dr_hub_setup_is_primary_hub | default(true) | bool
+
+# =============================================================================
+# STEP 5.5: COMPLETION SUMMARY AND STAGE 05 FINAL STATUS
+# =============================================================================
+
+- name: "[STAGE 05 - OADP] | Display OADP, DPA, and BackupSchedule completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/05_oadp_dpa_summary.j2').split('\n') }}"
+...

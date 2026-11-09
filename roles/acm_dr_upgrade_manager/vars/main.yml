@@ -1,0 +1,15 @@
+---
+# roles/acm_dr_upgrade_manager/vars/main.yml
+# =============================================================================
+# ROLE-INTERNAL CONSTANTS - ACM UPGRADE MANAGER
+# =============================================================================
+# Variables here are derived from user-supplied defaults. They must not be
+# overridden via group_vars or host_vars because their value is computed from
+# acm_dr_upgrade_manager_target_acm_version at play time.
+
+# OLM channel derived from the target version. "2.15" -> "release-2.15".
+# Override with extra-vars only if you need to pin a specific channel that
+# does not follow the standard "release-<major>.<minor>" naming.
+acm_dr_upgrade_manager_target_channel: >-
+  release-{{ (acm_dr_upgrade_manager_target_acm_version | trim).split('.')[:2] | join('.') }}
+...

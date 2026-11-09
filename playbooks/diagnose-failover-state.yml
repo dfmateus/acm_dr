@@ -1,0 +1,392 @@
+---
+# playbooks/diagnose-failover-state.yml
+# =============================================================================
+# FAILOVER STATE DIAGNOSTIC (POST-FAILURE INSPECTOR)
+#
+# Description:
+#   Called when the Hub Failover JT fails during production execution. Queries
+#   both Hub clusters to determine how far the failover progressed: whether the
+#   Source Hub was fenced (BackupSchedule paused), whether a Restore completed
+#   on Destination, and what state the MultiClusterHub reports. Sends a
+#   structured diagnostic report via the webhook credential.
+#
+#   Does NOT attempt any remediation. Safe to run against clusters in any state.
+#   Always exits rc=0 so the WJT failure path is not further complicated by an
+#   additional diagnostic failure.
+#
+# Credentials required:
+#   ACM DR - Source Hub             - injects ACM_DR_SOURCE_HOST, ACM_DR_SOURCE_TOKEN,
+#                                     ACM_DR_SOURCE_CA_DATA, ACM_DR_SOURCE_CONTEXT
+#   ACM DR - Destination Hub        - injects ACM_DR_DEST_HOST, ACM_DR_DEST_TOKEN,
+#                                     ACM_DR_DEST_CA_DATA, ACM_DR_DEST_CONTEXT
+#   ACM DR - Notification Webhook   - injects NOTIF_WEBHOOK_URL, NOTIF_WEBHOOK_FORMAT
+#
+# Variables (extra_vars, all optional):
+#   acm_dr_failover_action  - failover or failback. Controls which Hub is labelled
+#                             as Source vs Destination in the report.
+#                             Default: failover
+#   wf_name                 - display name of the failed workflow.
+#                             Default: (unknown workflow)
+#
+# Exit codes:
+#   0 - diagnostic report sent (or gracefully skipped on webhook error)
+#   1 - required credential env vars are absent
+#
+# Dependencies:
+#   collections: kubernetes.core, ansible.builtin
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+# =============================================================================
+
+- name: Diagnose Failover State and Send Structured Report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster credentials
+      # from AAP or load_cluster_env.sh), falling back to the monolithic KUBECONFIG env var.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  vars:
+    acm_dr_failover_action: "failover"   # failover or failback; affects hub labelling in the report
+    wf_name: "(unknown workflow)"         # workflow display name for the notification body
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]
+      tags: [always]
+
+    - name: "[PRE-FLIGHT] | Read per-cluster and webhook credentials from environment"
+      ansible.builtin.set_fact:
+        _source_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_SOURCE_CONTEXT', default='') }}"
+        _dest_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_DEST_CONTEXT', default='') }}"
+        _webhook_url: "{{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_URL', default='') }}"
+        _webhook_format: >-
+          {{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_FORMAT', default='generic-json') }}
+      no_log: true  # _webhook_url is a secret endpoint
+
+    - name: "[PRE-FLIGHT] | Assert required credential env vars are present"
+      ansible.builtin.assert:
+        that:
+          - _source_context | length > 0
+          - _dest_context | length > 0
+          - _webhook_url | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Missing required credential env vars.
+          ACM_DR_SOURCE_CONTEXT and ACM_DR_DEST_CONTEXT come from the
+          ACM DR Source Hub and Destination Hub credentials.
+          NOTIF_WEBHOOK_URL comes from the ACM DR - Notification Webhook credential.
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Credentials resolved.
+          Source={{ _source_context }} Dest={{ _dest_context }}.
+
+  tasks:
+    # -----------------------------------------------------------------
+    # STEP 1: probe Source Hub connectivity
+    # -----------------------------------------------------------------
+
+    # Probing via namespace existence is a cheap, auth-free connectivity test.
+    # If k8s_info raises a connection error, resources will be absent from the result.
+    - name: "[DIAGNOSE] | 1.1) Probe Source Hub connectivity via backup namespace"
+      kubernetes.core.k8s_info:
+        api_version: "v1"
+        kind: "Namespace"
+        name: "open-cluster-management-backup"
+        context: "{{ _source_context }}"
+      register: _source_ns_probe
+      # Connection failure must not abort the play; check resources afterward.
+      failed_when: false
+
+    - name: "[DIAGNOSE] | 1.2) Record Source Hub reachability"
+      ansible.builtin.set_fact:
+        # resources is defined (even if empty) only when the API call succeeded.
+        _source_reachable: "{{ _source_ns_probe.resources is defined }}"
+
+    # -----------------------------------------------------------------
+    # STEP 2: query BackupSchedule on Source Hub
+    # -----------------------------------------------------------------
+    - name: "[DIAGNOSE] | 2.1) Query BackupSchedule objects on Source Hub"
+      kubernetes.core.k8s_info:
+        api_version: "cluster.open-cluster-management.io/v1beta1"
+        kind: "BackupSchedule"
+        namespace: "open-cluster-management-backup"
+        context: "{{ _source_context }}"
+      register: _source_backup_schedule
+      when: _source_reachable
+
+    - name: "[DIAGNOSE] | 2.2) Determine whether Source Hub is fenced"
+      ansible.builtin.set_fact:
+        _source_bs_resources: "{{ _source_backup_schedule.resources | default([]) }}"
+      when: _source_reachable
+
+    - name: "[DIAGNOSE] | 2.3) Compute fenced state and backup phase from BackupSchedule"
+      ansible.builtin.set_fact:
+        # Fenced state: RHACM DR fence sets spec.paused=true; the operator then
+        # transitions status.phase to 'Paused'. Either condition confirms fencing.
+        _source_fenced: >-
+          {{
+            _source_bs_resources | length > 0 and (
+              (_source_bs_resources[0].status.phase | default('')) == 'Paused' or
+              (_source_bs_resources[0].spec.paused | default(false)) | bool
+            )
+          }}
+        _source_backup_phase: >-
+          {{
+            _source_bs_resources[0].status.phase | default('Unknown')
+            if _source_bs_resources | length > 0
+            else 'NotFound'
+          }}
+      when: _source_reachable
+
+    - name: "[DIAGNOSE] | 2.4) Set Source Hub defaults when unreachable"
+      ansible.builtin.set_fact:
+        _source_fenced: false    # conservative: assume not fenced when we cannot confirm
+        _source_backup_phase: "Unreachable"
+        _source_bs_resources: []
+      when: not _source_reachable
+
+    # -----------------------------------------------------------------
+    # STEP 3: probe Destination Hub connectivity
+    # -----------------------------------------------------------------
+    - name: "[DIAGNOSE] | 3.1) Probe Destination Hub connectivity via backup namespace"
+      kubernetes.core.k8s_info:
+        api_version: "v1"
+        kind: "Namespace"
+        name: "open-cluster-management-backup"
+        context: "{{ _dest_context }}"
+      register: _dest_ns_probe
+      failed_when: false
+
+    - name: "[DIAGNOSE] | 3.2) Record Destination Hub reachability"
+      ansible.builtin.set_fact:
+        _dest_reachable: "{{ _dest_ns_probe.resources is defined }}"
+
+    # -----------------------------------------------------------------
+    # STEP 4: query Restore objects on Destination Hub
+    # -----------------------------------------------------------------
+    - name: "[DIAGNOSE] | 4.1) Query Restore objects on Destination Hub"
+      kubernetes.core.k8s_info:
+        api_version: "cluster.open-cluster-management.io/v1beta1"
+        kind: "Restore"
+        namespace: "open-cluster-management-backup"
+        context: "{{ _dest_context }}"
+      register: _dest_restore_list
+      when: _dest_reachable
+
+    - name: "[DIAGNOSE] | 4.2) Compute restore completion state"
+      ansible.builtin.set_fact:
+        _dest_restore_resources: "{{ _dest_restore_list.resources | default([]) }}"
+        # A Completed phase means the OADP/Velero restore finished successfully.
+        # Checking status.phase is sufficient; veleroRestoreNames is an implementation detail.
+        _dest_restore_complete: >-
+          {{
+            _dest_restore_list.resources | default([])
+            | selectattr('status.phase', 'equalto', 'Completed')
+            | list | length > 0
+          }}
+        _dest_restore_phase: >-
+          {{
+            _dest_restore_list.resources[0].status.phase | default('None')
+            if _dest_restore_list.resources | default([]) | length > 0
+            else 'None'
+          }}
+      when: _dest_reachable
+
+    # -----------------------------------------------------------------
+    # STEP 5: query MultiClusterHub on Destination Hub
+    # -----------------------------------------------------------------
+    - name: "[DIAGNOSE] | 5.1) Query MultiClusterHub status on Destination Hub"
+      kubernetes.core.k8s_info:
+        api_version: "operator.open-cluster-management.io/v1"
+        kind: "MultiClusterHub"
+        namespace: "open-cluster-management"
+        context: "{{ _dest_context }}"
+      register: _dest_mch
+      when: _dest_reachable
+
+    - name: "[DIAGNOSE] | 5.2) Extract MultiClusterHub phase"
+      ansible.builtin.set_fact:
+        _dest_mch_phase: >-
+          {{
+            _dest_mch.resources[0].status.phase | default('Unknown')
+            if _dest_mch.resources | default([]) | length > 0
+            else 'NotFound'
+          }}
+      when: _dest_reachable
+
+    - name: "[DIAGNOSE] | 5.3) Set Destination Hub defaults when unreachable"
+      ansible.builtin.set_fact:
+        _dest_restore_complete: false
+        _dest_restore_phase: "Unreachable"
+        _dest_mch_phase: "Unreachable"
+        _dest_restore_resources: []
+      when: not _dest_reachable
+
+    # -----------------------------------------------------------------
+    # STEP 6: classify overall failover state
+    # The five buckets below are mutually exclusive in order.
+    # -----------------------------------------------------------------
+    - name: "[DIAGNOSE] | 6.1) Classify: connectivity failure (neither hub reachable)"
+      ansible.builtin.set_fact:
+        _overall_state: "connectivity failure - cannot assess"
+        _recommended_action: >-
+          Both Hub clusters were unreachable at diagnosis time. Verify network connectivity,
+          kubeconfig validity, and ServiceAccount token expiry for both credentials before
+          taking any further action.
+      when: not _source_reachable and not _dest_reachable
+
+    - name: "[DIAGNOSE] | 6.2) Classify: Source Hub unreachable, partial diagnosis only"
+      ansible.builtin.set_fact:
+        _overall_state: "Source Hub unreachable - partial diagnosis only"
+        _recommended_action: >-
+          Source Hub connectivity failed so fence state cannot be confirmed. Destination
+          Hub is reachable (Restore complete: {{ _dest_restore_complete }}, MCH: {{ _dest_mch_phase }}).
+          Restore the Source Hub network path and re-run this diagnostic before deciding next steps.
+      when: not _source_reachable and _dest_reachable
+
+    - name: "[DIAGNOSE] | 6.3) Classify: failover did not start (Source Hub still active)"
+      ansible.builtin.set_fact:
+        _overall_state: "failover did not start"
+        _recommended_action: >-
+          The Source Hub BackupSchedule is not paused. The failover job failed before
+          reaching the fence step. No state change occurred; safe to investigate the
+          root cause and retry from the beginning.
+      when: _source_reachable and not _source_fenced
+
+    - name: "[DIAGNOSE] | 6.4) Classify: failover started but Restore is incomplete"
+      ansible.builtin.set_fact:
+        _overall_state: "failover started but Restore incomplete - Source Hub is fenced"
+        _recommended_action: >-
+          Source Hub is fenced (BackupSchedule paused) but no Restore has completed
+          on the Destination Hub. The failover is mid-flight. Do NOT re-fence or
+          re-trigger blindly. Inspect the Restore object on the Destination Hub and
+          check OADP operator logs before deciding whether to complete or roll back.
+      when:
+        - _source_reachable
+        - _source_fenced
+        - not _dest_restore_complete
+
+    - name: "[DIAGNOSE] | 6.5) Classify: failover completed but post-restore stages failed"
+      ansible.builtin.set_fact:
+        _overall_state: "failover completed but post-restore stages failed"
+        _recommended_action: >-
+          Restore completed on the Destination Hub (MCH: {{ _dest_mch_phase }}). The failure
+          occurred in a post-restore stage: Spoke reconnection, BackupSchedule activation,
+          or audit. The new active Hub should be functional. Investigate the specific failed
+          task in the job log and resume from that stage rather than re-running the full failover.
+      when:
+        - _source_reachable
+        - _source_fenced
+        - _dest_restore_complete
+
+    # Fallback covers any combination not matched above (should not occur in practice).
+    - name: "[DIAGNOSE] | 6.6) Classify: indeterminate state (fallback)"
+      ansible.builtin.set_fact:
+        _overall_state: "indeterminate - review all findings below"
+        _recommended_action: >-
+          The diagnostic could not map cluster state to a known failover phase. Review
+          all raw findings in this notification and consult the runbook for manual assessment.
+      when: _overall_state is not defined
+
+    # -----------------------------------------------------------------
+    # STEP 7: build notification content
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 7.1) Compose diagnostic report lines"
+      ansible.builtin.set_fact:
+        _report_title: "Failover Diagnostic: {{ _overall_state | capitalize }}"
+        _report_lines:
+          - "Workflow: {{ wf_name }}"
+          - "Action: {{ acm_dr_failover_action }}"
+          - ""
+          - "SOURCE HUB ({{ _source_context }})"
+          - "  Reachable: {{ _source_reachable }}"
+          - "  BackupSchedule phase: {{ _source_backup_phase }}"
+          - "  Fenced: {{ _source_fenced }}"
+          - ""
+          - "DESTINATION HUB ({{ _dest_context }})"
+          - "  Reachable: {{ _dest_reachable }}"
+          - "  Restore phase: {{ _dest_restore_phase }}"
+          - "  Restore complete: {{ _dest_restore_complete }}"
+          - "  MultiClusterHub phase: {{ _dest_mch_phase }}"
+          - ""
+          - "OVERALL STATE: {{ _overall_state }}"
+          - "RECOMMENDED ACTION: {{ _recommended_action }}"
+
+    - name: "[NOTIFY] | 7.2) Join report lines into body string"
+      ansible.builtin.set_fact:
+        _report_body: "{{ _report_lines | join('\n') }}"
+
+    # -----------------------------------------------------------------
+    # STEP 8: build format-specific webhook payload
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 8.1) Build Slack payload"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          text: "*{{ _report_title }}*\n{{ _report_body }}"
+      when: _webhook_format == 'slack'
+
+    - name: "[NOTIFY] | 8.2) Build Teams Adaptive Card payload"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          type: "message"
+          attachments:
+            - contentType: "application/vnd.microsoft.card.adaptive"
+              content:
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json"
+                type: "AdaptiveCard"
+                version: "1.4"
+                body:
+                  - type: "TextBlock"
+                    text: "{{ _report_title }}"
+                    weight: "Bolder"
+                    size: "Medium"
+                  - type: "TextBlock"
+                    text: "{{ _report_body }}"
+                    wrap: true
+      when: _webhook_format == 'teams'
+
+    - name: "[NOTIFY] | 8.3) Build generic-json payload (fallback for all other formats)"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          title: "{{ _report_title }}"
+          body: "{{ _report_body }}"
+          severity: "warning"
+          workflow: "{{ wf_name }}"
+          action: "{{ acm_dr_failover_action }}"
+          source_hub:
+            context: "{{ _source_context }}"
+            reachable: "{{ _source_reachable }}"
+            backup_phase: "{{ _source_backup_phase }}"
+            fenced: "{{ _source_fenced }}"
+          destination_hub:
+            context: "{{ _dest_context }}"
+            reachable: "{{ _dest_reachable }}"
+            restore_phase: "{{ _dest_restore_phase }}"
+            restore_complete: "{{ _dest_restore_complete }}"
+            mch_phase: "{{ _dest_mch_phase }}"
+          overall_state: "{{ _overall_state }}"
+      when: _webhook_format not in ['slack', 'teams']
+
+    # -----------------------------------------------------------------
+    # STEP 9: send the notification
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 9.1) POST diagnostic report to webhook"
+      ansible.builtin.uri:
+        url: "{{ _webhook_url }}"
+        method: POST
+        body: "{{ _webhook_payload | to_json }}"
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        status_code: [200, 202, 204]
+      no_log: true  # _webhook_url is a secret injected by the credential type
+      # Webhook delivery failure must not add another failed node to the WJT path.
+      # This is a diagnostic-only step; the operator already has the job log.
+      failed_when: false
+...

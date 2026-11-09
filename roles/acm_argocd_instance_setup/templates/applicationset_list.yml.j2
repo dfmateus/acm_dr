@@ -1,0 +1,33 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: {{ acm_argocd_instance_setup_name }}-applicationset
+  namespace: {{ acm_argocd_instance_setup_namespace }}
+spec:
+  generators:
+    - list:
+        elements:
+{% for app in acm_argocd_instance_setup_applications %}
+          - appName: {{ app.name }}
+            appPath: {{ app.path }}
+            destinationNamespace: {{ app.destination_namespace | default(app.name) }}
+            destinationServer: {{ app.destination_server | default('https://kubernetes.default.svc') }}
+{% endfor %}
+  template:
+    metadata:
+      name: '{{ '{{' }}appName{{ '}}' }}'
+    spec:
+      project: default
+      source:
+        repoURL: {{ acm_argocd_instance_setup_repo_url }}
+        targetRevision: {{ acm_argocd_instance_setup_repo_target_revision | default('main') }}
+        path: '{{ '{{' }}appPath{{ '}}' }}'
+      destination:
+        server: '{{ '{{' }}destinationServer{{ '}}' }}'
+        namespace: '{{ '{{' }}destinationNamespace{{ '}}' }}'
+      syncPolicy:
+{% if acm_argocd_instance_setup_sync_automated | default(true) | bool %}
+        automated:
+          prune: {{ acm_argocd_instance_setup_sync_prune | default(true) | bool | lower }}
+          selfHeal: {{ acm_argocd_instance_setup_sync_self_heal | default(true) | bool | lower }}
+{% endif %}

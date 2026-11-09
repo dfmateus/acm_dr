@@ -1,0 +1,147 @@
+---
+# roles/acm_argocd_instance/tasks/02_gitops_operator.yml
+# =============================================================================
+# STAGE 02: OPENSHIFT GITOPS OPERATOR (CLUSTER-WIDE, IDEMPOTENT)
+# =============================================================================
+# Note: the operator is a cluster-wide resource -- even with N ArgoCD instances
+# being created by this role in sequence (loop), this stage only actually installs
+# on the first call; on subsequent calls, all tasks below are no-op
+# (the operator is already present and ready).
+
+- name: "[GITOPS OPERATOR] | 2.1) Create Operator Namespace - {{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    kind: Namespace
+    name: "{{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+
+- name: "[GITOPS OPERATOR] | 2.2) Query existing OperatorGroups in the Namespace"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    namespace: "{{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+  register: acm_argocd_instance_setup_existing_og_info
+
+- name: "[GITOPS OPERATOR] | 2.3) Create OperatorGroup (if none exists yet)"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: openshift-gitops-operator-group
+        namespace: "{{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+      spec:
+        targetNamespaces:
+          - "{{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+  when: acm_argocd_instance_setup_existing_og_info.resources | default([]) | length == 0
+
+- name: "[GITOPS OPERATOR] | 2.4) Query the Operator PackageManifest from the OpenShift catalog"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: packages.operators.coreos.com/v1
+    kind: PackageManifest
+    name: openshift-gitops-operator
+    namespace: openshift-marketplace
+  register: acm_argocd_instance_setup_gitops_packagemanifest
+  when: acm_argocd_instance_setup_gitops_channel | default('auto') == 'auto'
+
+- name: "[GITOPS OPERATOR] | 2.5) Resolve dynamic Operator channel (defaultChannel / latest)"
+  ansible.builtin.set_fact:
+    acm_argocd_instance_setup_gitops_resolved_channel: >-
+      {{
+        acm_argocd_instance_setup_gitops_channel
+        if (acm_argocd_instance_setup_gitops_channel is defined and acm_argocd_instance_setup_gitops_channel != 'auto')
+        else (
+          acm_argocd_instance_setup_gitops_packagemanifest.resources[0].status.defaultChannel
+          if (
+            acm_argocd_instance_setup_gitops_packagemanifest.resources is defined and
+            acm_argocd_instance_setup_gitops_packagemanifest.resources | length > 0 and
+            acm_argocd_instance_setup_gitops_packagemanifest.resources[0].status.defaultChannel is defined
+          )
+          else 'latest'
+        )
+      }}
+
+- name: "[GITOPS OPERATOR] | 2.6) Install the Red Hat OpenShift GitOps Operator (Subscription)"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: openshift-gitops-operator
+        namespace: "{{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+      spec:
+        channel: "{{ acm_argocd_instance_setup_gitops_resolved_channel }}"
+        installPlanApproval: "{{ acm_argocd_instance_setup_gitops_approval | default('Automatic') }}"
+        name: openshift-gitops-operator
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+
+- name: "[GITOPS OPERATOR] | 2.7a) WAIT - Discover pending InstallPlan (Manual mode)"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: InstallPlan
+    namespace: "{{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+  register: acm_argocd_instance_setup_install_plans
+  until:
+    - (acm_argocd_instance_setup_install_plans.resources | default([])) | length > 0
+    - (acm_argocd_instance_setup_install_plans.resources | default([]) | selectattr('spec.approved', 'equalto', false) | list | length > 0)
+  retries: 30
+  delay: 10
+  when: acm_argocd_instance_setup_gitops_approval | default('Automatic') == 'Manual'
+  ignore_errors: true
+
+- name: "[GITOPS OPERATOR] | 2.7b) Approve pending GitOps Operator InstallPlan"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: patched
+    api_version: operators.coreos.com/v1alpha1
+    kind: InstallPlan
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace }}"
+    definition:
+      spec:
+        approved: true
+  loop: "{{ acm_argocd_instance_setup_install_plans.resources | default([]) | selectattr('spec.approved', 'equalto', false) | list }}"
+  when:
+    - acm_argocd_instance_setup_gitops_approval | default('Automatic') == 'Manual'
+    - acm_argocd_instance_setup_install_plans.resources is defined
+
+- name: "[GITOPS OPERATOR] | 2.8) WAIT - Validate GitOps Operator Controller Manager readiness"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    namespace: "{{ acm_argocd_instance_setup_gitops_operator_namespace }}"
+    name: openshift-gitops-operator-controller-manager
+  register: acm_argocd_instance_setup_gitops_op_deploy
+  until:
+    - (acm_argocd_instance_setup_gitops_op_deploy.resources | default([])) | length > 0
+    - acm_argocd_instance_setup_gitops_op_deploy.resources[0].status.readyReplicas | default(0) | int > 0
+  retries: 40
+  delay: 10
+  ignore_errors: true
+
+# GitOps operator diagnostic.
+- name: "[GITOPS OPERATOR DIAGNOSTIC] | ❌ GitOps operator install failed"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => GitOps operator install failed on context '{{ k8s_target_context }}'.
+      {% if acm_argocd_instance_setup_install_plans is defined
+      and acm_argocd_instance_setup_install_plans is failed
+      %}InstallPlan discovery timed out (Manual approval mode). Check CatalogSource health:
+      oc get catalogsource -n openshift-marketplace --context {{ k8s_target_context }}.
+      {% elif acm_argocd_instance_setup_gitops_op_deploy is failed
+      %}Controller Manager Deployment has no ready replicas after 6.7 minutes.
+      Check operator pod logs: oc logs -n {{ acm_argocd_instance_setup_gitops_operator_namespace }}
+      -l control-plane=gitops-operator --context {{ k8s_target_context }}.
+      {% endif %}
+  when: >-
+    (acm_argocd_instance_setup_install_plans is defined and acm_argocd_instance_setup_install_plans is failed) or
+    acm_argocd_instance_setup_gitops_op_deploy is failed
+...

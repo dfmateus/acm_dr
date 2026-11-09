@@ -1,0 +1,23 @@
+---
+# =============================================================================
+# BOOTSTRAP RBAC - namespace, ServiceAccount, ClusterRoleBinding, token Secret
+#
+# All resources use state: present - safe to re-run on a cluster that already
+# has the SA. Kubernetes no-ops on resources that match the desired spec.
+# =============================================================================
+
+- name: "[BOOTSTRAP - RBAC] | 2.1.1) Apply automation namespace, SA, CRB, and token Secret"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context | default(omit) }}"
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'rbac/ansible_dr_orchestrator_rbac.yml.j2') }}"
+  register: acm_dr_cluster_onboard_rbac_apply
+  no_log: "{{ acm_dr_cluster_onboard_debug_no_log | bool }}"
+
+- name: "[BOOTSTRAP - RBAC] | 2.1.2) Confirm RBAC objects were created or already present"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ SA '{{ acm_dr_cluster_onboard_sa_name }}' in namespace
+      '{{ acm_dr_cluster_onboard_namespace }}' - RBAC applied
+      (changed={{ acm_dr_cluster_onboard_rbac_apply.changed }}).
+...

@@ -1,0 +1,31 @@
+---
+# .ansible-lint
+
+profile: production # min, basic, moderate,safety, shared, production
+
+exclude_paths:
+  - .github/
+  - changelogs/
+  - .ansible/
+  - tests/
+  - ignore_*
+  - ignore_*/
+
+use_default_rules: true
+
+skip_list:
+  - role-name[path]
+
+enable_list:
+  - args
+  - empty-string-compare # opt-in
+  - no-log-password # opt-in
+  - no-same-owner # opt-in
+  - galaxy-version-incorrect # opt-in
+  - yaml
+
+warn_list:
+  - experimental
+
+offline: true
+...

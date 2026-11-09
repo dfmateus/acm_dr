@@ -1,0 +1,62 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/main.yml
+
+- name: "MAIN | Display ArgoCD instance cleanup initialization status"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_argocd_instance_cleanup_banner_title: "🧹 ACM ARGOCD INSTANCE CLEANUP - '{{ acm_argocd_instance_cleanup_name }}'"
+    acm_argocd_instance_cleanup_banner_lines:
+      - "🎯 TARGET CONTEXT: {{ k8s_target_context | default('NOT DEFINED') }}"
+      - "📂 NAMESPACE:      {{ acm_argocd_instance_cleanup_namespace | default('NOT DEFINED') }}"
+      - >-
+        🔎 EXECUTION MODE: {{ (acm_argocd_instance_cleanup_dry_run | default(false) | bool)
+        | ternary('DRY-RUN (simulation)', 'PRODUCTION (actual removal)') }}
+  run_once: true
+  tags:
+    - always
+
+- name: "[ARGOCD CLEANUP] | Validate parameters and safety gate"
+  ansible.builtin.import_tasks: 00_preflight.yml
+  tags:
+    - always
+    - preflight
+    - stage00
+
+- name: "[ARGOCD CLEANUP] | Remove Applications/ApplicationSet (controller still running)"
+  ansible.builtin.import_tasks: 01_remove_applications.yml
+  tags:
+    - remove_applications
+    - stage01
+
+- name: "[ARGOCD CLEANUP] | Remove managed Namespaces (conditional)"
+  ansible.builtin.import_tasks: 02_remove_managed_namespaces.yml
+  when: acm_argocd_instance_cleanup_remove_managed_namespaces | default(true) | bool
+  tags:
+    - remove_namespaces
+    - stage02
+
+- name: "[ARGOCD CLEANUP] | Remove ConsoleLink"
+  ansible.builtin.import_tasks: 03_remove_console_link.yml
+  tags:
+    - remove_console_link
+    - stage03
+
+- name: "[ARGOCD CLEANUP] | Remove cluster-scoped RBAC"
+  ansible.builtin.import_tasks: 04_remove_rbac.yml
+  tags:
+    - remove_rbac
+    - stage04
+
+- name: "[ARGOCD CLEANUP] | Remove the ArgoCD instance (CR + Namespace)"
+  ansible.builtin.import_tasks: 05_remove_instance.yml
+  tags:
+    - remove_instance
+    - stage05
+
+- name: "[ARGOCD CLEANUP] | Display completion summary"
+  ansible.builtin.import_tasks: 06_summary.yml
+  tags:
+    - summary
+    - stage06
+...

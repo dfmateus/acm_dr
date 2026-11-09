@@ -1,0 +1,207 @@
+---
+# roles/acm_dr_failover_manager/tasks/05_create_schedule.yml
+
+- name: "[STAGE 05 - Protect New Leader] | Display new Leader protection activation metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🛡️ STAGE 05 - Protect New Leader (Create BackupSchedule)"
+    acm_dr_failover_manager_banner_lines:
+      - "✅ NEW HUB: {{ passive_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+- name: "[STAGE 05 - Protect New Leader] | 5.1.1) Apply BackupSchedule policy - {{ passive_hub }}"
+  kubernetes.core.k8s:
+    context: "{{ passive_hub }}"
+    state: present
+    definition:
+      apiVersion: cluster.open-cluster-management.io/v1beta1
+      kind: BackupSchedule
+      metadata:
+        name: "{{ acm_dr_failover_manager_schedule_name }}"
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+      spec:
+        veleroSchedule: "{{ acm_dr_failover_manager_velero_schedule }}"
+        veleroTtl: "{{ acm_dr_failover_manager_velero_ttl }}"
+        useManagedServiceAccount: true
+        noBackupOnStart: "{{ acm_dr_failover_manager_backup_no_backup_on_start | default(false) | bool }}"
+        managedServiceAccountTTL: "{{ acm_dr_failover_manager_managed_service_account_ttl | default('') | ternary(acm_dr_failover_manager_managed_service_account_ttl, omit) }}"
+        paused: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 05 - Protect New Leader] | 5.1.2) Backup schedule activation audit"
+  ansible.builtin.debug:
+    msg: >-
+      {{ '🔎 [DRY-RUN]: BackupSchedule would be activated' if (acm_dr_failover_manager_dry_run | default(false) | bool)
+         else '✅ [NEW LEADER PROTECTED]: BackupSchedule activated successfully' }}
+      '{{ acm_dr_failover_manager_schedule_name }}' on Hub '{{ passive_hub }}'.
+
+# -----------------------------------------------------------------------------
+# 5.1.3-5.1.4) BACKUP COLLISION GUARD
+# -----------------------------------------------------------------------------
+# After failback, the storage already holds backups written by the former DR
+# leader (a different clusterID). ACM's backup operator detects the mismatch
+# and sets the BackupSchedule phase to BackupCollision, refusing to schedule
+# new backups until the conflict is cleared.
+# Fix: poll for the phase, delete the colliding schedule, recreate it. The
+# operator then registers the current clusterID as the authoritative writer.
+# This is a no-op on first-time failover (storage is empty for this cluster).
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 05 - Protect New Leader] | 5.1.3) Poll BackupSchedule phase after apply - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    name: "{{ acm_dr_failover_manager_schedule_name }}"
+  register: acm_dr_failover_manager_schedule_phase
+  # Wait until the operator sets a non-empty phase (Enabled or BackupCollision)
+  until: >-
+    acm_dr_failover_manager_schedule_phase.resources | default([]) | length > 0
+    and acm_dr_failover_manager_schedule_phase.resources[0].status is defined
+    and acm_dr_failover_manager_schedule_phase.resources[0].status.phase | default('') != ''
+  retries: 12  # count - 12 × 5 s = 60 s max; operator reconciles quickly
+  delay: 5
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  failed_when: false
+
+- name: "[STAGE 05 - Protect New Leader] | 5.1.4) Recycle BackupSchedule on BackupCollision - {{ passive_hub }}"
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_schedule_phase.resources | default([]) | length > 0
+    - acm_dr_failover_manager_schedule_phase.resources[0].status.phase | default('') == 'BackupCollision'
+  block:
+    - name: "[STAGE 05 - Protect New Leader] | 5.1.4a) ⚠️ BackupCollision detected - logging diagnostic"
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️ BackupCollision on Hub '{{ passive_hub }}': the storage location already has
+          backups from a different clusterID (prior DR leader). Recycling the BackupSchedule
+          to register the current cluster as the authoritative writer.
+
+    - name: "[STAGE 05 - Protect New Leader] | 5.1.4b) Delete colliding BackupSchedule"
+      kubernetes.core.k8s:
+        context: "{{ passive_hub }}"
+        state: absent
+        api_version: cluster.open-cluster-management.io/v1beta1
+        kind: BackupSchedule
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+        name: "{{ acm_dr_failover_manager_schedule_name }}"
+
+    - name: "[STAGE 05 - Protect New Leader] | 5.1.4c) Wait for BackupSchedule deletion to complete"
+      kubernetes.core.k8s_info:
+        context: "{{ passive_hub }}"
+        api_version: cluster.open-cluster-management.io/v1beta1
+        kind: BackupSchedule
+        namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+        name: "{{ acm_dr_failover_manager_schedule_name }}"
+      register: acm_dr_failover_manager_schedule_gone
+      until: acm_dr_failover_manager_schedule_gone.resources | default([]) | length == 0
+      retries: 12  # count - 12 × 5 s = 60 s max
+      delay: 5
+
+    - name: "[STAGE 05 - Protect New Leader] | 5.1.4d) Recreate BackupSchedule after collision clear"
+      kubernetes.core.k8s:
+        context: "{{ passive_hub }}"
+        state: present
+        definition:
+          apiVersion: cluster.open-cluster-management.io/v1beta1
+          kind: BackupSchedule
+          metadata:
+            name: "{{ acm_dr_failover_manager_schedule_name }}"
+            namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+          spec:
+            veleroSchedule: "{{ acm_dr_failover_manager_velero_schedule }}"
+            veleroTtl: "{{ acm_dr_failover_manager_velero_ttl }}"
+            useManagedServiceAccount: true
+            noBackupOnStart: "{{ acm_dr_failover_manager_backup_no_backup_on_start | default(false) | bool }}"
+            managedServiceAccountTTL: >-
+              {{ acm_dr_failover_manager_managed_service_account_ttl | default('')
+                 | ternary(acm_dr_failover_manager_managed_service_account_ttl, omit) }}
+            paused: false
+
+    - name: "[STAGE 05 - Protect New Leader] | 5.1.4e) ✅ BackupCollision cleared - schedule recycled"
+      ansible.builtin.debug:
+        msg: >-
+          ✅ [COLLISION CLEARED]: BackupSchedule '{{ acm_dr_failover_manager_schedule_name }}'
+          recycled on Hub '{{ passive_hub }}'. BackupCollision is expected after failback when
+          the storage has backups from the prior leader. The new schedule resumes writes from
+          this cluster's ID.
+
+    - name: "[STAGE 05 - Protect New Leader] | 5.1.4f) Notify operator: BackupCollision auto-resolved"
+      ansible.builtin.include_tasks: common/notify_event.yml
+      vars:
+        _notify_title: "ACM DR - BackupCollision Auto-Resolved"
+        _notify_severity: "warning"
+        _notify_message: >-
+          BackupCollision detected and auto-resolved on DR Hub '{{ passive_hub }}'.
+          The storage had backups from a prior cluster ID (previous DR leader).
+          BackupSchedule '{{ acm_dr_failover_manager_schedule_name }}' was recycled.
+          This is expected after failback between the same Hub pair.
+          Confirm new backups are completing on '{{ passive_hub }}' after failover.
+
+# -----------------------------------------------------------------------------
+# 5.2) FLEET SECRET REFRESH (POST-RESTORE SYNC)
+# -----------------------------------------------------------------------------
+# The OADP Restore on the destination Hub overwrites the fleet kubeconfig
+# Secret with whatever version was in the last backup. If new Spokes were
+# onboarded after that backup, the destination Hub's fleet is stale.
+# This block reads the fleet Secret from the source Hub (which was active
+# and has the latest fleet) and applies it to the destination Hub so the
+# next failover/failback finds all Spoke contexts.
+# -----------------------------------------------------------------------------
+
+- name: "[STAGE 05 - Protect New Leader] | 5.2) Fleet Secret refresh"
+  when: acm_dr_failover_manager_fleet_refresh_enabled | default(true) | bool
+  block:
+    - name: "[STAGE 05 - Protect New Leader] | 5.2.1) Read fleet kubeconfig Secret from source Hub"
+      kubernetes.core.k8s_info:
+        context: "{{ active_hub }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ acm_dr_failover_manager_fleet_secret_namespace }}"
+        name: "{{ acm_dr_failover_manager_fleet_secret_name }}"
+      register: acm_dr_failover_manager_source_fleet_secret
+      # Fleet Secret contains bearer tokens for every Spoke SA
+      no_log: "{{ acm_dr_failover_manager_debug_no_log }}"
+      failed_when: false
+      check_mode: false
+
+    - name: "[STAGE 05 - Protect New Leader] | 5.2.2) Sync fleet kubeconfig Secret to destination Hub"
+      kubernetes.core.k8s:
+        context: "{{ passive_hub }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ acm_dr_failover_manager_fleet_secret_name }}"
+            namespace: "{{ acm_dr_failover_manager_fleet_secret_namespace }}"
+            labels:
+              # OADP backup label so the fleet replicates to passive Hubs
+              cluster.open-cluster-management.io/backup: cluster
+              app.kubernetes.io/managed-by: ansible-dr-orchestrator
+          data: "{{ acm_dr_failover_manager_source_fleet_secret.resources[0].data }}"
+      # Fleet Secret contains bearer tokens for every Spoke SA
+      no_log: "{{ acm_dr_failover_manager_debug_no_log }}"
+      check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+      diff: false
+      when:
+        - acm_dr_failover_manager_source_fleet_secret.resources | default([]) | length > 0
+
+    - name: "[STAGE 05 - Protect New Leader] | 5.2.3) Fleet Secret refresh result"
+      ansible.builtin.debug:
+        msg: >-
+          {% if acm_dr_failover_manager_dry_run | default(false) | bool %}
+          🔎 [DRY-RUN] Would sync fleet Secret '{{ acm_dr_failover_manager_fleet_secret_name }}'
+          from {{ active_hub }} to {{ passive_hub }}
+          {% elif acm_dr_failover_manager_source_fleet_secret.resources | default([]) | length > 0 %}
+          ✅ Fleet Secret '{{ acm_dr_failover_manager_fleet_secret_name }}' synced
+          from {{ active_hub }} to {{ passive_hub }}
+          {% else %}
+          ⚠️ Fleet Secret '{{ acm_dr_failover_manager_fleet_secret_name }}' not found
+          on {{ active_hub }} - skipped. Spoke contexts may be stale on the new leader
+          {% endif %}
+...

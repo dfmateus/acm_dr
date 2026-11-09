@@ -1,0 +1,312 @@
+---
+# roles/acm_dr_kubeconfig_resolver/tasks/main.yml
+# =============================================================================
+# KUBECONFIG RESOLVER - RUNTIME KUBECONFIG ASSEMBLY FROM PER-CLUSTER CREDENTIALS
+# =============================================================================
+# Scans env vars injected by AAP custom credential types (or exported locally
+# via examples/scripts/lib/load_cluster_env.sh), builds a multi-context kubeconfig, and sets
+# the fact 'acm_dr_kubeconfig_path' for module_defaults to pick up.
+#
+# If no per-cluster env vars are detected, the role is a no-op - the playbook
+# falls back to the legacy KUBECONFIG / K8S_AUTH_KUBECONFIG env vars.
+
+# ---------------------------------------------------------------------------
+# STEP 1: Detect per-cluster env vars and build an entry list
+# ---------------------------------------------------------------------------
+# For each prefix in acm_dr_kubeconfig_resolver_cluster_prefixes, check if
+# <PREFIX>_HOST, <PREFIX>_TOKEN, and <PREFIX>_CONTEXT are all present and
+# non-empty. AAP injects empty strings for optional fields that were not
+# filled in, so we guard against '' with the length > 0 check.
+- name: "[KUBECONFIG RESOLVER] | 1.1) Scan per-cluster env vars for each prefix"
+  ansible.builtin.set_fact:
+    # Build a list of cluster entry dicts from env vars that are present and non-empty.
+    # Each entry has: prefix, host, token, ca_data, context_name
+    acm_dr_kubeconfig_resolver_entries: >-
+      {% set ns = namespace(items=[]) %}
+      {% for prefix in acm_dr_kubeconfig_resolver_cluster_prefixes %}
+        {% set host = lookup('ansible.builtin.env', prefix ~ '_HOST', default='') %}
+        {% set token = lookup('ansible.builtin.env', prefix ~ '_TOKEN', default='') %}
+        {% set context = lookup('ansible.builtin.env', prefix ~ '_CONTEXT', default='') %}
+        {% set ca = lookup('ansible.builtin.env', prefix ~ '_CA_DATA', default='') %}
+        {% if host | length > 0 and token | length > 0 and context | length > 0 %}
+          {% set _ = ns.items.append({
+            'prefix': prefix,
+            'host': host,
+            'token': token,
+            'ca_data': ca,
+            'context_name': context
+          }) %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.items }}
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # entries contain bearer tokens
+
+# Jinja2 rendered via >- produces a string ("[]" not []).
+# Parse it into a proper Python list so | length and attribute access work.
+- name: "[KUBECONFIG RESOLVER] | 1.2) Parse raw entries string into a structured list"
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_entries: "{{ acm_dr_kubeconfig_resolver_entries | from_yaml | default([], true) }}"
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # entries contain bearer tokens
+
+# ---------------------------------------------------------------------------
+# STEP 2: Detect spoke fleet kubeconfig (failover orchestrator scenario)
+# ---------------------------------------------------------------------------
+# The failover orchestrator needs contexts for dynamically discovered Spokes.
+# These come from a kubeconfig file path in ACM_DR_SPOKE_FLEET_KUBECONFIG
+# (injected by AAP's "ACM DR - Spoke Fleet Kubeconfig" credential type, or exported
+# locally via 'export ACM_DR_SPOKE_FLEET_KUBECONFIG=~/.kube/spoke-fleet.kubeconfig').
+- name: "[KUBECONFIG RESOLVER] | 2.1) Check for spoke fleet kubeconfig env var"
+  ansible.builtin.set_fact:
+    # Read the env var and store the path - empty string if not set
+    acm_dr_kubeconfig_resolver_fleet_path: "{{ lookup('ansible.builtin.env', acm_dr_kubeconfig_resolver_spoke_fleet_env_var, default='') }}"
+
+- name: "[KUBECONFIG RESOLVER] | 2.2) Read spoke fleet kubeconfig file content"
+  # Only runs when the fleet kubeconfig env var points to an actual file.
+  # Reads the file and parses its YAML so the template can merge the fleet
+  # contexts alongside the per-cluster entries in the assembled kubeconfig.
+  ansible.builtin.slurp:
+    src: "{{ acm_dr_kubeconfig_resolver_fleet_path }}"
+  register: acm_dr_kubeconfig_resolver_fleet_raw
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # kubeconfig content contains tokens
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_path | length > 0
+
+- name: "[KUBECONFIG RESOLVER] | 2.3) Parse spoke fleet kubeconfig YAML"
+  # Converts the base64-encoded slurp output to a YAML dict so the Jinja2
+  # template can iterate over its clusters/users/contexts entries.
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_fleet_parsed: "{{ (acm_dr_kubeconfig_resolver_fleet_raw.content | b64decode | from_yaml) }}"
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # parsed kubeconfig contains tokens
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_raw is defined
+    - acm_dr_kubeconfig_resolver_fleet_raw is not skipped
+    - acm_dr_kubeconfig_resolver_fleet_raw.content is defined
+
+# Track fleet source for the status report (Step 5)
+- name: "[KUBECONFIG RESOLVER] | 2.4) Record fleet source as file-based"
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_fleet_source: "file"
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_parsed is defined
+
+# ---------------------------------------------------------------------------
+# STEP 2a: Auto-read spoke fleet from Hub Secret (dynamic fleet discovery)
+# ---------------------------------------------------------------------------
+# When no fleet kubeconfig file was provided (ACM_DR_SPOKE_FLEET_KUBECONFIG not
+# set or empty), and Source Hub credentials exist in the entries list (failover
+# orchestrator scenario), the resolver reads the fleet from a Secret stored on
+# the Source Hub. The Secret is maintained by 03_build_spoke_fleet.sh --push-secret
+# and labeled cluster.open-cluster-management.io/backup=cluster so OADP
+# replicates it to passive Hubs automatically.
+#
+# This makes Spoke fleet management fully dynamic: onboard a new Spoke, rebuild
+# with --push-secret, and the next failover picks it up without touching AAP.
+#
+# Uses kubernetes.core.k8s_info with host/api_key directly (the runtime
+# kubeconfig hasn't been written yet at this point in the flow). TLS
+# verification follows the same policy as the generated kubeconfig
+# (skip_tls_when_no_ca). For clusters with custom CAs, use the file-based
+# fleet (ACM_DR_SPOKE_FLEET_KUBECONFIG env var) instead.
+
+- name: "[KUBECONFIG RESOLVER] | 2a.0) Identify Source Hub entry for fleet Secret read"
+  # Extract the Source Hub credentials from the per-cluster entries list so we
+  # can connect directly via host/api_key (runtime kubeconfig not yet written).
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_source_entry: >-
+      {{ acm_dr_kubeconfig_resolver_entries
+         | selectattr('prefix', 'equalto', 'ACM_DR_SOURCE')
+         | list | first | default(None) }}
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # entry contains bearer token
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_secret_enabled | bool
+    - acm_dr_kubeconfig_resolver_fleet_parsed is not defined
+    - acm_dr_kubeconfig_resolver_entries | length > 0
+
+- name: "[KUBECONFIG RESOLVER] | 2a.1) Read spoke fleet Secret from Source Hub"
+  kubernetes.core.k8s_info:
+    host: "{{ acm_dr_kubeconfig_resolver_source_entry.host }}"
+    api_key: "{{ acm_dr_kubeconfig_resolver_source_entry.token }}"
+    # TLS policy mirrors the generated kubeconfig: skip verification when no CA
+    # data is provided (default for ARO/public-CA clusters). For private-CA
+    # clusters, use the file-based fleet approach instead.
+    validate_certs: "{{ not (acm_dr_kubeconfig_resolver_skip_tls_when_no_ca | default(true) | bool) }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_kubeconfig_resolver_fleet_secret_namespace }}"
+    name: "{{ acm_dr_kubeconfig_resolver_fleet_secret_name }}"
+  register: acm_dr_kubeconfig_resolver_fleet_secret_info
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # Secret contains bearer tokens
+  failed_when: false  # graceful fallback - Secret might not exist yet
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_secret_enabled | bool
+    - acm_dr_kubeconfig_resolver_fleet_parsed is not defined
+    - acm_dr_kubeconfig_resolver_source_entry is defined
+    # Must be a dict with host/token keys, not an empty string or None.
+    # When no ACM_DR_SOURCE_* env vars exist, default(None) renders as ""
+    # via >- block scalar, which passes != None / != 'None' checks but
+    # fails at template time when accessing .host.
+    - acm_dr_kubeconfig_resolver_source_entry is mapping
+
+- name: "[KUBECONFIG RESOLVER] | 2a.2) Parse spoke fleet kubeconfig from Hub Secret"
+  # Decode the base64 Secret data and parse as YAML, producing the same
+  # fleet_parsed structure that the file-based path (Step 2.3) creates.
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_fleet_parsed: >-
+      {{ acm_dr_kubeconfig_resolver_fleet_secret_info.resources[0].data[acm_dr_kubeconfig_resolver_fleet_secret_key]
+         | b64decode | from_yaml }}
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # parsed kubeconfig contains tokens
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_secret_info is defined
+    - acm_dr_kubeconfig_resolver_fleet_secret_info.resources | default([]) | length > 0
+    - acm_dr_kubeconfig_resolver_fleet_secret_info.resources[0].data[acm_dr_kubeconfig_resolver_fleet_secret_key] is defined
+
+- name: "[KUBECONFIG RESOLVER] | 2a.3) Record fleet source as Hub Secret"
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_fleet_source: "hub_secret"
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_source | default('none') == 'none'
+    - acm_dr_kubeconfig_resolver_fleet_parsed is defined
+
+- name: "[KUBECONFIG RESOLVER] | 2a.4) ⚠️ No fleet Secret found on Source Hub"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ acm_dr_kubeconfig_resolver tried to read fleet Secret
+      '{{ acm_dr_kubeconfig_resolver_fleet_secret_name }}' from namespace
+      '{{ acm_dr_kubeconfig_resolver_fleet_secret_namespace }}' on the Source Hub,
+      but the Secret was not found. Spoke fleet contexts will not be available.
+      Run 03_build_spoke_fleet.sh --auto --push-secret to create it.
+  when:
+    - acm_dr_kubeconfig_resolver_fleet_secret_enabled | bool
+    - acm_dr_kubeconfig_resolver_fleet_source | default('none') == 'none'
+    - acm_dr_kubeconfig_resolver_source_entry is defined
+    - acm_dr_kubeconfig_resolver_source_entry is mapping
+
+# ---------------------------------------------------------------------------
+# STEP 2b: Read passive hub fleet kubeconfig (N+ topology)
+# ---------------------------------------------------------------------------
+# When the topology includes more than two hubs (Hub Primary + Hub Secondary +
+# one or more additional passive hubs), Stage 05a of the Failover Orchestrator
+# needs kubeconfig contexts for every additional passive hub. These come from a
+# kubeconfig file path in ACM_DR_PASSIVE_HUB_FLEET_KUBECONFIG, injected by the
+# "ACM DR - Passive Hub Fleet" credential type.
+#
+# Unlike the spoke fleet (which can be auto-read from a Hub Secret), the passive
+# hub fleet has no auto-read fallback: additional hubs are explicitly provisioned
+# by the operator and stored in the credential.
+- name: "[KUBECONFIG RESOLVER] | 2b.1) Check for passive hub fleet kubeconfig env var"
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_passive_hub_fleet_path: "{{ lookup('ansible.builtin.env', acm_dr_kubeconfig_resolver_passive_hub_fleet_env_var, default='') }}"
+
+- name: "[KUBECONFIG RESOLVER] | 2b.2) Read passive hub fleet kubeconfig file content"
+  # Only runs when ACM_DR_PASSIVE_HUB_FLEET_KUBECONFIG points to an actual file.
+  # Reads and base64-encodes the file so Step 2b.3 can decode and parse it.
+  ansible.builtin.slurp:
+    src: "{{ acm_dr_kubeconfig_resolver_passive_hub_fleet_path }}"
+  register: acm_dr_kubeconfig_resolver_passive_hub_fleet_raw
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # kubeconfig content contains tokens
+  when:
+    - acm_dr_kubeconfig_resolver_passive_hub_fleet_path | length > 0
+
+- name: "[KUBECONFIG RESOLVER] | 2b.3) Parse passive hub fleet kubeconfig YAML"
+  # Converts the base64-encoded slurp output to a YAML dict so the Jinja2
+  # template can iterate over its clusters/users/contexts entries alongside
+  # the spoke fleet and per-cluster entries.
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_passive_hub_fleet_parsed: "{{ (acm_dr_kubeconfig_resolver_passive_hub_fleet_raw.content | b64decode | from_yaml) }}"
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # parsed kubeconfig contains tokens
+  when:
+    - acm_dr_kubeconfig_resolver_passive_hub_fleet_raw is defined
+    - acm_dr_kubeconfig_resolver_passive_hub_fleet_raw is not skipped
+    - acm_dr_kubeconfig_resolver_passive_hub_fleet_raw.content is defined
+
+# ---------------------------------------------------------------------------
+# STEP 3: Determine if there is anything to assemble
+# ---------------------------------------------------------------------------
+# The resolver is a no-op when no per-cluster env vars AND no fleet kubeconfig
+# are detected. This keeps full backward compatibility with the legacy
+# monolithic KUBECONFIG approach.
+- name: "[KUBECONFIG RESOLVER] | 3.1) Evaluate whether a runtime kubeconfig is needed"
+  ansible.builtin.set_fact:
+    # True when at least one per-cluster entry, a spoke fleet, or a passive hub fleet exists
+    acm_dr_kubeconfig_resolver_has_entries: >-
+      {{ (acm_dr_kubeconfig_resolver_entries | length > 0) or
+         (acm_dr_kubeconfig_resolver_fleet_parsed is defined and
+          acm_dr_kubeconfig_resolver_fleet_parsed.contexts | default([]) | length > 0) or
+         (acm_dr_kubeconfig_resolver_passive_hub_fleet_parsed is defined and
+          acm_dr_kubeconfig_resolver_passive_hub_fleet_parsed.contexts | default([]) | length > 0) }}
+
+# ---------------------------------------------------------------------------
+# STEP 4: Assemble and write the runtime kubeconfig
+# ---------------------------------------------------------------------------
+- name: "[KUBECONFIG RESOLVER] | 4.1) Render runtime kubeconfig from detected credentials"
+  # Renders the Jinja2 template that merges per-cluster entries and fleet
+  # contexts into a single kubeconfig file. Written with mode 0600 because
+  # the file contains bearer tokens.
+  ansible.builtin.template:
+    src: runtime_kubeconfig.yml.j2
+    dest: "{{ acm_dr_kubeconfig_resolver_tempfile_path }}"
+    mode: "0600"  # owner-only - file contains bearer tokens
+  no_log: "{{ acm_dr_kubeconfig_resolver_debug_no_log | default(true) | bool }}"  # rendered kubeconfig contains tokens
+  when:
+    - acm_dr_kubeconfig_resolver_has_entries | bool
+
+- name: "[KUBECONFIG RESOLVER] | 4.2) Set acm_dr_kubeconfig_path fact for module_defaults"  # noqa var-naming[no-role-prefix]
+  # This fact is consumed by module_defaults in the playbook via lazy Jinja2
+  # evaluation: kubeconfig: "{{ acm_dr_kubeconfig_path | default(...) }}"
+  # When set, it takes precedence over K8S_AUTH_KUBECONFIG / KUBECONFIG env vars.
+  # The variable name intentionally omits the role prefix because it is a cross-role
+  # contract: every playbook's module_defaults references 'acm_dr_kubeconfig_path'.
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_path: "{{ acm_dr_kubeconfig_resolver_tempfile_path }}"  # noqa var-naming[no-role-prefix]
+  when:
+    - acm_dr_kubeconfig_resolver_has_entries | bool
+
+# ---------------------------------------------------------------------------
+# STEP 5: Status report
+# ---------------------------------------------------------------------------
+- name: "[KUBECONFIG RESOLVER] | 5.0) Build context count summary for report"
+  # Pre-compute context counts so the report message stays readable.
+  ansible.builtin.set_fact:
+    acm_dr_kubeconfig_resolver_per_cluster_count: "{{ acm_dr_kubeconfig_resolver_entries | length }}"
+    acm_dr_kubeconfig_resolver_fleet_count: "{{ (acm_dr_kubeconfig_resolver_fleet_parsed.contexts | default([])) | length if acm_dr_kubeconfig_resolver_fleet_parsed is defined else 0 }}"
+    acm_dr_kubeconfig_resolver_passive_hub_fleet_count: "{{ (acm_dr_kubeconfig_resolver_passive_hub_fleet_parsed.contexts | default([])) | length if acm_dr_kubeconfig_resolver_passive_hub_fleet_parsed is defined else 0 }}"
+    acm_dr_kubeconfig_resolver_detected_prefixes: "{{ acm_dr_kubeconfig_resolver_entries | map(attribute='prefix') | list | join(', ') }}"
+  when:
+    - acm_dr_kubeconfig_resolver_has_entries | bool
+
+- name: "[KUBECONFIG RESOLVER] | 5.1) ✅ Report runtime kubeconfig assembled"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ PASSED! Oh. Yes! => acm_dr_kubeconfig_resolver assembled a runtime kubeconfig
+      with {{ acm_dr_kubeconfig_resolver_per_cluster_count }} per-cluster context(s)
+      + {{ acm_dr_kubeconfig_resolver_fleet_count }} spoke fleet context(s)
+      [fleet source: {{ acm_dr_kubeconfig_resolver_fleet_source | default('none') }}]
+      + {{ acm_dr_kubeconfig_resolver_passive_hub_fleet_count }} passive hub fleet context(s)
+      at {{ acm_dr_kubeconfig_resolver_tempfile_path }}.
+      Detected prefixes: {{ acm_dr_kubeconfig_resolver_detected_prefixes }}.
+  when:
+    - acm_dr_kubeconfig_resolver_has_entries | bool
+
+- name: "[KUBECONFIG RESOLVER] | 5.2) 🔎 No per-cluster env vars detected - falling back to ambient credentials"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 acm_dr_kubeconfig_resolver found no per-cluster env vars (ACM_DR_*_HOST/TOKEN/CONTEXT).
+      Falling back to ambient credentials in this order: K8S_AUTH_HOST + K8S_AUTH_API_KEY
+      (AAP built-in OpenShift Bearer Token credential), then K8S_AUTH_KUBECONFIG / KUBECONFIG
+      (monolithic kubeconfig file). This is expected for bootstrap runs using a temporary
+      cluster-admin token, or when running locally with a multi-context kubeconfig.
+  when:
+    - not (acm_dr_kubeconfig_resolver_has_entries | bool)
+
+# ---------------------------------------------------------------------------
+# STEP 6: Control plane topology detection (ARO Classic vs HCP, platform)
+# ---------------------------------------------------------------------------
+# Runs after the kubeconfig is assembled so k8s_info can reach the target.
+# Sets cross-role facts: acm_dr_control_plane_topology, acm_dr_platform,
+# acm_dr_is_hosted_control_plane. Graceful no-op on non-OCP clusters.
+- name: "[KUBECONFIG RESOLVER] | Execute topology detection on target cluster"
+  ansible.builtin.include_tasks: 01_topology_detection.yml
+  when:
+    - k8s_target_context is defined
+    - k8s_target_context | default('', true) | length > 0
+...

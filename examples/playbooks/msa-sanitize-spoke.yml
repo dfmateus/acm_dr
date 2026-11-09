@@ -1,0 +1,149 @@
+---
+# playbooks/test-sanitize-spoke.yml
+# =============================================================================
+# KCS 7039710 TOKEN SANITIZATION ISOLATED TEST
+#
+# Description:
+#   Atomic test bench for the ManagedServiceAccount token sanitization and
+#   re-import flow described in KCS 7039710 (https://access.redhat.com/solutions/7039710).
+#   Targets a single Spoke against a single Hub without running the full 9-stage
+#   failover pipeline. Use this to verify the sanitization logic in isolation,
+#   reproduce the KCS 7039710 symptom against a known-bad Spoke, or validate
+#   a fix before pushing it to the full orchestrator.
+#
+#   The playbook:
+#     1. Discovers ManagedServiceAccount objects in the Spoke namespace on the Hub
+#        with status.conditions[TokenReported].status=False (the KCS 7039710 symptom)
+#     2. Purges those MSA objects and their associated Secrets
+#     3. Re-injects the auto-import-secret for the Spoke
+#     4. Waits for ManagedClusterConditionAvailable=True on the Hub
+#
+# Usage:
+#   ansible-playbook playbooks/test-sanitize-spoke.yml \
+#     -e test_hub_context=acmdr-hub-dr-01-sa \
+#     -e test_spoke_name=aro-spoke-01
+#
+#   With per-cluster credentials (AAP or load_cluster_env.sh):
+#     source examples/scripts/lib/load_cluster_env.sh source ~/.kube/clusters/hub-dr-sa.env
+#     source examples/scripts/lib/load_cluster_env.sh spoke  ~/.kube/clusters/aro-spoke-01-sa.env
+#     ansible-playbook playbooks/test-sanitize-spoke.yml \
+#       -e test_hub_context=acmdr-hub-dr-01-sa \
+#       -e test_spoke_name=aro-spoke-01
+#
+# Variables (required):
+#   test_hub_context  - kubeconfig context of the Hub where the Spoke is imported.
+#                       Typically the DR Hub during a pending post-restore state.
+#   test_spoke_name   - ManagedCluster object name in RHACM (namespace name on the Hub).
+#
+# Dependencies:
+#   collections: kubernetes.core
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+#                acm_dr_spoke_manager (re-import stage)
+#
+# Expected outcome:
+#   Exit 0 - Sanitization complete: corrupted MSA/Secret purged, auto-import-secret
+#             re-injected, Spoke reports ManagedClusterConditionAvailable=True on the Hub.
+#   Exit 1 - Validation fails (test_hub_context or test_spoke_name not defined),
+#             MSA purge fails, or Spoke does not reconnect within the poll timeout.
+# =============================================================================
+
+- name: "Isolated Spoke Sanitization and Re-import Test"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Uses the runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster
+      # credentials from AAP or scripts/lib/load_cluster_env.sh), falling back to the legacy
+      # monolithic K8S_AUTH_KUBECONFIG / KUBECONFIG env var when no per-cluster vars exist.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+  vars:
+    # Set the target Hub for the test (usually the DR Hub during pending import state)
+    test_hub_context: "acm-dr-hub"
+    # Set the target Spoke cluster for the test (any distribution: ARO, AKS, Amazon EKS, GKE, IKS)
+    test_spoke_name: "test-spoke-import"
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]  # propagate to tasks inside the role so they also run
+      tags: [always]  # ensures the include itself runs regardless of --tags filtering
+
+    - name: "[PRE-FLIGHT] | Validate required input variables"
+      ansible.builtin.assert:
+        that:
+          - test_hub_context is defined
+          - test_hub_context | length > 0
+          - test_spoke_name is defined
+          - test_spoke_name | length > 0
+        fail_msg: "❌ FAILED! Oh. No! => Variables 'test_hub_context' and 'test_spoke_name' must be defined. Use: -e test_hub_context=<ctx> -e test_spoke_name=<spoke>"
+        success_msg: "✅ PASSED! Oh. Yes! => Variables 'test_hub_context' and 'test_spoke_name' are defined and valid."
+
+  tasks:
+    - name: "[TEST BENCH] | Display execution metadata"
+      ansible.builtin.debug:
+        msg:
+          - "======================================================================"
+          - " 🚀 STARTING ATOMIC SANITIZATION TEST (KCS 7039710)"
+          - " 🎛️  TARGET HUB:   {{ test_hub_context }}"
+          - " 🎯  TARGET SPOKE: {{ test_spoke_name }}"
+          - "======================================================================"
+
+    - name: "[TEST BENCH] | 1) Purge corrupted ManagedServiceAccount"
+      kubernetes.core.k8s:
+        context: "{{ test_hub_context }}"
+        state: absent
+        api_version: authentication.open-cluster-management.io/v1beta1
+        kind: ManagedServiceAccount
+        name: auto-import-account
+        namespace: "{{ test_spoke_name }}"
+      failed_when: false
+
+    - name: "[TEST BENCH] | 2) Purge Token Secret with orphaned ownerRef"
+      kubernetes.core.k8s:
+        context: "{{ test_hub_context }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: auto-import-account
+        namespace: "{{ test_spoke_name }}"
+      failed_when: false
+
+    - name: "[TEST BENCH] | 3) Wait for Kubernetes API Garbage Collection (15s)"
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: "[TEST BENCH] | 4) Call acm_dr_spoke_manager role to re-inject the auto-import-secret"
+      ansible.builtin.include_role:
+        name: acm_dr_spoke_manager
+        tasks_from: 01_spoke_prep.yml
+      vars:
+        # Variable mapping for the acm_dr_spoke_manager role
+        acm_dr_spoke_manager_hub_context: "{{ test_hub_context }}"
+        acm_dr_spoke_manager_cluster_name: "{{ test_spoke_name }}"
+        acm_dr_spoke_manager_spoke_k8s_context: "{{ test_spoke_name }}"
+
+    - name: "[TEST BENCH] | 5) Validate Reconciliation Status on the Hub"
+      kubernetes.core.k8s_info:
+        context: "{{ test_hub_context }}"
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        name: "{{ test_spoke_name }}"
+      register: test_spoke_status
+
+    - name: "[TEST BENCH] | 6) Assert Import Status"
+      ansible.builtin.assert:
+        that:
+          - test_spoke_status.resources | length > 0
+          - >-
+            (test_spoke_status.resources[0].status.conditions | default([]) |
+              selectattr('type', 'equalto', 'ManagedClusterConditionAvailable') |
+              selectattr('status', 'equalto', 'True') | list | length > 0)
+        success_msg: "✅ PASSED! Oh. Yes! => Spoke '{{ test_spoke_name }}' was sanitized and reconnected successfully!"
+        fail_msg: "❌ FAILED! Oh. No! => Spoke '{{ test_spoke_name }}' did not reach AVAILABLE state after sanitization."
+...

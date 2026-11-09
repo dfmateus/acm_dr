@@ -1,0 +1,14 @@
+{# OperatorGroup for the OADP operator in the backup namespace.
+   On non-STS clusters (ARO), the MCH cluster-backup component auto-creates this.
+   On AWS STS clusters (ROSA HCP), it must be pre-created so the OADP Subscription
+   can resolve. Name and targetNamespaces match the MCH-generated resource so OLM
+   treats them as the same object if cluster-backup catches up later. #}
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: "{{ acm_dr_hub_setup_oadp_operatorgroup_name }}"
+  namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+spec:
+  targetNamespaces:
+    - "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  upgradeStrategy: Default

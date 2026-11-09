@@ -1,0 +1,25 @@
+---
+# =============================================================================
+# BOOTSTRAP REPORT - print summary after RBAC provisioning
+#
+# The bearer token is never shown here. AAP credential creation is handled by
+# 05_aap_credential.yml (auto-registration via AAP API). This file only prints
+# the cluster identifiers for operator reference.
+# =============================================================================
+
+- name: "[BOOTSTRAP - Report] | 4.1.1) Print bootstrap summary"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ✅ RBAC PROVISIONED"
+      - "======================================================================"
+      - ""
+      - " Cluster   : {{ acm_dr_cluster_onboard_cluster_name | default('(not set)') }}"
+      - " Namespace : {{ acm_dr_cluster_onboard_namespace }}"
+      - " SA        : {{ acm_dr_cluster_onboard_sa_name }}"
+      - " Secret    : {{ acm_dr_cluster_onboard_token_secret }}"
+      - ""
+      - " Namespace, ServiceAccount, ClusterRoleBinding, and token Secret are"
+      - " present on the cluster. Proceeding to AAP credential self-registration."
+      - "======================================================================"
+...

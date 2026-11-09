@@ -1,0 +1,629 @@
+---
+# roles/acm_dr_failover_manager/tasks/06_detach_old_hub.yml
+# =============================================================================
+# STAGE 06: ISOLATE AND DETACH OLD HUB (DETACH OLD HUB)
+# =============================================================================
+# NOTE: this file is named "06_" to reflect its original development order.
+# In the current logical stage sequence (see main.yml), Stage 06 follows the
+# BackupSchedule creation (Stage 05) and precedes convergence wait (Stage 06a).
+# Do not renumber the file; the stage label in main.yml is authoritative.
+
+- name: "[STAGE 06 - Detach Old Hub] | Display old Hub detach metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🧹 STAGE 06 - Isolate & Detach Old Hub Fleet Records"
+    acm_dr_failover_manager_banner_lines:
+      - "⚠️  OLD HUB: {{ active_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.1) Delete ManagedCluster Custom Resources from the old Hub - {{ active_hub }}"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.2) 🧹 PROPHYLAXIS: Remove ManagedCluster finalizers on the old Hub"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.3) 🧹 PROPHYLAXIS: Remove ObservabilityAddon finalizers on the old Hub"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    api_version: observability.open-cluster-management.io/v1beta1
+    kind: ObservabilityAddon
+    namespace: "{{ item }}"
+    name: "{{ acm_dr_failover_manager_observability_addon_name }}"
+    state: patched
+    definition:
+      metadata:
+        finalizers: []
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.4a) 🔎 Discover orphan ManifestWorks by namespace on the old Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    namespace: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_orphan_manifestworks
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log }}"  # spec.workload may contain bootstrap-hub-kubeconfig with bearer token
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.4b) 🧹 PROPHYLAXIS: Remove orphan ManifestWork finalizers on the old Hub"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ active_hub }}"
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: >-
+    {{ acm_dr_failover_manager_orphan_manifestworks.results
+       | selectattr('resources', 'defined')
+       | map(attribute='resources')
+       | flatten }}
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.5) 🧹 PROPHYLAXIS: Remove KlusterletAddonConfig finalizers on the old Hub"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ active_hub }}"
+    api_version: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+    namespace: "{{ item }}"
+    name: "{{ item }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.6) 🛡️ SELF-HEALING: Unblock Spoke Namespaces on the old Hub"
+  ansible.builtin.shell: |
+    set -o pipefail
+    oc get ns {{ item }} --context {{ active_hub }} -o json 2>/dev/null \
+    | jq '.spec.finalizers = []' \
+    | oc replace --raw /api/v1/namespaces/{{ item }}/finalize --context {{ active_hub }} -f - 2>/dev/null || true
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_detach_ns_cmd
+  # rc is always 0 because the pipeline ends with || true.
+  # stdout is non-empty only when oc get found the namespace and oc replace ran.
+  changed_when: acm_dr_failover_manager_detach_ns_cmd.stdout | default('') | length > 0
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log }}"  # oc error output can expose cluster URL and context details
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.7) ⏳ WAIT - Polling for complete Namespace purge on the old Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_old_hub_ns_check
+  until: >-
+    (acm_dr_failover_manager_old_hub_ns_check.resources | default([]) | length == 0) or
+    (acm_dr_failover_manager_old_hub_ns_check.resources[0].status.phase | default('')) != 'Terminating'
+  retries: "{{ acm_dr_failover_manager_ns_purge_retries | default(30) }}"
+  delay: "{{ acm_dr_failover_manager_ns_purge_delay | default(4) }}"
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  ignore_errors: true
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.1.8) 🔎 [DRY-RUN] Old Hub detach preview"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] ManagedClusters {{ acm_dr_failover_manager_spoke_list }} would be removed from the old
+      Hub '{{ active_hub }}' (delete + finalizer cleanup on ManagedCluster, ObservabilityAddon,
+      ManifestWork, and KlusterletAddonConfig), and corresponding namespaces would be unblocked
+      if stuck in Terminating. Validated via Kubernetes API dry-run -- no real changes were applied.
+  when: acm_dr_failover_manager_dry_run | default(false) | bool
+
+# =============================================================================
+# 6.2) SWEEP: DISCOVER AND PURGE ALL STALE RHACM RESIDUE BEYOND SPOKE LIST
+# =============================================================================
+# Runs unconditionally after 6.1.7 - whether namespaces are already gone or
+# still stuck. The spoke-list-scoped cleanup above only covers the current
+# fleet. Previously detached, renamed, or orphaned ManagedClusters and their
+# namespaces accumulate across failover cycles and eventually block Velero
+# restores. The force-finalize at 6.2.7 also unblocks any namespace that the
+# 6.1.6 finalize attempt could not clear (resources inside still had finalizers
+# at that point but may be gone now after the wait loop).
+# IMPORTANT: this sweep runs BEFORE the diagnostic fail (D.4) so that the
+# self-healing has a chance to fix stuck namespaces. D.4 re-checks state after
+# the sweep and only fails if namespaces are STILL stuck.
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.1) 🔎 Discover ALL remaining ManagedCluster objects on the old Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+  register: acm_dr_failover_manager_all_old_hub_mc
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.2) 🔎 Identify orphan ManagedClusters not in current fleet"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_orphan_mc_names: >-
+      {{ acm_dr_failover_manager_all_old_hub_mc.resources | default([])
+         | map(attribute='metadata.name')
+         | reject('equalto', 'local-cluster')
+         | reject('in', acm_dr_failover_manager_spoke_list)
+         | list }}
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.3) ⚠️ Orphan ManagedClusters found, removing stale records"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [STALE STATE] {{ acm_dr_failover_manager_orphan_mc_names | length }} orphan
+      ManagedCluster(s) found on {{ active_hub }} outside the current fleet:
+      {{ acm_dr_failover_manager_orphan_mc_names | join(', ') }}
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_orphan_mc_names | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.4) 🧹 Remove finalizers from orphan ManagedClusters"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: "{{ acm_dr_failover_manager_orphan_mc_names | default([]) }}"
+  loop_control:
+    label: "{{ item }}"  # orphan ManagedCluster name string
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+  when: (acm_dr_failover_manager_orphan_mc_names | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.5) 🧹 Delete orphan ManagedCluster objects"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ acm_dr_failover_manager_orphan_mc_names | default([]) }}"
+  loop_control:
+    label: "{{ item }}"  # orphan ManagedCluster name string
+  failed_when: false
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+  when: (acm_dr_failover_manager_orphan_mc_names | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6) 🔎 Discover ALL Terminating namespaces on the old Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Namespace
+    field_selectors:
+      - status.phase=Terminating
+  register: acm_dr_failover_manager_old_hub_all_terminating_ns
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+# 6.2.6a-i: Delete RHACM resources inside Terminating namespaces that block the
+# namespace controller. Three categories of blocker require explicit deletion:
+#
+# Finalizer holders (6.2.6a-f): KlusterletAddonConfig and ManagedServiceAccount
+# carry finalizers managed by RHACM controllers no longer connected to this hub
+# after failover. Those controllers will never clear the finalizers, so the
+# namespace controller cannot delete these objects on its own.
+#
+# Recreation-race objects (6.2.6g-i): RoleBindings created by MCO, work-manager,
+# and the addon framework, plus the managed-cluster-lease renewed by the klusterlet,
+# have no finalizers but are recreated by active controllers faster than the namespace
+# GC can process them. Deleting them explicitly here breaks the recreation cycle and
+# gives the GC a clean window to finalize the namespace.
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6a) 🔎 Discover KlusterletAddonConfigs in Terminating namespaces"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+    namespace: "{{ item.metadata.name }}"
+  loop: "{{ acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: acm_dr_failover_manager_klusterlet_addon_configs
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6b) 🧹 Remove KlusterletAddonConfig finalizers in Terminating namespaces"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ active_hub }}"
+    api_version: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: >-
+    {{ acm_dr_failover_manager_klusterlet_addon_configs.results | default([])
+       | selectattr('resources', 'defined')
+       | map(attribute='resources')
+       | flatten }}
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6c) 🧹 Delete KlusterletAddonConfigs in Terminating namespaces"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    api_version: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+    state: absent
+  loop: >-
+    {{ acm_dr_failover_manager_klusterlet_addon_configs.results | default([])
+       | selectattr('resources', 'defined')
+       | map(attribute='resources')
+       | flatten }}
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6d) 🔎 Discover ManagedServiceAccounts in Terminating namespaces"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: authentication.open-cluster-management.io/v1alpha1
+    kind: ManagedServiceAccount
+    namespace: "{{ item.metadata.name }}"
+  loop: "{{ acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: acm_dr_failover_manager_managed_service_accounts
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6e) 🧹 Remove ManagedServiceAccount finalizers in Terminating namespaces"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ active_hub }}"
+    api_version: authentication.open-cluster-management.io/v1alpha1
+    kind: ManagedServiceAccount
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: >-
+    {{ acm_dr_failover_manager_managed_service_accounts.results | default([])
+       | selectattr('resources', 'defined')
+       | map(attribute='resources')
+       | flatten }}
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6f) 🧹 Delete ManagedServiceAccounts in Terminating namespaces"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    api_version: authentication.open-cluster-management.io/v1alpha1
+    kind: ManagedServiceAccount
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+    state: absent
+  loop: >-
+    {{ acm_dr_failover_manager_managed_service_accounts.results | default([])
+       | selectattr('resources', 'defined')
+       | map(attribute='resources')
+       | flatten }}
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6g) 🔎 Discover RoleBindings in Terminating namespaces"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    namespace: "{{ item.metadata.name }}"
+  loop: "{{ acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: acm_dr_failover_manager_terminating_ns_rolebindings
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6h) 🧹 Delete non-system RoleBindings in Terminating namespaces"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+    state: absent
+  loop: >-
+    {{ acm_dr_failover_manager_terminating_ns_rolebindings.results | default([])
+       | selectattr('resources', 'defined')
+       | map(attribute='resources')
+       | flatten
+       | rejectattr('metadata.name', 'match', 'system:') }}
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6i) 🧹 Delete managed-cluster-lease in Terminating namespaces"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    api_version: coordination.k8s.io/v1
+    kind: Lease
+    namespace: "{{ item.metadata.name }}"
+    name: "{{ acm_dr_failover_manager_managed_cluster_lease_name }}"
+    state: absent
+  loop: "{{ acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+# Generic finalizer sweep: the typed deletions above (6.2.6a-i) cover known
+# RHACM resource categories, but AKS/EKS/GKE spokes can leave additional CRD
+# instances (e.g. work-manager, addon-framework) whose controllers are already
+# gone. This sweep finds ANY namespaced object that still carries a finalizer
+# and removes the finalizer via a JSON patch, giving the namespace controller
+# a clean window to terminate. Run after the typed deletions so the well-known
+# objects are already gone and this only catches the tail cases.
+# Uses a single oc get across all API types (consistent with jq already used in 6.2.7)
+# rather than xargs to avoid YAML block-scalar issues with inline Python.
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6j) 🔎 Discover remaining objects with finalizers in Terminating namespaces"
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      # Build a comma-separated list of all namespaced API resource types.
+      api_types=$(oc api-resources --verbs=list --namespaced -o name \
+        --context {{ active_hub }} 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+      [ -z "$api_types" ] && echo '[]' && exit 0
+      # Single oc get across all types produces one JSON List; jq filters to
+      # objects that still have non-empty finalizers arrays.
+      oc get ${api_types} \
+        -n {{ item.metadata.name }} \
+        --context {{ active_hub }} \
+        -o json --ignore-not-found 2>/dev/null \
+      | jq -c '[.items[]? | select((.metadata.finalizers // []) | length > 0) |
+               {apiVersion: .apiVersion, kind: .kind,
+                name: .metadata.name, namespace: .metadata.namespace}]' \
+      || echo '[]'
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  loop: "{{ acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: acm_dr_failover_manager_stuck_objects_raw
+  changed_when: false
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log }}"
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.6k) 🧹 Remove finalizers from remaining stuck objects"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ active_hub }}"
+    api_version: "{{ item.apiVersion }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: >-
+    {{
+      acm_dr_failover_manager_stuck_objects_raw.results
+      | default([])
+      | map(attribute='stdout', default='[]')
+      | map('from_json')
+      | flatten
+    }}
+  loop_control:
+    label: "{{ item.kind }}/{{ item.namespace }}/{{ item.name }}"
+  failed_when: false
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_stuck_objects_raw.results | default([]) | length > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.7) 🧹 SELF-HEALING: Force-finalize ALL remaining Terminating namespaces"
+  ansible.builtin.shell: |
+    set -o pipefail
+    oc get ns {{ item.metadata.name }} --context {{ active_hub }} -o json 2>/dev/null \
+    | jq '.spec.finalizers = []' \
+    | oc replace --raw /api/v1/namespaces/{{ item.metadata.name }}/finalize --context {{ active_hub }} -f - 2>/dev/null || true
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  loop: "{{ acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: acm_dr_failover_manager_sweep_ns_purge
+  changed_when: >-
+    acm_dr_failover_manager_sweep_ns_purge.rc == 0 and
+    acm_dr_failover_manager_sweep_ns_purge.stdout | default('') | length > 0
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log }}"  # oc error output can expose cluster URL and context details
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_old_hub_all_terminating_ns.resources | default([]) | length) > 0
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.7a) ⏳ POST-SWEEP WAIT: Poll for spoke namespace deletion after resource sweep"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"
+  register: acm_dr_failover_manager_post_sweep_ns_check
+  until: >-
+    (acm_dr_failover_manager_post_sweep_ns_check.resources | default([]) | length == 0) or
+    (acm_dr_failover_manager_post_sweep_ns_check.resources[0].status.phase | default('')) != 'Terminating'
+  retries: "{{ acm_dr_failover_manager_post_sweep_ns_purge_retries | default(30) }}"
+  delay: "{{ acm_dr_failover_manager_post_sweep_ns_purge_delay | default(10) }}"
+  ignore_errors: true
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_old_hub_ns_check is failed
+
+- name: "[STAGE 06 - Detach Old Hub] | 6.2.8) 🔎 [DRY-RUN] Stale state sweep preview"
+  ansible.builtin.debug:
+    msg:
+      - >-
+        🔎 [DRY-RUN] Would remove {{ acm_dr_failover_manager_orphan_mc_names | default([]) | length }} orphan
+        ManagedCluster(s) and force-finalize Terminating namespace(s) on {{ active_hub }}.
+      - >-
+        Orphan MCs: {{ acm_dr_failover_manager_orphan_mc_names | default([]) | join(', ') | default('none') }}
+  when: acm_dr_failover_manager_dry_run | default(false) | bool
+
+# =============================================================================
+# NAMESPACE PURGE DIAGNOSTIC SECTION
+# =============================================================================
+# Runs only when 6.1.7 timed out AND 6.2.7 still could not clear the namespaces.
+# Re-checks namespace state AFTER the sweep so the diagnostic reflects real
+# post-sweep reality, not the pre-sweep timeout state.
+
+# D.1) Re-check which spoke namespaces are still stuck AFTER the sweep.
+- name: "[STAGE 06 - Detach Old Hub DIAGNOSTIC] | D.1) Re-check spoke namespace state after sweep"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_diag_ns_recheck
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_old_hub_ns_check is failed
+
+# D.2) Extract which namespaces are still Terminating after the sweep.
+- name: "[STAGE 06 - Detach Old Hub DIAGNOSTIC] | D.2) Identify namespaces still stuck after sweep"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_diag_stuck_names: >-
+      {{ acm_dr_failover_manager_diag_ns_recheck.results | default([])
+         | selectattr('resources', 'defined')
+         | selectattr('resources', 'ne', [])
+         | selectattr('resources.0.status.phase', 'defined')
+         | selectattr('resources.0.status.phase', 'equalto', 'Terminating')
+         | map(attribute='item')
+         | list }}
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_old_hub_ns_check is failed
+
+# D.3) Print diagnostic report - only if namespaces are STILL stuck after sweep.
+- name: "[STAGE 06 - Detach Old Hub DIAGNOSTIC] | D.3) ❌ NAMESPACE PURGE FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ NAMESPACE PURGE FAILED AFTER SWEEP: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - "OLD HUB: {{ active_hub }}"
+      - "STILL STUCK: {{ acm_dr_failover_manager_diag_stuck_names | default([]) | join(', ') }}"
+      - ""
+      - "Possible causes:"
+      - "  - A webhook or admission controller is blocking deletion."
+      - "  - An operator is recreating resources inside the namespace."
+      - "  - The klusterlet on the spoke has not responded to detach yet."
+      - ""
+      - "Manual resolution:"
+      - "  examples/scripts/break-glass/force_delete_namespace.sh"
+      - "  --context {{ active_hub }} --namespace <ns-name>"
+      - "======================================================================"
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_old_hub_ns_check is failed
+    - (acm_dr_failover_manager_diag_stuck_names | default([]) | length) > 0
+
+# D.4) Fail only if namespaces are STILL stuck after the sweep.
+- name: "[STAGE 06 - Detach Old Hub DIAGNOSTIC] | D.4) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => {{ acm_dr_failover_manager_diag_stuck_names | default([]) | length }}
+      spoke namespace(s) on old Hub '{{ active_hub }}' are still stuck in Terminating
+      after self-healing finalizer cleanup and force-finalize sweep:
+      {{ acm_dr_failover_manager_diag_stuck_names | default([]) | join(', ') }}.
+      See the diagnostic report above.
+      Use examples/scripts/break-glass/force_delete_namespace.sh to force-remove.
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_old_hub_ns_check is failed
+    - (acm_dr_failover_manager_diag_stuck_names | default([]) | length) > 0
+...

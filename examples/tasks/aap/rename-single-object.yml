@@ -1,0 +1,113 @@
+---
+# aap/playbooks/tasks/rename_single_object.yml
+# Renames a single AAP object from old_name to new_name and updates
+# its description. Called in a loop from configure_aap_objects.yml.
+#
+# Expected loop variable (item):
+#   type      - human label ("Credential Type", "Credential", etc.)
+#   endpoint  - REST API collection path (e.g. "credential_types")
+#   old_name  - current name on the AAP instance
+#   new_name  - standardized name per the naming convention
+#   description - desired description text
+#
+# Behaviour:
+#   1. GET by old_name. If found, PATCH name + description (rename).
+#   2. If old_name missing, GET by new_name. If found and description
+#      differs, PATCH description only (already renamed, fix desc).
+#   3. If neither found, warning (manual creation needed).
+#   4. In check mode, PATCH calls are skipped and a dry-run message
+#      shows what would change.
+
+# Step 1: look up the object by its current (old) name.
+# check_mode: false because this is a read-only GET that must execute
+# even in --check to provide data for the conditional steps below.
+- name: "[AAP CONFIG] | Look up object by old name: {{ item.old_name }}"
+  ansible.builtin.uri:
+    url: "{{ configure_aap_api_base }}/{{ item.endpoint }}/?name={{ item.old_name | urlencode }}"
+    method: GET
+    user: "{{ configure_aap_controller_username }}"
+    password: "{{ configure_aap_controller_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ configure_aap_validate_certs }}"
+    status_code: 200
+  register: configure_aap_old_lookup
+  check_mode: false
+  changed_when: false
+
+# Step 2a: old name found and not check mode, rename + update description.
+- name: "[AAP CONFIG] | Rename object to standardized name: {{ item.new_name }}"
+  ansible.builtin.uri:
+    url: "{{ configure_aap_api_base }}/{{ item.endpoint }}/{{ configure_aap_old_lookup.json.results[0].id }}/"
+    method: PATCH
+    user: "{{ configure_aap_controller_username }}"
+    password: "{{ configure_aap_controller_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ configure_aap_validate_certs }}"
+    body_format: json
+    body:
+      name: "{{ item.new_name }}"
+      description: "{{ item.description }}"
+    status_code: 200
+  when:
+    - configure_aap_old_lookup.json.count > 0
+    - not ansible_check_mode
+  changed_when: true
+
+# Step 2b: check mode, show what would change without touching anything.
+- name: "[AAP CONFIG] | DRY-RUN would rename: {{ item.old_name }}"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 [DRY-RUN] {{ item.type }}: '{{ item.old_name }}' → '{{ item.new_name }}'
+  when:
+    - configure_aap_old_lookup.json.count > 0
+    - ansible_check_mode
+  changed_when: true
+
+# Step 3: old name not found, check if already renamed.
+# check_mode: false because this is a read-only GET (same as Step 1).
+- name: "[AAP CONFIG] | Look up object by new name: {{ item.new_name }}"
+  ansible.builtin.uri:
+    url: "{{ configure_aap_api_base }}/{{ item.endpoint }}/?name={{ item.new_name | urlencode }}"
+    method: GET
+    user: "{{ configure_aap_controller_username }}"
+    password: "{{ configure_aap_controller_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ configure_aap_validate_certs }}"
+    status_code: 200
+  register: configure_aap_new_lookup
+  check_mode: false
+  when: configure_aap_old_lookup.json.count == 0
+  changed_when: false
+
+# Step 4: already renamed but description differs, update description only.
+- name: "[AAP CONFIG] | Update description for: {{ item.new_name }}"
+  ansible.builtin.uri:
+    url: "{{ configure_aap_api_base }}/{{ item.endpoint }}/{{ configure_aap_new_lookup.json.results[0].id }}/"
+    method: PATCH
+    user: "{{ configure_aap_controller_username }}"
+    password: "{{ configure_aap_controller_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ configure_aap_validate_certs }}"
+    body_format: json
+    body:
+      description: "{{ item.description }}"
+    status_code: 200
+  when:
+    - configure_aap_old_lookup.json.count == 0
+    - configure_aap_new_lookup.json is defined
+    - (configure_aap_new_lookup.json.count | default(0)) > 0
+    - configure_aap_new_lookup.json.results[0].description != item.description
+    - not ansible_check_mode
+  changed_when: true
+
+# Step 5: neither name found, the object doesn't exist on this instance.
+- name: "[AAP CONFIG] | Object not found by either name: {{ item.new_name }}"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ {{ item.type }} not found as '{{ item.old_name }}' or
+      '{{ item.new_name }}'. Create it manually or add a creation task.
+  when:
+    - configure_aap_old_lookup.json.count == 0
+    - configure_aap_new_lookup.json is defined
+    - (configure_aap_new_lookup.json.count | default(0)) == 0
+...

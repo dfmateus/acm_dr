@@ -1,0 +1,255 @@
+---
+# roles/acm_dr_failover_manager/tasks/04_verify_spokes.yml
+
+- name: "[STAGE 04 - Verify Spokes] | Display fleet reconnection verification metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🔄 STAGE 04 - Verify Spoke Status (MSA Reconnection)"
+    acm_dr_failover_manager_banner_lines: >-
+      {{
+        ['✅ NEW HUB: ' ~ passive_hub,
+         '🌐  VERIFYING:  ' ~ (acm_dr_failover_manager_reachable_spoke_list
+           | default(acm_dr_failover_manager_spoke_list) | length) | string
+           ~ ' reachable Spoke(s)',
+         '🔎 MODE: DRY-RUN (simulation - no changes applied)'
+           if (acm_dr_failover_manager_dry_run | default(false) | bool)
+           else '🔥 MODE: PRODUCTION (live changes active)']
+        + ((['⚠️  SKIPPED:    ' ~ (acm_dr_failover_manager_unreachable_spoke_list | length) | string
+             ~ ' unreachable (' ~ (acm_dr_failover_manager_unreachable_spoke_list | join(', ')) ~ ')'])
+           if (acm_dr_failover_manager_unreachable_spoke_list | default([]) | length) > 0
+           else [])
+      }}
+  run_once: true
+
+# Parallelized Spoke verification: all Spokes polled simultaneously instead of
+# serially. With N Spokes the old serial loop took N × (up to 20 min) worst
+# case; this implementation takes max(Spoke reconnection times) - typically
+# under 5 min regardless of fleet size. Each background shell loops until
+# ManagedClusterConditionAvailable=True or the retry budget expires.
+- name: "[STAGE 04 - Verify Spokes] | 4.1.1a) ⏳ Launch parallel Spoke availability polls (all Spokes simultaneously)"
+  ansible.builtin.shell: |
+    set -o pipefail
+    spoke="{{ item }}"
+    hub="{{ passive_hub }}"
+    for i in $(seq 1 {{ acm_dr_failover_manager_verify_retries | int }}); do
+      status=$(oc get managedcluster "${spoke}" --context "${hub}" \
+        -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+        2>/dev/null || echo "")
+      [ "${status}" = "True" ] && exit 0
+      sleep {{ acm_dr_failover_manager_verify_delay | int }}
+    done
+    exit 1
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  # async = total retry budget + 60 s buffer for shell startup
+  async: "{{ (acm_dr_failover_manager_verify_retries | int * acm_dr_failover_manager_verify_delay | int) + 60 }}"
+  poll: 0  # fire-and-forget: all shells run simultaneously
+  register: acm_dr_failover_manager_spoke_poll_jobs
+  changed_when: false  # pure poll; exits 0 on Available, 1 on timeout - no cluster state is modified
+  failed_when: false  # exit 1 means spoke timed out (non-fatal); collected in 4.1.1b
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+  no_log: "{{ acm_dr_failover_manager_debug_no_log }}"
+
+# Collect async exit codes. The async_status check is cheap (queries job state
+# in the Ansible job file, not the cluster), so serializing this step costs
+# almost nothing. The shells themselves are all still running in parallel.
+- name: "[STAGE 04 - Verify Spokes] | 4.1.1b) ⏳ Collect parallel Spoke poll results"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop: "{{ acm_dr_failover_manager_spoke_poll_jobs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"  # spoke name string from the launch loop
+  register: acm_dr_failover_manager_spoke_poll_status
+  until: acm_dr_failover_manager_spoke_poll_status.finished
+  # A few extra retries above the shell's own budget in case of collector lag
+  retries: "{{ acm_dr_failover_manager_verify_retries | int + 5 }}"
+  delay: 10  # seconds - shorter than the shell's own loop delay (30s); spokes that reconnect fast confirm ~20s sooner
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_spoke_poll_jobs is defined
+  ignore_errors: true
+
+# Build the list of spoke names that timed out (rc != 0) for diagnostic use.
+- name: "[STAGE 04 - Verify Spokes] | 4.1.1c) Identify Spokes that timed out"
+  ansible.builtin.set_fact:
+    # item.item is the async_jobs result entry; item.item.item is the spoke name
+    acm_dr_failover_manager_spoke_poll_failed_names: >-
+      {{ acm_dr_failover_manager_spoke_poll_status.results | default([])
+         | selectattr('rc', 'defined')
+         | selectattr('rc', 'ne', 0)
+         | map(attribute='item.item')
+         | list }}
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - acm_dr_failover_manager_spoke_poll_status is defined
+
+# Query the Kubernetes API for the final state of timed-out Spokes so the
+# diagnostic section (D.1-D.5) has ManagedCluster conditions to display.
+# This task is skipped entirely when all Spokes reconnect successfully.
+- name: "[STAGE 04 - Verify Spokes] | 4.1.1d) Query final ManagedCluster state for failed Spokes (diagnostic)"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_poll_failed_names | default([]) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_spoke_status
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length) > 0
+
+# =============================================================================
+# SPOKE RECONNECTION DIAGNOSTIC SECTION
+# =============================================================================
+# Runs only when the looped polling at 4.1.1 times out for any Spoke.
+# Since the task loops over acm_dr_failover_manager_spoke_list, the
+# register holds a .results list. Partial failures (some spokes OK,
+# some failed) are handled by extracting only the failed items.
+
+# D.1) Extract the list of Spokes that timed out from the parallel poll results.
+- name: "[STAGE 04 - Verify Spokes DIAGNOSTIC] | D.1) Identify failed Spokes"
+  ansible.builtin.set_fact:
+    # k8s_info results for the failed Spokes - produced by task 4.1.1d.
+    # Each entry has .item (spoke name) and .resources (ManagedCluster resource).
+    acm_dr_failover_manager_diag_failed_spokes: >-
+      {{ acm_dr_failover_manager_spoke_status.results | default([]) }}
+  when: (acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length) > 0
+
+# D.2) Build a per-spoke condition summary from the k8s_info snapshot taken in
+#      task 4.1.1d. The structure mirrors what the old serial polling produced.
+- name: "[STAGE 04 - Verify Spokes DIAGNOSTIC] | D.2) Build per-spoke condition summary"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_diag_spoke_conditions: >-
+      {% set failed = acm_dr_failover_manager_diag_failed_spokes | default([]) %}
+      {% for spoke_result in failed %}
+      --- {{ spoke_result.item }} ---
+      {% set mc = spoke_result.resources | default([]) %}
+      {% if mc | length > 0 and mc[0].status is defined %}
+      {% for c in mc[0].status.conditions | default([]) %}
+        {{ c.type }}: {{ c.status }} - {{ c.message | default('(no message)') }}
+      {% endfor %}
+      {% else %}
+        ManagedCluster not found or has no status on Hub '{{ passive_hub }}'.
+      {% endif %}
+      {% endfor %}
+  when: (acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length) > 0
+
+# D.3) Match observed conditions against known reconnection failure patterns.
+- name: "[STAGE 04 - Verify Spokes DIAGNOSTIC] | D.3) Generate troubleshooting hints"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_diag_spoke_hints: >-
+      {% set cond_text = acm_dr_failover_manager_diag_spoke_conditions | default('') %}
+      {% set hints = [] %}
+      {% if 'ManagedClusterConditionAvailable: False' in cond_text
+            or 'ManagedClusterConditionAvailable: Unknown' in cond_text %}
+      {%   set _ = hints.append(
+             'SPOKE NOT AVAILABLE: The klusterlet on one or more Spokes is not reporting back. '
+             ~ 'Common causes: (1) klusterlet pods crashed or got evicted after the restore, '
+             ~ '(2) the Spoke lost network connectivity to the new Hub API, '
+             ~ '(3) the ManagedServiceAccount token was not renewed (see KCS 7039710). '
+             ~ 'Stage 07 (sanitize) will attempt automatic remediation.') %}
+      {% endif %}
+      {% if 'HubAcceptedManagedCluster: False' in cond_text %}
+      {%   set _ = hints.append(
+             'HUB NOT ACCEPTING SPOKE: The Hub has not accepted the ManagedCluster. '
+             ~ 'This can happen if the ManagedCluster spec was corrupted during the restore '
+             ~ 'or if the cluster-manager controller is not running on the new Hub.') %}
+      {% endif %}
+      {% if 'LeaseUpdateStopped' in cond_text or 'ClusterStatusCheckStopped' in cond_text %}
+      {%   set _ = hints.append(
+             'LEASE EXPIRED: The klusterlet stopped updating its lease on the Hub. '
+             ~ 'The Spoke may have lost network connectivity to the Hub API. '
+             ~ 'Check Spoke-to-Hub network path and klusterlet pod status on the Spoke: '
+             ~ 'kubectl get pods -n open-cluster-management-agent --context <spoke-ctx>') %}
+      {% endif %}
+      {% if 'ManagedCluster not found' in cond_text %}
+      {%   set _ = hints.append(
+             'MANAGEDCLUSTER MISSING: The Spoke was in the fleet list but its '
+             ~ 'ManagedCluster object does not exist on the new Hub after restore. '
+             ~ 'The backup may not have included this Spoke, or the restore excluded it.') %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append(
+             'No specific pattern matched. Check the ManagedCluster conditions above '
+             ~ 'and the klusterlet pod logs on each failed Spoke. '
+             ~ 'Stage 07 (sanitize) will run next and may fix token-related issues.') %}
+      {% endif %}
+      {{ hints }}
+  when: (acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length) > 0
+
+# D.4) Print the structured diagnostic report.
+- name: "[STAGE 04 - Verify Spokes DIAGNOSTIC] | D.4) ❌ RECONNECTION FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ SPOKE RECONNECTION FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "TARGET HUB:"
+      - "  {{ passive_hub }}"
+      - ""
+      - "FAILED SPOKES:"
+      - "  {{ acm_dr_failover_manager_spoke_poll_failed_names | default([]) | join(', ') }}"
+      - "  ({{ acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length }} of {{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) | length }} reachable failed)"
+      - ""
+      - "PER-SPOKE CONDITIONS:"
+      - "{{ acm_dr_failover_manager_diag_spoke_conditions | default('  (could not read conditions)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_failover_manager_diag_spoke_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: (acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length) > 0
+
+# D.5) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 04 - Verify Spokes DIAGNOSTIC] | D.5) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => {{ acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length }}
+      of {{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) | length }}
+      reachable Spoke(s) did not reach AVAILABLE state on Hub '{{ passive_hub }}'
+      within the verification timeout
+      ({{ acm_dr_failover_manager_verify_retries | int * acm_dr_failover_manager_verify_delay | int }}s).
+      Failed Spokes: {{ acm_dr_failover_manager_spoke_poll_failed_names | default([]) | join(', ') }}.
+      See the diagnostic report above for per-spoke conditions and troubleshooting hints.
+  when: (acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length) > 0
+
+- name: "[STAGE 04 - Verify Spokes] | 4.1.2) Successful reconnection audit log"
+  ansible.builtin.debug:
+    msg: "✅ [RECONNECTION OK]: Spoke cluster '{{ item }}' reconnected and reports AVAILABLE status on DR Hub '{{ passive_hub }}'."
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_spoke_poll_failed_names | default([]) | length) == 0
+
+# Log unreachable Spokes that were excluded from verification so the operator
+# knows they still need attention after the failover completes.
+- name: "[STAGE 04 - Verify Spokes] | 4.1.2b) ⚠️ Log unreachable Spokes excluded from verification"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [SKIPPED]: Spoke '{{ item }}' was unreachable during the connectivity probe (Stage 01)
+      and was excluded from reconnection verification. Verify this cluster's status manually
+      or run a detach operation if it was permanently deactivated.
+  loop: "{{ acm_dr_failover_manager_unreachable_spoke_list | default([]) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_unreachable_spoke_list | default([]) | length) > 0
+
+- name: "[STAGE 04 - Verify Spokes] | 4.1.3) 🔎 [DRY-RUN] Reconnection verification preview"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] Polling would wait until each Spoke {{ acm_dr_failover_manager_spoke_list }}
+      reports ManagedClusterConditionAvailable=True on Hub '{{ passive_hub }}'
+      before proceeding to new leader protection.
+  when: acm_dr_failover_manager_dry_run | default(false) | bool
+...

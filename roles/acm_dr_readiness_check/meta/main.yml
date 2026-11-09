@@ -1,0 +1,20 @@
+---
+# roles/acm_dr_readiness_check/meta/main.yml
+galaxy_info:
+  role_name: acm_dr_readiness_check
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  description: >-
+    Read-only DR readiness assessment for RHACM Hub clusters. Validates BackupSchedule
+    health, BackupStorageLocation availability, backup freshness against the RPO threshold,
+    Spoke connectivity, and passive Hub pre-positioning on the Destination Hub.
+    Non-destructive - safe to run on production at any time.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "9"
+
+dependencies: []
+...

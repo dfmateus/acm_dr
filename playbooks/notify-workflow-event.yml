@@ -1,0 +1,121 @@
+---
+# playbooks/notify-workflow-event.yml
+# =============================================================================
+# GENERIC WORKFLOW EVENT NOTIFICATION
+#
+# Description:
+#   Sends a formatted notification to the configured webhook. Intended for WJT
+#   nodes that need to announce an event (e.g., "DR Drill completed", "Upgrade
+#   window opened", "Onboarding batch finished") without borrowing a real
+#   automation JT as a proxy.
+#
+#   This replaces the pattern where the Hub Switchover JT was invoked with
+#   drill_summary_only=true just to produce a Slack notification. That approach
+#   coupled notification concerns to failover logic; any refactor of the failover
+#   JT risked breaking the notification path.
+#
+#   Exits rc=0 only when the webhook responds with HTTP 200/202/204. Use this
+#   playbook in WJT success paths where delivery confirmation matters.
+#
+# Credentials required:
+#   ACM DR - Notification Webhook   - injects NOTIF_WEBHOOK_URL, NOTIF_WEBHOOK_FORMAT
+#
+# Variables (extra_vars via Survey):
+#   notification_message    (Required) - body text to include in the notification
+#   notification_title      (Optional) - short title line. Default: ACM DR Notification
+#   notification_severity   (Optional) - info, warning, or critical. Default: info
+#
+# Exit codes:
+#   0 - webhook responded with HTTP 200, 202, or 204
+#   1 - notification_message is empty, NOTIF_WEBHOOK_URL is absent,
+#       or webhook returned an unexpected HTTP status
+#
+# Dependencies:
+#   collections: ansible.builtin
+# =============================================================================
+
+- name: Generic Workflow Event Notification
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    notification_title: "ACM DR Notification"  # heading shown in all webhook formats
+    notification_severity: "info"              # info | warning | critical
+
+  tasks:
+    # -----------------------------------------------------------------
+    # PRE-FLIGHT: read injected env vars and validate inputs
+    # -----------------------------------------------------------------
+    - name: "[PRE-FLIGHT] | Read webhook credentials from environment"
+      ansible.builtin.set_fact:
+        _webhook_url: "{{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_URL', default='') }}"
+        _webhook_format: >-
+          {{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_FORMAT', default='generic-json') }}
+      no_log: true  # NOTIF_WEBHOOK_URL is a secret endpoint
+
+    - name: "[PRE-FLIGHT] | Assert notification_message and webhook URL are present"
+      ansible.builtin.assert:
+        that:
+          - notification_message is defined
+          - notification_message | length > 0
+          - _webhook_url | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => notification_message must be a non-empty string (provide
+          via Survey or -e notification_message='...'). NOTIF_WEBHOOK_URL must be injected
+          by the ACM DR - Notification Webhook credential.
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => notification_message and webhook URL are present.
+          Title='{{ notification_title }}' Severity='{{ notification_severity }}'.
+
+    # -----------------------------------------------------------------
+    # STEP 1: build format-specific webhook payload
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 1.1) Build Slack payload"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          text: "*{{ notification_title }}* ({{ notification_severity }})\n{{ notification_message }}"
+      when: _webhook_format == 'slack'
+
+    - name: "[NOTIFY] | 1.2) Build Teams Adaptive Card payload"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          type: "message"
+          attachments:
+            - contentType: "application/vnd.microsoft.card.adaptive"
+              content:
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json"
+                type: "AdaptiveCard"
+                version: "1.4"
+                body:
+                  - type: "TextBlock"
+                    text: "{{ notification_title }} ({{ notification_severity }})"
+                    weight: "Bolder"
+                    size: "Medium"
+                  - type: "TextBlock"
+                    text: "{{ notification_message }}"
+                    wrap: true
+      when: _webhook_format == 'teams'
+
+    - name: "[NOTIFY] | 1.3) Build generic-json payload (fallback for all other formats)"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          title: "{{ notification_title }}"
+          body: "{{ notification_message }}"
+          severity: "{{ notification_severity }}"
+      when: _webhook_format not in ['slack', 'teams']
+
+    # -----------------------------------------------------------------
+    # STEP 2: send the notification
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 2.1) POST to webhook endpoint"
+      ansible.builtin.uri:
+        url: "{{ _webhook_url }}"
+        method: POST
+        body: "{{ _webhook_payload | to_json }}"
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        status_code: [200, 202, 204]
+      no_log: true  # _webhook_url is a secret injected by the credential type
+...

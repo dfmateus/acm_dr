@@ -1,0 +1,446 @@
+---
+# roles/acm_dr_failover_manager/tasks/07_sanitize_passive_hub.yml
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | Display Spoke sanitization metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🧹 STAGE 07 - Sanitize Passive Hub & Reconnect Fleet (KCS 7039710)"
+    acm_dr_failover_manager_banner_lines:
+      - "✅ NEW HUB:     {{ passive_hub }}"
+      - "🛡️  MITIGATION: Purging corrupted post-restore ManagedServiceAccount tokens"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.1) Discover existing ManagedServiceAccounts per Spoke on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: authentication.open-cluster-management.io/v1beta1
+    kind: ManagedServiceAccount
+    namespace: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_msa_discovery
+  failed_when: false
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.1b) Identify ManagedServiceAccounts with corrupted token (TokenReported: False) - KCS 7039710"
+  # Does not assume a fixed name (e.g., "auto-import-account") - the object name may change
+  # between RHACM/MSA addon versions. Detects dynamically by the actual failure condition,
+  # which is the exact symptom described in KCS 7039710, instead of a hardcoded literal.
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_broken_msa_list: >-
+      {% set ns = namespace(items=[]) %}
+      {% for result in (acm_dr_failover_manager_msa_discovery.results | default([])) %}
+        {% set spoke_ns = result.item | default('') %}
+        {% for msa in (result.resources | default([])) %}
+          {% set conds = msa.status.conditions | default([]) | selectattr('type', 'equalto', 'TokenReported') %}
+          {% set token_status = conds | map(attribute='status') | first | default('True') %}
+          {% if token_status != 'True' and spoke_ns != '' and msa.metadata.name is defined %}
+            {% set _ = ns.items.append({'namespace': spoke_ns, 'name': msa.metadata.name}) %}
+          {% endif %}
+        {% endfor %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.1c) Purge detected ManagedServiceAccounts with corrupted tokens - {{ passive_hub }}"
+  kubernetes.core.k8s:
+    context: "{{ passive_hub }}"
+    state: absent
+    api_version: authentication.open-cluster-management.io/v1beta1
+    kind: ManagedServiceAccount
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+  loop: "{{ acm_dr_failover_manager_broken_msa_list | from_json }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.1d) Purge Token Secrets corresponding to corrupted ManagedServiceAccounts - {{ passive_hub }}"
+  # The ManagedServiceAccount controller creates the token Secret with the SAME name as the MSA
+  # (confirmed in the KCS 7039710 error itself: 'secrets "auto-import-account" is forbidden').
+  kubernetes.core.k8s:
+    context: "{{ passive_hub }}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+  loop: "{{ acm_dr_failover_manager_broken_msa_list | from_json }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  failed_when: false
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.3) ⏳ Poll until deleted ManagedServiceAccount tokens are fully GC'd"
+  # Polls the ManagedServiceAccount list for broken MSAs. Exits as soon as they
+  # disappear, instead of waiting a fixed pause that may be too short or too long.
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: authentication.open-cluster-management.io/v1beta1
+    kind: ManagedServiceAccount
+    namespace: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_msa_gc_poll
+  until: >-
+    (acm_dr_failover_manager_msa_gc_poll.resources | default([])
+     | selectattr('status.conditions', 'defined')
+     | map(attribute='status.conditions')
+     | flatten
+     | selectattr('type', 'equalto', 'TokenReported')
+     | selectattr('status', 'ne', 'True')
+     | list | length) == 0
+  retries: "{{ acm_dr_failover_manager_gc_wait_retries }}"
+  delay: "{{ acm_dr_failover_manager_gc_wait_delay }}"
+  failed_when: false
+  check_mode: false
+  when:
+    - acm_dr_failover_manager_spoke_list | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+# Read the existing cloud label from each ManagedCluster on the new Hub so we can
+# pass it to acm_dr_spoke_manager during reconnection. Without this, non-OCP Spokes
+# (AKS, EKS) lose their correct cloud label (Amazon, Azure) and get overwritten
+# with 'Other' because the auto-detection fallback runs on clusters that lack the
+# OpenShift Infrastructure CR.
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.3b) Read existing ManagedCluster labels for fleet reconnection"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_mc_labels_info
+  failed_when: false
+
+# Initialize the map before the loop so combine() has a base dict.
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.3c) Initialize cloud label map"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_spoke_cloud_map: {}
+
+# Build the cloud label map iteratively via combine(). The previous
+# implementation used a >- Jinja2 block with mixed {% %}/{{ }} tags,
+# which produces an AnsibleUnsafeText string instead of a native dict
+# when jinja2_native is disabled (AAP EE default). Using combine() with
+# a single {{ }} expression guarantees a native dict in all environments.
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.3c) Build cloud label map from restored ManagedClusters"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_spoke_cloud_map: "{{ acm_dr_failover_manager_spoke_cloud_map | combine({item.resources[0].metadata.name: (item.resources[0].metadata.labels | default({}))['cloud'] | default('')}) }}"
+  loop: "{{ acm_dr_failover_manager_mc_labels_info.results | default([]) }}"
+  when: (item.resources | default([])) | length > 0
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+
+# =============================================================================
+# PRE-IMPORT: STOP SOURCE HUB MANIFESTWORK INTERFERENCE
+# =============================================================================
+# When the source Hub (active_hub) is still running during a failover, its
+# work agent continuously reconciles ManifestWorks for each Spoke. The klusterlet
+# ManifestWork (<spoke>-klusterlet) includes bootstrap-hub-kubeconfig pointing to
+# the source Hub. After spoke_prep on the destination Hub updates this secret, the
+# source Hub's work agent overwrites it within seconds - the Spoke briefly joins
+# the destination Hub but then the lease stops (ManagedClusterLeaseUpdateStopped).
+#
+# The fix: delete the source Hub's klusterlet ManifestWorks for each Spoke BEFORE
+# running spoke_prep. The default deleteOption is Orphan (propagationPolicy: Orphan),
+# so deletion stops reconciliation without removing the klusterlet resources from
+# the Spoke. Once the ManifestWork is gone, spoke_prep can set the new Hub endpoint
+# without racing against the source Hub's work agent.
+#
+# This only applies to ManifestWorks on the SOURCE Hub (active_hub). ManifestWorks
+# on the destination Hub (passive_hub) are set by the OADP Restore and are correct.
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.3d) 🛡️ Delete klusterlet ManifestWork from source Hub to prevent kubeconfig overwrite"
+  # Removes the source Hub's klusterlet ManifestWork for each Spoke so its work agent
+  # stops reconciling the bootstrap-hub-kubeconfig. The Orphan propagationPolicy means
+  # the klusterlet resources remain on the Spoke - only the Hub-side reconciler stops.
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    state: absent
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    name: "{{ spoke_item }}-klusterlet"
+    namespace: "{{ spoke_item }}"
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    loop_var: spoke_item
+    label: "{{ spoke_item }}"
+  failed_when: false  # ok if the ManifestWork does not exist (e.g., spoke already detached)
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.3e) 🛡️ Delete klusterlet-crds ManifestWork from source Hub"
+  # Removes the CRD ManifestWork (<spoke>-klusterlet-crds) as well. Without this the
+  # source Hub's work agent would continue reconciling CRD resources on the Spoke even
+  # after the klusterlet ManifestWork is deleted.
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    state: absent
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    name: "{{ spoke_item }}-klusterlet-crds"
+    namespace: "{{ spoke_item }}"
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    loop_var: spoke_item
+    label: "{{ spoke_item }}"
+  failed_when: false
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.4) Re-import and restore fleet Spoke connectivity"
+  ansible.builtin.include_role:
+    name: acm_dr_spoke_manager
+  vars:
+    acm_dr_spoke_manager_hub_context: "{{ passive_hub }}"
+    acm_dr_spoke_manager_cluster_name: "{{ spoke_item }}"
+    # The ManagedCluster name in RHACM (spoke_item) does not always match the local
+    # Kubeconfig context name used to connect directly to the Spoke. Resolves
+    # first by explicit exception in the map; otherwise applies the default suffix.
+    acm_dr_spoke_manager_spoke_k8s_context: >-
+      {{
+        (acm_dr_failover_manager_spoke_context_map | default({}))[spoke_item]
+        | default(spoke_item ~ (acm_dr_failover_manager_spoke_context_suffix | default('-sa')))
+      }}
+    acm_dr_spoke_manager_action: "prep"
+    acm_dr_spoke_manager_cleanup_bootstrap_sa: true
+    # Preserve the cloud label from the restored ManagedCluster so non-OCP Spokes
+    # keep their correct provider (Amazon, Azure) instead of falling back to 'Other'.
+    acm_dr_spoke_manager_cluster_cloud: >-
+      {{ (acm_dr_failover_manager_spoke_cloud_map | default({}))[spoke_item] | default('') }}
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    loop_var: spoke_item
+    label: "{{ spoke_item }}"
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.4b) 🔎 [DRY-RUN] Fleet reconnection preview"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] Spoke '{{ item }}' would be reconnected to Hub '{{ passive_hub }}' via role
+      acm_dr_spoke_manager (action=prep): bootstrap ServiceAccount creation on the Spoke,
+      'auto-import-secret' Secret injection on the Hub, and Klusterlet reconciliation wait
+      (3-7 minutes). This step is not simulated via check_mode as it involves credentials
+      generated at runtime and state polling that would not exist in a simulated execution.
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  when: acm_dr_failover_manager_dry_run | default(false) | bool
+
+# =============================================================================
+# OPERATION C: MIRRORED TOKEN FALLBACK RECONNECT
+# =============================================================================
+# For Spokes in unreachable_spoke_list (context absent from the restored fleet
+# kubeconfig), attempt reconnection using the per-Spoke mirrored SA token Secret
+# written to the Hub during onboarding. This covers Spokes added after the last
+# OADP snapshot - a gap that Operation B cannot close because their context was
+# never backed up in the fleet kubeconfig.
+# Spokes without a valid mirrored Secret are logged as unrecoverable.
+#
+# ALIGNMENT REQUIREMENT: acm_dr_failover_manager_hub_token_mirror_prefix and
+# acm_dr_failover_manager_hub_token_mirror_namespace must exactly match the
+# values used by acm_dr_spoke_manager during onboarding (defaults: prefix=acm-dr-,
+# namespace=ansible-automation). If they diverge through role-level overrides,
+# Operation C looks for Secrets with the wrong name and all unreachable Spokes
+# appear unrecoverable. The task below prints the values in use so any mismatch
+# is visible in the AAP job output.
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.0) 🔎 Print mirror Secret lookup parameters for operator verification"
+  ansible.builtin.debug:
+    msg:
+      - "🔎 Operation C will look for mirrored Secrets with the following parameters:"
+      - "   namespace : {{ acm_dr_failover_manager_hub_token_mirror_namespace }}"
+      - "   prefix    : {{ acm_dr_failover_manager_hub_token_mirror_prefix }}"
+      - "   pattern   : {{ acm_dr_failover_manager_hub_token_mirror_prefix }}<spoke-name>-sa-token"
+      - "   ⚠️  These must match acm_dr_spoke_manager_hub_token_mirror_namespace and"
+      - "       acm_dr_spoke_manager_hub_token_mirror_prefix used at onboard time."
+      - "       If they differ, all unreachable Spokes will appear unrecoverable."
+      - "   unreachable Spokes: {{ acm_dr_failover_manager_unreachable_spoke_list | default([]) | join(', ') | default('(none)') }}"
+  when: (acm_dr_failover_manager_unreachable_spoke_list | default([])) | length > 0
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.1) Read mirrored SA token Secrets for unreachable Spokes"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_failover_manager_hub_token_mirror_namespace }}"
+    name: "{{ acm_dr_failover_manager_hub_token_mirror_prefix }}{{ item }}-sa-token"
+  loop: "{{ acm_dr_failover_manager_unreachable_spoke_list | default([]) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_mirror_secrets_info
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  when:
+    - (acm_dr_failover_manager_unreachable_spoke_list | default([])) | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.2) Build recoverable Spoke list from mirrored token Secrets"
+  # Produces a list of {spoke, token, host} dicts for Spokes that have a non-empty
+  # mirrored Secret. spoke_manager action=prep is called for each entry in 7.2.4.
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_recoverable_spokes: >-
+      {% set ns = namespace(items=[]) %}
+      {% for result in (acm_dr_failover_manager_mirror_secrets_info.results | default([])) %}
+        {% set resources = result.resources | default([]) %}
+        {% if resources | length > 0 %}
+          {% set d = resources[0].data | default({}) %}
+          {% if d.token | default('') | length > 0 and d.host | default('') | length > 0 %}
+            {% set _ = ns.items.append({
+              'spoke': result.item,
+              'token': d.token | b64decode,
+              'host': d.host | b64decode
+            }) %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+  no_log: "{{ acm_dr_failover_manager_debug_no_log | default(true) | bool }}"
+  when:
+    - (acm_dr_failover_manager_unreachable_spoke_list | default([])) | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.3) ⚠️ Warn: unreachable Spokes with no recoverable mirrored token"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ No mirrored SA token Secret found for Spoke '{{ item }}'. Automatic fallback reconnect
+      is not possible. Either this Spoke was onboarded with hub_token_mirror_enabled=false, or
+      the mirrored Secret was deleted. Manual reconnection is required after failover completes.
+  loop: >-
+    {{ (acm_dr_failover_manager_unreachable_spoke_list | default([]))
+       | difference(
+           (acm_dr_failover_manager_recoverable_spokes | default('[]') | from_json)
+           | map(attribute='spoke') | list
+         ) }}
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  when: (acm_dr_failover_manager_unreachable_spoke_list | default([])) | length > 0
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.3a) Build list of Spokes with no Operation C fallback"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_unrecoverable_spokes: >-
+      {{ (acm_dr_failover_manager_unreachable_spoke_list | default([]))
+         | difference(
+             (acm_dr_failover_manager_recoverable_spokes | default('[]') | from_json)
+             | map(attribute='spoke') | list
+           ) }}
+  when:
+    - (acm_dr_failover_manager_unreachable_spoke_list | default([])) | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.3b) Notify operator: Spokes requiring manual reconnection"
+  ansible.builtin.include_tasks: common/notify_event.yml
+  vars:
+    _notify_title: "ACM DR - Spokes Without Operation C Fallback"
+    _notify_severity: "critical"
+    _notify_message: >-
+      {{ acm_dr_failover_manager_unrecoverable_spokes | length }} Spoke(s) have no mirrored SA token Secret
+      and require manual reconnection after failover to DR Hub '{{ passive_hub }}'.
+      Spokes: {{ acm_dr_failover_manager_unrecoverable_spokes | join(', ') }}.
+      These Spokes were unreachable and were not onboarded with the
+      'ACM DR - Spoke Cluster' credential attached.
+      Run the Spoke Lifecycle JT (action=prep) manually for each Spoke after failover.
+  when:
+    - (acm_dr_failover_manager_unrecoverable_spokes | default([])) | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.4) Reconnect unreachable Spoke via mirrored SA token (Operation C fallback)"
+  # Pre-sets api_token and api_url so spoke_prep's Phase 1 (bootstrap SA creation)
+  # is skipped. The permanent SA token from the mirrored Secret drives auto-import-secret
+  # injection on the passive Hub directly - same mechanism as the onboard action.
+  # credentials_provided=true tells 01_spoke_prep.yml task 1.1.0 to NOT sanitize
+  # api_url/api_token. Without it, the sanitization block clears the values pre-set
+  # here because action=prep, causing auto-import-secret to get an empty server URL for
+  # non-OCP spokes (AKS, EKS, GKE, IKS) where no spoke credential is attached to JT-9.
+  ansible.builtin.include_role:
+    name: acm_dr_spoke_manager
+  vars:
+    acm_dr_spoke_manager_hub_context: "{{ passive_hub }}"
+    acm_dr_spoke_manager_cluster_name: "{{ spoke_entry.spoke }}"
+    acm_dr_spoke_manager_action: "prep"
+    acm_dr_spoke_manager_cleanup_bootstrap_sa: true
+    acm_dr_spoke_manager_cluster_cloud: >-
+      {{ (acm_dr_failover_manager_spoke_cloud_map | default({}))[spoke_entry.spoke] | default('') }}
+    acm_dr_spoke_manager_api_token: "{{ spoke_entry.token }}"
+    acm_dr_spoke_manager_api_url: "{{ spoke_entry.host }}"
+    acm_dr_spoke_manager_credentials_provided: true  # prevents sanitization from clearing pre-set api_url/api_token
+  loop: "{{ acm_dr_failover_manager_recoverable_spokes | default('[]') | from_json }}"
+  loop_control:
+    loop_var: spoke_entry
+    label: "{{ spoke_entry.spoke }}"
+  when:
+    - (acm_dr_failover_manager_recoverable_spokes | default('[]') | from_json | length) > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.4c) Notify operator: Operation C activated for Spokes"
+  ansible.builtin.include_tasks: common/notify_event.yml
+  vars:
+    _notify_title: "ACM DR - Operation C Activated"
+    _notify_severity: "warning"
+    _notify_message: >-
+      Operation C fallback reconnect was activated for
+      {{ (acm_dr_failover_manager_recoverable_spokes | default('[]') | from_json) | length }} Spoke(s)
+      during failover to DR Hub '{{ passive_hub }}'.
+      Spokes reconnected: {{ (acm_dr_failover_manager_recoverable_spokes | default('[]') | from_json) | map(attribute='spoke') | list | join(', ') }}.
+      These Spokes were absent from the restored fleet kubeconfig and were reconnected via mirrored SA token Secrets.
+      Verify Spoke availability in RHACM after failover completes.
+  when:
+    - (acm_dr_failover_manager_recoverable_spokes | default('[]') | from_json) | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.2.4b) 🔎 [DRY-RUN] Operation C fallback reconnect preview"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] Spoke '{{ item }}' would be reconnected via mirrored SA token Secret
+      '{{ acm_dr_failover_manager_hub_token_mirror_namespace }}/{{ acm_dr_failover_manager_hub_token_mirror_prefix }}{{ item }}-sa-token'
+      on Hub '{{ passive_hub }}' (action=prep, bootstrap SA phase skipped).
+  loop: "{{ acm_dr_failover_manager_unreachable_spoke_list | default([]) }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  when:
+    - (acm_dr_failover_manager_unreachable_spoke_list | default([])) | length > 0
+    - acm_dr_failover_manager_dry_run | default(false) | bool
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.5) Collect updated Spoke state on the New Hub - {{ passive_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ passive_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ item }}"
+  loop: "{{ acm_dr_failover_manager_spoke_list }}"
+  loop_control:
+    label: "{{ item }}"  # spoke name string
+  register: acm_dr_failover_manager_sanitized_spokes_info
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 07 - Sanitize Passive Hub] | 7.1.6) Display fleet sanitization completion banner"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_sep_char: "-"
+    acm_dr_failover_manager_banner_title: >-
+      {{ '🔎 [DRY-RUN] SIMULATION COMPLETED: no real changes were applied.'
+         if (acm_dr_failover_manager_dry_run | default(false) | bool)
+         else '✅ SANITIZATION COMPLETED: ManagedServiceAccount tokens sanitized and fleet reconnected!' }}
+    acm_dr_failover_manager_banner_lines: >-
+      {{
+        ['✅ NEW HUB:           ' ~ passive_hub,
+         '🌐  Spokes Sanitized: '
+           ~ (acm_dr_failover_manager_reachable_spoke_list
+              | default(acm_dr_failover_manager_spoke_list) | length) | string
+           ~ ' of ' ~ (acm_dr_failover_manager_spoke_list | length) | string ~ ' clusters']
+        + ((['⚠️  Skipped:         '
+             ~ (acm_dr_failover_manager_unreachable_spoke_list | length) | string
+             ~ ' unreachable ('
+             ~ (acm_dr_failover_manager_unreachable_spoke_list | join(', ')) ~ ')'])
+           if (acm_dr_failover_manager_unreachable_spoke_list | default([]) | length) > 0
+           else [])
+      }}
+  run_once: true
+...

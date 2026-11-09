@@ -1,0 +1,50 @@
+---
+# roles/acm_dr_readiness_check/defaults/main.yml
+# ==========================================================================
+# Default variables for the acm_dr_readiness_check role.
+# Override via extra-vars (-e) or AAP Survey on the Readiness Check Job Template.
+# All values are intentionally conservative for production use.
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# Section 1 - Namespace and resource names
+# --------------------------------------------------------------------------
+
+# Namespace where OADP/Velero and ACM backup resources live on both Hubs.
+acm_dr_readiness_check_backup_namespace: "open-cluster-management-backup"  # string - OADP resource namespace
+
+# Name of the ACM-managed BackupSchedule on the Source Hub.
+# Leave empty to auto-detect the first BackupSchedule found in the namespace.
+acm_dr_readiness_check_backup_schedule_name: ""  # string - leave empty for auto-detect
+
+# --------------------------------------------------------------------------
+# Section 2 - RPO and freshness thresholds
+# --------------------------------------------------------------------------
+
+# Maximum age (in seconds) of the most recent successful backup on the Source Hub.
+# Backups older than this threshold trigger a ⚠️ warning (non-blocking by default).
+# Default: 7 hours = 25200 seconds, matching the default BackupSchedule interval.
+acm_dr_readiness_check_rpo_seconds: 25200  # seconds (7 hours) - max acceptable backup age
+
+# --------------------------------------------------------------------------
+# Section 3 - Spoke count and fleet expectations
+# --------------------------------------------------------------------------
+
+# Minimum number of connected Spokes expected on the Source Hub (excluding local-cluster).
+# Set to 0 to disable the spoke count check (no expected minimum).
+# Used only for informational reporting, not a blocking assertion.
+acm_dr_readiness_check_min_spoke_count: 0  # count - minimum expected Spoke count (0 = skip check)
+
+# --------------------------------------------------------------------------
+# Section 4 - Assertion behavior
+# --------------------------------------------------------------------------
+
+# When true, a stale backup (older than acm_dr_readiness_check_rpo_seconds) causes the
+# role to fail. When false, it logs a ⚠️ warning but continues (non-blocking).
+# Default: false - RPO staleness is common in lab environments during low-activity periods.
+acm_dr_readiness_check_fail_on_stale_backup: false  # bool - fail vs. warn on stale backup
+
+# When true, absence of a passive Restore on the Destination Hub causes the role to fail.
+# When false, it logs a ⚠️ warning. Always set to true in production readiness gates.
+acm_dr_readiness_check_fail_on_missing_restore: true  # bool - fail if passive Restore is absent
+...

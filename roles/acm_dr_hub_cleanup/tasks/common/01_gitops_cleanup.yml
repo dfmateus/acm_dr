@@ -1,0 +1,371 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 01 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 01 - GitOps Cleanup] | Display Governance/GitOps removal metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "🐙 STAGE 01 - Remove Governance/AppDemo ArgoCD Instances"
+    acm_dr_hub_cleanup_banner_lines:
+      - "⚠️  The GitOps Operator and default ArgoCD instance (openshift-gitops) are PRESERVED"
+  run_once: true
+
+# =============================================================================
+# STEP 1.1: UNDO PUBLICATIONS IN OPENSHIFT CONSOLE
+# =============================================================================
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.1.1a) Discover all ConsoleLinks in the cluster (ConsoleLink is cluster-scoped) - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: console.openshift.io/v1
+    kind: ConsoleLink
+  register: acm_dr_hub_cleanup_all_consolelinks
+
+# Note: ConsoleLinks are identified by destination (href), not by object name.
+# The name recorded by acm_dr_hub_setup includes the k8s_target_context USED AT SETUP TIME
+# (e.g., "gitops-acm-acm-dr-hub"), which may not match the k8s_target_context used
+# now in cleanup (e.g., "acm-dr-hub-sa") if the context naming convention changed
+# between setup and cleanup. Filtering by exact name would leave those ConsoleLinks orphaned
+# forever, pointing to routes that have already been removed. Real finding confirmed in testing.
+- name: "[STAGE 01 - GitOps Cleanup] | 1.1.1b) Remove Governance/AppDemo ArgoCD ConsoleLinks (by destination) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: console.openshift.io/v1
+    kind: ConsoleLink
+    name: "{{ item.metadata.name }}"
+  loop: >-
+    {{
+      acm_dr_hub_cleanup_all_consolelinks.resources | default([])
+      | selectattr('spec.href', 'defined')
+      | selectattr('spec.href', 'search', 'openshift-gitops-acm-server|openshift-gitops-appdemo-server')
+      | list
+    }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.1.2) Query enabled plugins in OpenShift Console - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: console.operator.openshift.io/v1
+    kind: Console
+    name: cluster
+  register: acm_dr_hub_cleanup_console_cluster
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.1.3) Disable the GitOps Operator Dynamic Console Plugin - {{ k8s_target_context }}"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ k8s_target_context }}"
+    api_version: console.operator.openshift.io/v1
+    kind: Console
+    name: cluster
+    patch:
+      - op: replace
+        path: /spec/plugins
+        value: "{{ acm_dr_hub_cleanup_remaining_plugins }}"
+  vars:
+    acm_dr_hub_cleanup_remaining_plugins: >-
+      {{
+        acm_dr_hub_cleanup_console_cluster.resources[0].spec.plugins | default([])
+        | reject('equalto', 'gitops-plugin') | list
+      }}
+  when:
+    - acm_dr_hub_cleanup_console_cluster.resources | default([]) | length > 0
+    - "'gitops-plugin' in (acm_dr_hub_cleanup_console_cluster.resources[0].spec.plugins | default([]))"
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# =============================================================================
+# STEP 1.2: REMOVE APPLICATIONSETS, RHACM INTEGRATION AND GOVERNANCE RBAC
+# =============================================================================
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.2.1) Remove RHACM Policies ApplicationSet - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    name: "{{ acm_dr_hub_cleanup_appset_policies_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_gitops_namespace_acm }}"
+  register: acm_dr_hub_cleanup_appset_acm_removal
+  # GitOps operator (and its CRDs) may not be installed on this hub.
+  # kubernetes.core.k8s returns "Failed to find exact match" when the CRD is absent,
+  # which is the same outcome as the object not existing - treat both as success.
+  failed_when: >-
+    acm_dr_hub_cleanup_appset_acm_removal is failed and
+    'Failed to find exact match' not in (acm_dr_hub_cleanup_appset_acm_removal.msg | default(''))
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.2.2) Remove Demo Applications ApplicationSet - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    name: "{{ acm_dr_hub_cleanup_appset_demo_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_gitops_namespace_appdemo }}"
+  register: acm_dr_hub_cleanup_appset_demo_removal
+  failed_when: >-
+    acm_dr_hub_cleanup_appset_demo_removal is failed and
+    'Failed to find exact match' not in (acm_dr_hub_cleanup_appset_demo_removal.msg | default(''))
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# Note: if ACM has already been removed previously (e.g., a second execution of this
+# cleanup, or a partial manual removal), the CRDs for these resources may no longer exist
+# in the cluster, which causes the k8s module to fail with "Failed to find exact match" instead of
+# treating it as an idempotent no-op. We specifically treat this case as success.
+- name: "[STAGE 01 - GitOps Cleanup] | 1.2.3) Remove RHACM integration (GitOpsCluster/Placement/ManagedClusterSetBinding) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ acm_dr_hub_cleanup_gitops_namespace_acm }}"
+  loop:
+    - { api_version: "apps.open-cluster-management.io/v1beta1", kind: "GitOpsCluster", name: "{{ acm_dr_hub_cleanup_gitops_cluster_name }}" }
+    - { api_version: "cluster.open-cluster-management.io/v1beta1", kind: "Placement", name: "{{ acm_dr_hub_cleanup_placement_name }}" }
+    - { api_version: "cluster.open-cluster-management.io/v1beta2", kind: "ManagedClusterSetBinding", name: "default" }
+  loop_control:
+    label: "{{ item.kind }}/{{ item.name }}"
+  register: acm_dr_hub_cleanup_rhacm_integration_removal
+  failed_when: >-
+    acm_dr_hub_cleanup_rhacm_integration_removal is failed and
+    'Failed to find exact match' not in (acm_dr_hub_cleanup_rhacm_integration_removal.msg | default(''))
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.2.4a) Remove Governance Role/RoleBinding (fixed names) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: "{{ item.kind }}"
+    name: "applicationset-placement-reader"
+    namespace: "{{ acm_dr_hub_cleanup_gitops_namespace_acm }}"
+  loop:
+    - { kind: "Role" }
+    - { kind: "RoleBinding" }
+  loop_control:
+    label: "{{ item.kind }}/applicationset-placement-reader"
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.2.4b) Discover all ClusterRoleBindings in the cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+  register: acm_dr_hub_cleanup_all_crbs
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.2.4c) Accumulate names of ClusterRoleBindings whose subject is the Governance or AppDemo ArgoCD ServiceAccount"
+  ansible.builtin.set_fact:
+    acm_dr_hub_cleanup_governance_crb_names: >-
+      {{
+        (acm_dr_hub_cleanup_governance_crb_names | default([])) +
+        (
+          [item.metadata.name]
+          if (
+            item.subjects | default([])
+            | selectattr('name', 'in', ['openshift-gitops-acm-argocd-application-controller', 'openshift-gitops-appdemo-argocd-application-controller'])
+            | list | length > 0
+          )
+          else []
+        )
+      }}
+  loop: "{{ acm_dr_hub_cleanup_all_crbs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+# Note: the same name-by-context problem from ConsoleLink (1.1.1b) applies here.
+# the ClusterRoleBinding "argo-admin-acm-ocp-{{ k8s_target_context }}" (or "argo-admin-appdemo-
+# {{ k8s_target_context }}") would only exist with that exact name if setup had used the
+# SAME k8s_target_context as cleanup. We identify by actual subject (the ServiceAccounts
+# of the Governance and AppDemo ArgoCD controllers) instead of the object name, covering
+# any context convention used in the past. Real finding confirmed in testing.
+- name: "[STAGE 01 - GitOps Cleanup] | 1.2.4d) Remove Governance/AppDemo ArgoCD ClusterRoleBinding(s) (by subject) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: "{{ item }}"
+  loop: "{{ acm_dr_hub_cleanup_governance_crb_names | default([]) }}"
+  loop_control:
+    label: "{{ item }}"  # ClusterRoleBinding name string
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# =============================================================================
+# STEP 1.3: REMOVE ARGOCD APPLICATION FINALIZERS, THEN ARGOCD INSTANCES
+# =============================================================================
+# ArgoCD Applications carry the 'resources-finalizer.argocd.argoproj.io' finalizer,
+# which the ArgoCD controller must reconcile before the Application can be deleted.
+# If we remove the ArgoCD instance (and its controller pods) first, that finalizer
+# becomes unresolvable and the Application objects, their owning namespaces, get
+# stuck in Terminating indefinitely. We strip those finalizers before touching
+# the ArgoCD instances so the controller is still running when the Applications
+# are garbage-collected during namespace deletion in step 1.4.
+# Real finding confirmed in TC-07.2 testing (2026-08-10): openshift-gitops-acm
+# namespace stuck Terminating because the governance policies Application
+# (name: <acm_dr_hub_cleanup_appset_policies_name>-local-cluster) still held
+# resources-finalizer.argocd.argoproj.io and the ArgoCD controller was gone.
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.3.0a) Discover ArgoCD Applications with stuck finalizers in Governance/AppDemo namespaces - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ item }}"
+  loop:
+    - "{{ acm_dr_hub_cleanup_gitops_namespace_acm }}"
+    - "{{ acm_dr_hub_cleanup_gitops_namespace_appdemo }}"
+  loop_control:
+    label: "{{ item }}"
+  register: acm_dr_hub_cleanup_argocd_apps_per_ns
+  # CRD may not exist if ArgoCD was already removed
+  failed_when: false
+
+# Flatten all Application objects into a single list and filter only those
+# carrying the ArgoCD resources finalizer. Applications without it (or
+# already cleaned by the controller) are left alone.
+- name: "[STAGE 01 - GitOps Cleanup] | 1.3.0b) Build list of Applications carrying the ArgoCD resources finalizer"
+  ansible.builtin.set_fact:
+    acm_dr_hub_cleanup_apps_with_finalizer: >-
+      {{
+        acm_dr_hub_cleanup_argocd_apps_per_ns.results | default([])
+        | map(attribute='resources', default=[]) | flatten
+        | selectattr('metadata.finalizers', 'defined')
+        | selectattr('metadata.finalizers', 'contains', 'resources-finalizer.argocd.argoproj.io')
+        | list
+      }}
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.3.0c) Strip 'resources-finalizer.argocd.argoproj.io' from Applications before removing ArgoCD instances - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace }}"
+    definition:
+      metadata:
+        finalizers: "{{ item.metadata.finalizers | reject('equalto', 'resources-finalizer.argocd.argoproj.io') | list }}"
+  loop: "{{ acm_dr_hub_cleanup_apps_with_finalizer | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  when: acm_dr_hub_cleanup_apps_with_finalizer | default([]) | length > 0
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  # Non-fatal: if the Application was already deleted by the controller
+  # between discover and patch, ignore the error.
+  failed_when: false
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.3.1) Remove RHACM Governance ArgoCD instance - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: argoproj.io/v1beta1
+    kind: ArgoCD
+    name: openshift-gitops-acm
+    namespace: "{{ acm_dr_hub_cleanup_gitops_namespace_acm }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_argocd_delete_timeout | default(300) }}"
+  register: acm_dr_hub_cleanup_argocd_acm_removal
+  # CRD absent means GitOps operator was never installed - treat as success.
+  failed_when: >-
+    acm_dr_hub_cleanup_argocd_acm_removal is failed and
+    'Failed to find exact match' not in (acm_dr_hub_cleanup_argocd_acm_removal.msg | default(''))
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.3.2) Remove Demo Applications ArgoCD instance - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: argoproj.io/v1beta1
+    kind: ArgoCD
+    name: openshift-gitops-appdemo
+    namespace: "{{ acm_dr_hub_cleanup_gitops_namespace_appdemo }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_argocd_delete_timeout | default(300) }}"
+  register: acm_dr_hub_cleanup_argocd_demo_removal
+  failed_when: >-
+    acm_dr_hub_cleanup_argocd_demo_removal is failed and
+    'Failed to find exact match' not in (acm_dr_hub_cleanup_argocd_demo_removal.msg | default(''))
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# ArgoCD instance removal diagnostic - only fires on real timeouts, not on CRD-absent cases.
+- name: "[STAGE 01 - GitOps Cleanup DIAGNOSTIC] | ❌ ArgoCD instance removal timed out"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => ArgoCD instance removal timed out on context '{{ k8s_target_context }}'.
+      {% if acm_dr_hub_cleanup_argocd_acm_removal is failed %}ACM instance
+      'openshift-gitops-acm' in '{{ acm_dr_hub_cleanup_gitops_namespace_acm }}' did not delete
+      within {{ acm_dr_hub_cleanup_argocd_delete_timeout | default(300) }}s.{% endif %}
+      {% if acm_dr_hub_cleanup_argocd_demo_removal is failed %}AppDemo instance
+      'openshift-gitops-appdemo' in '{{ acm_dr_hub_cleanup_gitops_namespace_appdemo }}' did not delete
+      within {{ acm_dr_hub_cleanup_argocd_delete_timeout | default(300) }}s.{% endif %}
+      Check ArgoCD CR finalizers: oc get argocd -A -o yaml --context {{ k8s_target_context }}.
+      The GitOps operator controller-manager must be running to reconcile the deletion.
+  when: >-
+    acm_dr_hub_cleanup_argocd_acm_removal is failed or
+    acm_dr_hub_cleanup_argocd_demo_removal is failed
+
+# =============================================================================
+# STEP 1.4: REMOVE DEDICATED NAMESPACES (REPO SECRET AND OTHER OBJECTS TOGETHER)
+# =============================================================================
+
+- name: "[STAGE 01 - GitOps Cleanup] | 1.4.1) Remove dedicated GitOps/Policies namespaces (repository Secret together) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    kind: Namespace
+    name: "{{ item }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}"
+  loop:
+    - "{{ acm_dr_hub_cleanup_gitops_namespace_acm }}"
+    - "{{ acm_dr_hub_cleanup_gitops_namespace_appdemo }}"
+    - "{{ acm_dr_hub_cleanup_policies_namespace }}"
+    # Demo application namespaces - use variables to match whatever names were set during setup.
+    - "{{ acm_dr_hub_cleanup_demo_app1_name }}"
+    - "{{ acm_dr_hub_cleanup_demo_app2_name }}"
+  loop_control:
+    label: "{{ item }}"  # namespace name string
+  register: acm_dr_hub_cleanup_gitops_ns_removal
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  ignore_errors: true
+
+# Namespace removal diagnostic (looped task - check .results for partial failures).
+- name: "[STAGE 01 - GitOps Cleanup DIAGNOSTIC] | ❌ GitOps namespace removal timed out"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => {{ acm_dr_hub_cleanup_gitops_ns_removal.results | default([])
+      | selectattr('failed', 'defined') | selectattr('failed') | list | length }}
+      GitOps/Policies namespace(s) did not terminate within
+      {{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}s
+      on context '{{ k8s_target_context }}'.
+      Stuck: {{ acm_dr_hub_cleanup_gitops_ns_removal.results | default([])
+      | selectattr('failed', 'defined') | selectattr('failed')
+      | map(attribute='item') | list | join(', ') }}.
+      Check for stuck finalizers: oc get ns -o yaml --context {{ k8s_target_context }}.
+      Use examples/scripts/break-glass/force_delete_namespace.sh if needed.
+  when: acm_dr_hub_cleanup_gitops_ns_removal is failed
+
+# =============================================================================
+# STEP 1.5: COMPLETION SUMMARY AND STAGE 01 STATUS
+# =============================================================================
+
+- name: "[STAGE 01 - GitOps Cleanup] | Display Governance/GitOps removal completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/01_gitops_cleanup_summary.j2').split('\n') }}"
+  run_once: true
+...

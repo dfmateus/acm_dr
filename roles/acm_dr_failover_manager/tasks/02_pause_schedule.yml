@@ -1,0 +1,100 @@
+---
+# roles/acm_dr_failover_manager/tasks/02_pause_schedule.yml
+
+- name: "[STAGE 02 - Logical Fencing] | Display Fencing application metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🛑 STAGE 02 - Logical Fencing (Pause BackupSchedule on Active Hub)"
+    acm_dr_failover_manager_banner_lines:
+      - "🌐 SOURCE HUB: {{ active_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+- name: "[STAGE 02 - Logical Fencing] | 2.1.1) Apply Fencing by pausing the BackupSchedule - {{ active_hub }}"
+  kubernetes.core.k8s:
+    context: "{{ active_hub }}"
+    state: patched
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    name: "{{ acm_dr_failover_manager_schedule_name }}"
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+    definition:
+      spec:
+        paused: true
+  check_mode: "{{ acm_dr_failover_manager_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 02 - Logical Fencing] | 2.1.2) ⏳ Poll BackupSchedule until fenced on the Source Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    name: "{{ acm_dr_failover_manager_schedule_name }}"
+    namespace: "{{ acm_dr_failover_manager_backup_ns }}"
+  register: acm_dr_failover_manager_r_fence_status
+  # Accept Paused/BackupSchedulePaused as the normal fenced phase.
+  # Also accept BackupCollision when allow_fenced_origin=true: the schedule is
+  # effectively stopped (no new backups are produced) and the operator has
+  # explicitly acknowledged the non-standard source state.
+  until: >-
+    (acm_dr_failover_manager_r_fence_status.resources | default([{}]))[0]
+    .get('status', {}).get('phase', '') in ('Paused', 'BackupSchedulePaused')
+    or (
+      (acm_dr_failover_manager_r_fence_status.resources | default([{}]))[0]
+      .get('status', {}).get('phase', '') == 'BackupCollision'
+      and (acm_dr_failover_manager_allow_fenced_origin | default(false) | bool)
+    )
+  retries: "{{ acm_dr_failover_manager_fence_wait_retries }}"
+  delay: "{{ acm_dr_failover_manager_fence_wait_delay }}"
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+- name: "[STAGE 02 - Logical Fencing] | 2.1.2a) ⚠️ BackupCollision detected on Source Hub - operator acknowledged"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ WARNING: BackupSchedule '{{ acm_dr_failover_manager_schedule_name }}' on source hub
+      '{{ active_hub }}' is in BackupCollision, not Paused. This means the OADP operator
+      detected a backup storage conflict (commonly a backup created outside the schedule, or
+      a stale backup from a different cluster ID in the same BSL). No new backups are being
+      produced from this hub, so logical fencing is effective. Proceeding because
+      allow_fenced_origin=true. Resolve the collision on this hub after the failover completes:
+      check 'oc get backupschedule -n open-cluster-management-backup --context {{ active_hub }}'.
+  when:
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+    - (acm_dr_failover_manager_allow_fenced_origin | default(false) | bool)
+    - >-
+      (acm_dr_failover_manager_r_fence_status.resources | default([{}]))[0]
+      .get('status', {}).get('phase', '') == 'BackupCollision'
+
+- name: "[STAGE 02 - Logical Fencing] | 2.1.3) 🛡️ Assert BackupSchedule is fenced before proceeding to Restore"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_r_fence_status.resources | default([{}]))[0]
+        .get('status', {}).get('phase', '') in ('Paused', 'BackupSchedulePaused')
+        or (
+          (acm_dr_failover_manager_r_fence_status.resources | default([{}]))[0]
+          .get('status', {}).get('phase', '') == 'BackupCollision'
+          and (acm_dr_failover_manager_allow_fenced_origin | default(false) | bool)
+        )
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => BackupSchedule '{{ acm_dr_failover_manager_schedule_name }}'
+      on source hub '{{ active_hub }}' did not reach a fenced phase
+      after {{ acm_dr_failover_manager_fence_wait_retries }} retries
+      ({{ acm_dr_failover_manager_fence_wait_retries * acm_dr_failover_manager_fence_wait_delay }}s total).
+      Current phase: {{
+        (acm_dr_failover_manager_r_fence_status.resources | default([{}]))[0]
+        .get('status', {}).get('phase', 'unknown')
+      }}.
+      Accepted phases: Paused, BackupSchedulePaused.
+      If the schedule is stuck in BackupCollision and no new backups are being generated,
+      pass allow_fenced_origin=true to acknowledge the non-standard source state.
+      Check operator logs: oc logs -n {{ acm_dr_failover_manager_backup_ns }}
+      -l app=cluster-backup-chart --context {{ active_hub }}.
+      Do NOT proceed manually -- verify the source hub is no longer generating backups first.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => BackupSchedule '{{ acm_dr_failover_manager_schedule_name }}'
+      on source hub '{{ active_hub }}' is fenced (phase={{ (acm_dr_failover_manager_r_fence_status.resources | default([{}]))[0].get('status', {}).get('phase', 'unknown') }}).
+      Logical fencing confirmed. Proceeding to restore.
+  when: not (acm_dr_failover_manager_dry_run | default(false) | bool)
+...

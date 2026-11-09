@@ -1,0 +1,76 @@
+---
+# Release pipeline for dfmateus.acm_dr collection.
+# Triggers on version tags (v*). Validates the tag matches galaxy.yml,
+# builds the collection tarball, publishes to Galaxy and Automation Hub,
+# and creates a GitHub Release.
+#
+# Requires repository secrets:
+#   GALAXY_API_TOKEN       - https://galaxy.ansible.com/me/preferences
+#   AUTOMATION_HUB_API_KEY - https://console.redhat.com/ansible/automation-hub/token
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core
+        run: pip install "ansible-core>=2.18"
+
+      - name: Extract version from tag
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate galaxy.yml version matches tag
+        run: |
+          GALAXY_VERSION=$(grep '^version:' galaxy.yml | awk '{print $2}')
+          TAG_VERSION="${{ steps.version.outputs.tag }}"
+          if [ "$GALAXY_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::galaxy.yml version ($GALAXY_VERSION) does not match tag (v$TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Build collection
+        run: ansible-galaxy collection build --output-path dist/
+
+      - name: Publish to Ansible Galaxy
+        if: env.GALAXY_API_TOKEN != ''
+        env:
+          GALAXY_API_TOKEN: ${{ secrets.GALAXY_API_TOKEN }}
+        run: >-
+          ansible-galaxy collection publish
+          dist/dfmateus-acm_dr-${{ steps.version.outputs.tag }}.tar.gz
+          --server https://galaxy.ansible.com/
+          --token "${GALAXY_API_TOKEN}"
+
+      - name: Publish to Automation Hub
+        if: env.AUTOMATION_HUB_API_KEY != ''
+        env:
+          AUTOMATION_HUB_API_KEY: ${{ secrets.AUTOMATION_HUB_API_KEY }}
+        run: >-
+          ansible-galaxy collection publish
+          dist/dfmateus-acm_dr-${{ steps.version.outputs.tag }}.tar.gz
+          --server https://console.redhat.com/api/automation-hub/
+          --token "${AUTOMATION_HUB_API_KEY}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/dfmateus-acm_dr-${{ steps.version.outputs.tag }}.tar.gz
+          generate_release_notes: true

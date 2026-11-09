@@ -1,0 +1,26 @@
+---
+galaxy_info:
+  role_name: acm_dr_spoke_manager
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Lifecycle management for onboarding (auto-import) and graceful
+    detachment of ManagedClusters in Red Hat Advanced Cluster
+    Management for Kubernetes (RHACM 2.10+), with Kubernetes 1.24+
+    support (KCS 5950901 / KCS 7039710).
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - disasterrecovery
+    - openshift
+    - kubernetes
+
+dependencies: []
+...

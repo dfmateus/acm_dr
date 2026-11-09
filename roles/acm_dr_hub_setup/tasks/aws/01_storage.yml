@@ -1,0 +1,157 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 01 METADATA DISPLAY (AWS)
+# =============================================================================
+
+- name: "[STAGE 01 - AWS S3 Storage] | Display S3 provisioning metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "☁️ STAGE 01 - AWS S3 Storage Provisioning"
+    acm_dr_hub_setup_banner_lines:
+      - "🌐 AWS REGION:            {{ acm_dr_hub_setup_aws_region }}"
+      - "🪣 BUCKET BACKUP:         {{ acm_dr_hub_setup_aws_s3_bucket_backup }}"
+      - "📊 BUCKET OBSERVABILITY:  {{ acm_dr_hub_setup_aws_s3_bucket_observability }}"
+      - "🔄 ALLOW REUSE:           {{ acm_dr_hub_setup_aws_storage_allow_reuse }}"
+  run_once: true
+
+# =============================================================================
+# STEP 1.1: AWS AUTHENTICATION VALIDATION
+# =============================================================================
+# amazon.aws modules authenticate via env vars (AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION) or module-level params.
+# No explicit "aws configure" or "aws sts get-caller-identity" step needed.
+# The env vars are set by:
+#   - AAP: custom "ACM DR - AWS IAM Credentials" credential type
+#   - CLI: export AWS_ACCESS_KEY_ID=... (or via defaults/main.yml env lookup)
+#
+# All amazon.aws calls in this file use an environment: block that maps
+# role variables to the env vars the SDK expects.
+
+- name: "[STAGE 01 - AWS S3 Storage] | 1.1.1) Validate AWS credentials via STS caller identity query"
+  amazon.aws.aws_caller_info: {}
+  # Queries STS to confirm the IAM credentials are valid.
+  # Equivalent of the old "aws sts get-caller-identity".
+  # Callers must unset AWS_PROFILE before running (the .local/cloud/aws/env-setup.sh
+  # handles this) to prevent boto3 "both a profile and access tokens" conflict.
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ acm_dr_hub_setup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ acm_dr_hub_setup_aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ acm_dr_hub_setup_aws_region }}"
+  register: acm_dr_hub_setup_aws_auth_check
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# =============================================================================
+# STEP 1.2: EXISTING RESOURCE CHECKS AND SAFETY VALIDATION
+# =============================================================================
+
+- name: "[STAGE 01 - AWS S3 Storage] | 1.2.1) Check for pre-existing Backup S3 Bucket"
+  # s3_bucket_info returns bucket metadata when the bucket exists.
+  # When the bucket does not exist the module returns an empty list.
+  amazon.aws.s3_bucket_info:
+    name: "{{ acm_dr_hub_setup_aws_s3_bucket_backup }}"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ acm_dr_hub_setup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ acm_dr_hub_setup_aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ acm_dr_hub_setup_aws_region }}"
+  register: acm_dr_hub_setup_aws_bucket_backup_check
+  failed_when: false
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# Determine if backup bucket exists. s3_bucket_info returns a list of matching
+# buckets; an empty list means the bucket does not exist.
+- name: "[STAGE 01 - AWS S3 Storage] | 1.2.1b) Determine if Backup Bucket exists"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_aws_backup_bucket_exists: >-
+      {{ (acm_dr_hub_setup_aws_bucket_backup_check.bucket_list | default([]) | length) > 0 }}
+
+- name: "[STAGE 01 - AWS S3 Storage] | 1.2.2) Check for pre-existing Observability S3 Bucket"
+  amazon.aws.s3_bucket_info:
+    name: "{{ acm_dr_hub_setup_aws_s3_bucket_observability }}"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ acm_dr_hub_setup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ acm_dr_hub_setup_aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ acm_dr_hub_setup_aws_region }}"
+  register: acm_dr_hub_setup_aws_bucket_obs_check
+  failed_when: false
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 01 - AWS S3 Storage] | 1.2.2b) Determine if Observability Bucket exists"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_aws_obs_bucket_exists: >-
+      {{ (acm_dr_hub_setup_aws_bucket_obs_check.bucket_list | default([]) | length) > 0 }}
+
+- name: "[STAGE 01 - AWS S3 Storage] | 1.2.3) 🛡️ SAFETY LOCK - Block execution if S3 buckets already exist without reuse flag"
+  ansible.builtin.fail:
+    msg:
+      - "🛑 [SAFETY MECHANISM ACTIVATED]: S3 resources have already been detected in AWS!"
+      - "---------------------------------------------------------------------------------------------------"
+      - " Backup Bucket:        {{ acm_dr_hub_setup_aws_s3_bucket_backup }} (Exists: {{ acm_dr_hub_setup_aws_backup_bucket_exists }})"
+      - " Observability Bucket: {{ acm_dr_hub_setup_aws_s3_bucket_observability }} (Exists: {{ acm_dr_hub_setup_aws_obs_bucket_exists }})"
+      - "---------------------------------------------------------------------------------------------------"
+      - " AVAILABLE OPTIONS TO CONTINUE:"
+      - " 1. To REUSE these existing resources, re-run adding the flag:"
+      - "    -e acm_dr_hub_setup_aws_storage_allow_reuse=true"
+      - ""
+      - " 2. To CHANGE the bucket names, adjust the extra-vars or defaults/main.yml."
+      - "---------------------------------------------------------------------------------------------------"
+  when:
+    - not acm_dr_hub_setup_aws_storage_allow_reuse | bool
+    - (acm_dr_hub_setup_aws_backup_bucket_exists | bool) or
+      (acm_dr_hub_setup_aws_obs_bucket_exists | bool)
+
+# =============================================================================
+# STEP 1.3: IDEMPOTENT PROVISIONING OF S3 BUCKETS
+# =============================================================================
+
+- name: "[STAGE 01 - AWS S3 Storage] | 1.3.1) Create S3 Bucket for OADP/Velero Backups"
+  # The s3_bucket module is idempotent: state=present no-ops if the bucket
+  # already exists with the same configuration.
+  # encryption: string - "AES256" (SSE-S3) or "aws:kms" (SSE-KMS).
+  # encryption_key_id: only set when using KMS; omitted for AES256.
+  amazon.aws.s3_bucket:
+    name: "{{ acm_dr_hub_setup_aws_s3_bucket_backup }}"
+    state: present
+    # Block all public access (S3 Block Public Access)
+    public_access:
+      block_public_acls: true
+      ignore_public_acls: true
+      block_public_policy: true
+      restrict_public_buckets: true
+    # S3 default encryption (AES-256 or KMS when key specified)
+    encryption: "{{ (acm_dr_hub_setup_aws_kms_key_id | default('') | length > 0) | ternary('aws:kms', 'AES256') }}"
+    encryption_key_id: "{{ acm_dr_hub_setup_aws_kms_key_id | default(omit, true) }}"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ acm_dr_hub_setup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ acm_dr_hub_setup_aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ acm_dr_hub_setup_aws_region }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not (acm_dr_hub_setup_aws_backup_bucket_exists | bool)
+
+- name: "[STAGE 01 - AWS S3 Storage] | 1.3.2) Create S3 Bucket for Thanos Observability History"
+  amazon.aws.s3_bucket:
+    name: "{{ acm_dr_hub_setup_aws_s3_bucket_observability }}"
+    state: present
+    public_access:
+      block_public_acls: true
+      ignore_public_acls: true
+      block_public_policy: true
+      restrict_public_buckets: true
+    encryption: "{{ (acm_dr_hub_setup_aws_kms_key_id | default('') | length > 0) | ternary('aws:kms', 'AES256') }}"
+    encryption_key_id: "{{ acm_dr_hub_setup_aws_kms_key_id | default(omit, true) }}"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ acm_dr_hub_setup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ acm_dr_hub_setup_aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ acm_dr_hub_setup_aws_region }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: not (acm_dr_hub_setup_aws_obs_bucket_exists | bool)
+
+# =============================================================================
+# STEP 1.4: COMPLETION SUMMARY AND STAGE 01 FINISH STATUS
+# =============================================================================
+
+- name: "[STAGE 01 - AWS S3 Storage] | Display AWS S3 provisioning completion status"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/aws/01_storage_summary.j2').split('\n') }}"
+  run_once: true
+...

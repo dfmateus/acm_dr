@@ -1,0 +1,119 @@
+---
+# molecule/default/converge.yml
+# Offline validation of role defaults and Jinja2 template rendering.
+# Does not contact any Kubernetes cluster. All assertions run against
+# local YAML files and rendered Jinja2 output.
+#
+# What this playbook tests:
+#   Phase 1 - Loads defaults/main.yml for all 7 roles and confirms
+#             the YAML parses without error.
+#   Phase 2 - Renders templates that can work with mock variables
+#             (no cluster state needed) and writes them to /tmp/ so
+#             verify.yml can inspect the output.
+
+- name: "Validate role defaults and template rendering (offline)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    # =================================================================
+    # PHASE 1: LOAD ROLE DEFAULTS
+    # Each include_vars stores the result under a role-scoped dict name
+    # to avoid variable collisions across the 7 roles.
+    # =================================================================
+    - name: "Load defaults for each role"
+      ansible.builtin.include_vars:
+        dir: "{{ playbook_dir }}/../../roles/{{ item }}/defaults"
+        name: "{{ item }}_defaults"
+      loop:
+        - acm_dr_kubeconfig_resolver
+        - acm_dr_hub_setup
+        - acm_dr_failover_manager
+        - acm_dr_spoke_manager
+        - acm_dr_hub_cleanup
+        - acm_argocd_instance_setup
+        - acm_argocd_instance_cleanup
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Confirm all role defaults loaded successfully"
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.vars', item + '_defaults') is mapping
+          - lookup('ansible.builtin.vars', item + '_defaults') | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Defaults for role '{{ item }}' failed to load
+          or returned an empty dict
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Defaults for role '{{ item }}' loaded
+          ({{ lookup('ansible.builtin.vars', item + '_defaults') | length }} variables)
+      loop:
+        - acm_dr_kubeconfig_resolver
+        - acm_dr_hub_setup
+        - acm_dr_failover_manager
+        - acm_dr_spoke_manager
+        - acm_dr_hub_cleanup
+        - acm_argocd_instance_setup
+        - acm_argocd_instance_cleanup
+      loop_control:
+        label: "{{ item }}"
+
+    # =================================================================
+    # PHASE 2: RENDER TEMPLATES WITH MOCK DATA
+    # Templates that depend only on role variables (not on live cluster
+    # state) can be rendered offline to catch Jinja2 syntax errors and
+    # missing default() guards.
+    # =================================================================
+
+    # -- kubeconfig resolver template --
+    # The runtime_kubeconfig.yml.j2 generates a multi-context kubeconfig
+    # from a list of per-cluster entries. We provide a single mock entry
+    # to exercise the full template (clusters, users, contexts blocks).
+    - name: "Render runtime_kubeconfig.yml.j2 with mock cluster entry"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_kubeconfig_resolver/templates/runtime_kubeconfig.yml.j2"
+        dest: /tmp/molecule_test_kubeconfig.yml
+        mode: "0600"
+      vars:
+        acm_dr_kubeconfig_resolver_entries:
+          - context_name: "molecule-test-hub"
+            host: "https://api.molecule-test.example.com:6443"
+            token: "molecule-mock-token-not-real"  # not a real token
+            ca_data: ""
+        acm_dr_kubeconfig_resolver_skip_tls_when_no_ca: true
+
+    # -- ArgoCD CR template --
+    # The argocd_cr.yml.j2 produces a full ArgoCD custom resource spec.
+    # We supply the required identity vars plus safe defaults for optional
+    # fields (SSO, RBAC, resource exclusions).
+    - name: "Render argocd_cr.yml.j2 with mock instance data"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_argocd_instance_setup/templates/argocd_cr.yml.j2"
+        dest: /tmp/molecule_test_argocd_cr.yml
+        mode: "0644"
+      vars:
+        acm_argocd_instance_setup_name: "molecule-test-argocd"
+        acm_argocd_instance_setup_namespace: "molecule-test-ns"
+        acm_argocd_instance_setup_resource_exclusions: []
+        acm_argocd_instance_setup_sso_enabled: true
+        acm_argocd_instance_setup_rbac_default_policy: ""
+        acm_argocd_instance_setup_rbac_policy: "g, system:cluster-admins, role:admin"
+        acm_argocd_instance_setup_rbac_scopes: "[groups]"
+
+    # -- stage_banner template (lab_setup) --
+    # Every role has a stage_banner.j2 template for formatted console
+    # output. We render the lab_setup variant with mock banner data to
+    # confirm the line-length calculation and separator logic work.
+    - name: "Render stage_banner.j2 with mock banner data"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_hub_setup/templates/reports/stage_banner.j2"
+        dest: /tmp/molecule_test_stage_banner.txt
+        mode: "0644"
+      vars:
+        acm_dr_hub_setup_separator_char: "="
+        acm_dr_hub_setup_banner_title: "MOLECULE TEST BANNER"
+        acm_dr_hub_setup_banner_lines:
+          - "Role: acm_dr_hub_setup"
+          - "Context: molecule-test-context"
+...

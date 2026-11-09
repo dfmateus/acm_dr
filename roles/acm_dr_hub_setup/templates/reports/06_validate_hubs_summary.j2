@@ -1,0 +1,18 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 75 %}
+{{ _sep }}
+ 🛡️  HUB COMPLIANCE AND HEALTH AUDIT COMPLETED SUCCESSFULLY
+{{ _sep }}
+ 🎯 EVALUATED CONTEXT:      {{ k8s_target_context }}
+ 🎛️  HUB TYPE:               {{ acm_dr_hub_setup_is_primary_hub | ternary('PRIMARY HUB (ACTIVE)', 'SECONDARY / PASSIVE HUB (DR)') }}
+ 🚀 RHACM MULTICLUSTERHUB:  Running (Phase fully reconciled)
+ 🐙 OPENSHIFT GITOPS:       2/2 Active ArgoCD Instances (ACM & AppDemo)
+ 📊 THANOS OBSERVABILITY:   Ready (Condition True - Active Metrics Collection)
+ 🌐 BSL CONNECTION:         Available ({{ (acm_dr_hub_setup_cloud_provider == 'aws') | ternary('S3', 'Azure') }} Storage Connectivity Validated)
+ 📅 BACKUP SCHEDULE:        {{ acm_dr_hub_setup_is_primary_hub | ternary('ENABLED (Active)', 'DISABLED (Passive as expected)') }}
+ 🔄 PASSIVE SYNC RESTORE:  {{ (not acm_dr_hub_setup_is_primary_hub | bool) | ternary((acm_dr_hub_setup_audit_restore.resources | length > 0) | ternary('ACTIVE (Syncing)', 'NOT CONFIGURED'), 'N/A (Primary Hub)') }}
+ 💾 BACKUPS DETECTED:       {{ acm_dr_hub_setup_audit_backups.resources | length }} snapshot(s) visible in {{ (acm_dr_hub_setup_cloud_provider == 'aws') | ternary('S3', 'Azure Blob') }} Storage
+ 🆔 CLUSTER ID:             {{ (acm_dr_hub_setup_audit_cluster_version.resources | default([]) | length > 0) | ternary(acm_dr_hub_setup_audit_cluster_version.resources[0].spec.clusterID | default('N/A'), 'N/A (non-OCP cluster)') }}
+ 🔍 DETECTED DR ROLE:       {{ acm_dr_hub_setup_detected_dr_role | default('unknown') | trim | upper }}
+{{ _sep }}
+ 🚀 FINAL SETUP STATUS:     SETUP COMPLETED SUCCESSFULLY (100% OPERATIONAL)
+{{ _sep }}

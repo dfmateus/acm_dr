@@ -1,0 +1,8 @@
+---
+notesdir: fragments
+changes_file: changelog.yaml
+changes_format: combined
+keep_fragments: false
+title: "RHACM DR Collection"
+flatmap: true
+...

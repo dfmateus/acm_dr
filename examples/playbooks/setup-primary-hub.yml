@@ -1,0 +1,32 @@
+---
+# examples/playbooks/setup-primary-hub.yml
+# Provision a primary (active) Hub for DR.
+# Sets up MCH, OADP, Observability, GitOps/ArgoCD, and BackupSchedule.
+#
+# Required extra vars:
+#   k8s_target_context  - kubeconfig context for the target Hub cluster
+#   is_primary_hub      - true (creates BackupSchedule, not passive Restore)
+#
+# Required environment variables (Azure Storage + GitHub):
+#   GUID, SUBSCRIPTION, TENANT, CLIENT_ID, PASSWORD, RESOURCEGROUP
+#   GITHUB_USER, GITHUB_PAT
+#
+# Usage:
+#   ansible-playbook examples/playbooks/setup-primary-hub.yml \
+#     -e k8s_target_context="acm-primary-hub-sa" \
+#     -e is_primary_hub=true
+
+- name: Setup primary Hub for DR
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    # Resolve kubeconfig from per-cluster credentials or fall back to KUBECONFIG env var
+    - role: dfmateus.acm_dr.acm_dr_kubeconfig_resolver
+
+    # Provision the full DR stack on the primary Hub
+    - role: dfmateus.acm_dr.acm_dr_hub_setup
+      vars:
+        k8s_target_context: "acm-primary-hub-sa"  # kubeconfig context for the Hub
+        is_primary_hub: true  # creates BackupSchedule (active Hub)
+...

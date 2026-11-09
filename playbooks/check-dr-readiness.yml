@@ -1,0 +1,106 @@
+---
+# playbooks/check-dr-readiness.yml
+# =============================================================================
+# DR READINESS CHECK (READ-ONLY)
+#
+# Description:
+#   Lightweight health check for the DR infrastructure. Runs read-only queries
+#   against both Hub clusters and reports whether the environment is ready for
+#   a failover. Does NOT start the failover pipeline.
+#
+#   Checks performed:
+#     - Source Hub: BackupSchedule exists and is not paused
+#     - Source Hub: BackupStorageLocation is Available
+#     - Source Hub: Latest backup is within the RPO threshold
+#     - Source Hub: Connected Spoke count (informational)
+#     - Destination Hub: Passive sync Restore CR is present
+#
+#   Exit codes:
+#     0 - all critical checks passed (environment is ready)
+#     1 - one or more critical checks failed (see ❌ messages in output)
+#
+# Usage:
+#
+#   Per-cluster credentials (AAP or CLI via load_cluster_env.sh):
+#     source scripts/lib/load_cluster_env.sh source ~/.kube/clusters/acmdr-hub-01-sa.env
+#     source scripts/lib/load_cluster_env.sh dest   ~/.kube/clusters/acmdr-hub-02-sa.env
+#     ansible-playbook playbooks/check-dr-readiness.yml -v
+#
+#   Explicit context vars (monolithic kubeconfig):
+#     ansible-playbook playbooks/check-dr-readiness.yml \
+#       -e k8s_source_context=acmdr-hub-01-sa \
+#       -e k8s_dest_context=acmdr-hub-02-sa \
+#       -v
+#
+# Variables (required):
+#   k8s_source_context   - kubeconfig context for the active (Source) Hub SA.
+#                          Injected automatically via ACM_DR_SOURCE_CONTEXT when using
+#                          the ACM DR Source Hub AAP credential type.
+#   k8s_dest_context     - kubeconfig context for the passive (Destination) Hub SA.
+#                          Injected automatically via ACM_DR_DEST_CONTEXT when using
+#                          the ACM DR Destination Hub AAP credential type.
+#
+# Variables (optional):
+#   acm_dr_readiness_check_rpo_seconds              - RPO threshold in seconds (default: 25200 = 7 h)
+#   acm_dr_readiness_check_min_spoke_count          - minimum Spoke count to expect (default: 0, skip)
+#   acm_dr_readiness_check_fail_on_stale_backup     - true to fail on stale backup (default: false)
+#   acm_dr_readiness_check_fail_on_missing_restore  - true to fail if passive Restore absent (default: true)
+#
+# Dependencies:
+#   collections: kubernetes.core (k8s_info for all API reads)
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+#                acm_dr_readiness_check
+# =============================================================================
+
+- name: ACM DR Readiness Check - Read-Only Health Verification
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster credentials
+      # from AAP or load_cluster_env.sh), falling back to the monolithic KUBECONFIG env var.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]
+      tags: [always]
+
+    # Derive context from per-cluster credentials when not passed as extra-var
+    - name: "[PRE-FLIGHT] | Derive source context from ACM_DR_SOURCE_CONTEXT env var"
+      ansible.builtin.set_fact:
+        k8s_source_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_SOURCE_CONTEXT', default='') }}"  # noqa var-naming[no-role-prefix]
+      when:
+        - k8s_source_context is not defined
+        - lookup('ansible.builtin.env', 'ACM_DR_SOURCE_CONTEXT', default='') | length > 0
+
+    - name: "[PRE-FLIGHT] | Derive destination context from ACM_DR_DEST_CONTEXT env var"
+      ansible.builtin.set_fact:
+        k8s_dest_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_DEST_CONTEXT', default='') }}"  # noqa var-naming[no-role-prefix]
+      when:
+        - k8s_dest_context is not defined
+        - lookup('ansible.builtin.env', 'ACM_DR_DEST_CONTEXT', default='') | length > 0
+
+    - name: "READINESS CHECK | Validate required context variables"
+      ansible.builtin.assert:
+        that:
+          - k8s_source_context is defined and k8s_source_context | length > 0
+          - k8s_dest_context is defined and k8s_dest_context | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Both k8s_source_context (active Hub) and k8s_dest_context
+          (passive Hub) are required. Provide via -e vars or per-cluster credentials
+          (ACM_DR_SOURCE_CONTEXT / ACM_DR_DEST_CONTEXT from load_cluster_env.sh or AAP credential type).
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Contexts validated: source='{{ k8s_source_context }}'
+          dest='{{ k8s_dest_context }}'.
+
+  roles:
+    - role: "{{ playbook_dir }}/../roles/acm_dr_readiness_check"
+...

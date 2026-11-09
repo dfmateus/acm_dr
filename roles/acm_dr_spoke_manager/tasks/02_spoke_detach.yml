@@ -1,0 +1,699 @@
+---
+# roles/acm_dr_spoke_manager/tasks/02_spoke_detach.yml
+# =============================================================================
+# STAGE 02: GRACEFUL SPOKE DETACH & HARDENING (KCS 5950901)
+# =============================================================================
+
+- name: "[STAGE 02 - SPOKE DETACH] | Display Spoke detachment metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_spoke_manager_banner_title: "📝 STAGE 02 - Graceful Spoke Detach & Hardening (KCS 5950901)"
+    acm_dr_spoke_manager_banner_lines:
+      - "🎛️  HUB CONTEXT:    {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+      - "🎯 SPOKE CONTEXT:  {{ acm_dr_spoke_manager_spoke_k8s_context | default('NOT PROVIDED') }}"
+      - "🏷️  SPOKE NAME:     {{ acm_dr_spoke_manager_cluster_name }}"
+  run_once: true
+
+# =============================================================================
+# PHASE 1: DETACHMENT ON THE HUB
+# =============================================================================
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.1.1) Check ManagedCluster Custom Resource on the Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_r_managed_cluster_info
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.1.2) Notify start of ManagedCluster removal on the Hub"
+  ansible.builtin.debug:
+    msg:
+      - "📢 [HUB] Removing ManagedCluster Custom Resource '{{ acm_dr_spoke_manager_cluster_name }}'..."
+  when:
+    - acm_dr_spoke_manager_r_managed_cluster_info.resources is defined
+    - (acm_dr_spoke_manager_r_managed_cluster_info.resources | default([])) | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.1.3) Delete ManagedCluster Custom Resource on the Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: absent
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  when:
+    - acm_dr_spoke_manager_r_managed_cluster_info.resources is defined
+    - (acm_dr_spoke_manager_r_managed_cluster_info.resources | default([])) | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.1.4) ⏳ WAIT - Polling Spoke detachment on the Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_r_detach_check
+  until: (acm_dr_spoke_manager_r_detach_check.resources | default([])) | length == 0
+  retries: "{{ acm_dr_spoke_manager_detach_wait_retries }}"
+  delay: "{{ acm_dr_spoke_manager_detach_wait_delay }}"
+  when:
+    - acm_dr_spoke_manager_r_managed_cluster_info.resources is defined
+    - (acm_dr_spoke_manager_r_managed_cluster_info.resources | default([])) | length > 0
+  ignore_errors: true
+
+# =============================================================================
+# SPOKE DETACH DIAGNOSTIC SECTION
+# =============================================================================
+# Runs only when 2.1.4 times out (ManagedCluster still exists after 5min).
+# This section WARNS but does NOT re-fail, because Phase 2 hardening
+# (KCS 5950901) often fixes stuck MC deletion by cleaning up the klusterlet
+# on the Spoke side. The final validation in Phase 3 (assertions 2.3.2-2.3.7)
+# catches any remaining issues after hardening runs.
+
+# D.1) Re-read the ManagedCluster to check what finalizers are blocking.
+- name: "[SPOKE DETACH DIAGNOSTIC] | D.1) Read ManagedCluster finalizers from Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_diag_detach_mc
+  failed_when: false  # must not crash the diagnostic itself
+  when: acm_dr_spoke_manager_r_detach_check is failed
+
+# D.2) Build a diagnostic summary showing what is blocking deletion.
+- name: "[SPOKE DETACH DIAGNOSTIC] | D.2) Build detach diagnostic summary"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_diag_detach_summary: >-
+      {% set mc = acm_dr_spoke_manager_diag_detach_mc.resources | default([]) %}
+      {% if mc | length > 0 %}
+      ManagedCluster '{{ acm_dr_spoke_manager_cluster_name }}' still exists on Hub.
+      Finalizers: {{ mc[0].metadata.finalizers | default([]) | join(', ') | default('(none)') }}.
+      DeletionTimestamp: {{ mc[0].metadata.deletionTimestamp | default('not set') }}.
+      {% set conds = mc[0].status.conditions | default([]) %}
+      {% if conds | length > 0 %}
+      Conditions:
+      {% for c in conds %}
+        {{ c.type }}: {{ c.status }} - {{ c.message | default('(no message)') }}
+      {% endfor %}
+      {% endif %}
+      {% else %}
+      ManagedCluster '{{ acm_dr_spoke_manager_cluster_name }}' could not be read from Hub.
+      {% endif %}
+    acm_dr_spoke_manager_diag_detach_hints: >-
+      {% set mc = acm_dr_spoke_manager_diag_detach_mc.resources | default([]) %}
+      {% set hints = [] %}
+      {% if mc | length > 0 and mc[0].metadata.finalizers | default([]) | length > 0 %}
+      {%   set _ = hints.append(
+             'FINALIZER BLOCKING: The ManagedCluster has active finalizers that the '
+             ~ 'Hub controller cannot release. This usually means the klusterlet on the '
+             ~ 'Spoke is not responding to cleanup requests. Phase 2 hardening '
+             ~ '(KCS 5950901) will remove the klusterlet from the Spoke, then Phase 2c '
+             ~ 'will force-remove any remaining stuck finalizers (inline break-glass).') %}
+      {% endif %}
+      {% if mc | length > 0 and mc[0].metadata.deletionTimestamp is not defined %}
+      {%   set _ = hints.append(
+             'NOT DELETING: The ManagedCluster exists but has no deletionTimestamp. '
+             ~ 'The delete request at 2.1.3 may have failed silently. '
+             ~ 'Check Hub API connectivity and permissions.') %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append(
+             'The ManagedCluster is still present after 5 minutes. Phase 2 hardening '
+             ~ 'will attempt remediation. If the issue persists after hardening, Phase 2c '
+             ~ 'will automatically force-remove stuck finalizers (inline break-glass).') %}
+      {% endif %}
+      {{ hints }}
+  when: acm_dr_spoke_manager_r_detach_check is failed
+
+# D.3) Print the diagnostic as a WARNING (not a failure). Phase 2
+#      hardening will try to fix the issue before the final validation.
+- name: "[SPOKE DETACH DIAGNOSTIC] | D.3) ⚠️ DETACH TIMEOUT: Diagnostic Report (non-blocking)"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ⚠️ SPOKE DETACH TIMEOUT: DIAGNOSTIC REPORT (non-blocking)"
+      - "======================================================================"
+      - ""
+      - "SPOKE:"
+      - "  {{ acm_dr_spoke_manager_cluster_name }}"
+      - ""
+      - "HUB:"
+      - "  {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+      - ""
+      - "ATTEMPTS:"
+      - "  {{ acm_dr_spoke_manager_r_detach_check.attempts | default('?') }} of 30 retries exhausted (300s)"
+      - ""
+      - "MANAGEDCLUSTER STATUS:"
+      - "{{ acm_dr_spoke_manager_diag_detach_summary | default('  (could not read ManagedCluster)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_spoke_manager_diag_detach_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "⏩ Phase 2 hardening + Phase 2c inline break-glass will attempt remediation next."
+      - "======================================================================"
+  when: acm_dr_spoke_manager_r_detach_check is failed
+
+# =============================================================================
+# PHASE 2: HARDENING AND CLEANUP ON THE SPOKE CLUSTER (KCS 5950901)
+# =============================================================================
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.1) Notify start of deep cleanup on the Spoke"
+  ansible.builtin.debug:
+    msg:
+      - "🧹 [KCS 5950901] Executing deep cleanup on Spoke '{{ acm_dr_spoke_manager_spoke_k8s_context }}'..."
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.2) Remove stuck Klusterlet finalizers on the Spoke"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: Klusterlet
+    name: klusterlet
+    definition:
+      metadata:
+        finalizers: []
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.3) Delete Klusterlet object on the Spoke"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: absent
+    api_version: operator.open-cluster-management.io/v1
+    kind: Klusterlet
+    name: klusterlet
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.4) Delete RHACM agent namespaces on the Spoke"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: absent
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+  loop:
+    - open-cluster-management-agent
+    - open-cluster-management-agent-addon
+  loop_control:
+    label: "{{ item }}"  # namespace name string
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+# =============================================================================
+# PHASE 2b: CLUSTER-SCOPED RESOURCE CLEANUP ON THE SPOKE
+# =============================================================================
+# The klusterlet deploys ClusterRoles, ClusterRoleBindings and CRDs that live
+# outside the agent namespaces. Without this cleanup, a re-import fails because
+# the Hub import controller finds residual resources and tries to use them
+# instead of bootstrapping a fresh klusterlet ("open-cluster-management-agent
+# namespace not found" after 5/5 retries).
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.5) Discover residual klusterlet ClusterRoleBindings on the Spoke"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+  register: acm_dr_spoke_manager_r_spoke_crbs
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.5b) Remove klusterlet ClusterRoleBindings from the Spoke"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: "{{ item }}"
+  # Matches klusterlet-owned bindings dynamically so future RHACM versions
+  # with different names are caught without hardcoded lists.
+  loop: >-
+    {{ (acm_dr_spoke_manager_r_spoke_crbs.resources | default([]))
+       | map(attribute='metadata.name')
+       | select('match', '^(klusterlet|open-cluster-management)')
+       | list }}
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.6) Discover residual klusterlet ClusterRoles on the Spoke"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  register: acm_dr_spoke_manager_r_spoke_crs
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.6b) Remove klusterlet ClusterRoles from the Spoke"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    name: "{{ item }}"
+  # Pattern covers: klusterlet, klusterlet-bootstrap-kubeconfig,
+  # klusterlet-priority-class, open-cluster-management:klusterlet-*
+  loop: >-
+    {{ (acm_dr_spoke_manager_r_spoke_crs.resources | default([]))
+       | map(attribute='metadata.name')
+       | select('match', '^(klusterlet|open-cluster-management:klusterlet)')
+       | list }}
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.7) Remove klusterlet CRDs from the Spoke"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: absent
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: "{{ item }}"
+  loop:
+    - appliedmanifestworks.work.open-cluster-management.io
+    - clusterclaims.cluster.open-cluster-management.io
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+# =============================================================================
+# PHASE 2c: HUB-SIDE FINALIZER REMEDIATION (INLINE BREAK-GLASS)
+# =============================================================================
+# Runs only when Phase 1 wait (2.1.4) timed out. By this point, Phase 2 has
+# already removed the klusterlet and agent namespaces from the Spoke. If the
+# ManagedCluster is still stuck on the Hub with a deletionTimestamp and pending
+# finalizers, the import/registration controllers cannot resolve them because
+# the Spoke agent no longer exists. This section cleans up blocking sub-
+# resources in the Hub-side Spoke namespace and force-removes the finalizers
+# from the ManagedCluster, replacing the manual
+# examples/scripts/break-glass/force_purge_managed_cluster.sh.
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.8) Re-check ManagedCluster on the Hub after Spoke-side cleanup"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_r_mc_post_hardening
+  when: acm_dr_spoke_manager_r_detach_check is failed
+
+# Build a single boolean that governs every task in Phase 2c.
+# True when: MC exists, has a deletionTimestamp (delete was requested), and
+# has stuck finalizers that the controllers cannot resolve.
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.8b) Determine if inline break-glass remediation is needed"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_remediation_needed: >-
+      {{ (acm_dr_spoke_manager_r_mc_post_hardening.resources | default([]) | length > 0)
+         and (acm_dr_spoke_manager_r_mc_post_hardening.resources[0].metadata.deletionTimestamp is defined)
+         and ((acm_dr_spoke_manager_r_mc_post_hardening.resources[0].metadata.finalizers | default([])) | length > 0) }}
+  when: acm_dr_spoke_manager_r_detach_check is failed
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.8c) ⚠️ Notify: Starting inline break-glass finalizer remediation"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ⚠️ INLINE BREAK-GLASS: HUB-SIDE FINALIZER REMEDIATION"
+      - "======================================================================"
+      - ""
+      - " ManagedCluster '{{ acm_dr_spoke_manager_cluster_name }}' is stuck"
+      - " with a deletionTimestamp and the following finalizers:"
+      - "   {{ acm_dr_spoke_manager_r_mc_post_hardening.resources[0].metadata.finalizers | join(', ') }}"
+      - ""
+      - " Phase 2 already cleaned the Spoke-side agent, so these controllers"
+      - " cannot resolve their finalizers. Force-removing them now."
+      - "======================================================================"
+  when: acm_dr_spoke_manager_remediation_needed | default(false) | bool
+
+# Clean up Hub-side sub-resources in the Spoke namespace. The MC's
+# resource-cleanup finalizer blocks until ManifestWorks, ObservabilityAddons
+# and KlusterletAddonConfig objects in the Spoke namespace are deleted.
+# Patching their finalizers unblocks that controller.
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.9) Patch ObservabilityAddon finalizers in Hub-side Spoke namespace"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: observability.open-cluster-management.io/v1beta1
+    kind: ObservabilityAddon
+    name: observability-addon
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+    definition:
+      metadata:
+        finalizers: []
+  failed_when: false  # ObservabilityAddon may not exist if Observability is not installed
+  when: acm_dr_spoke_manager_remediation_needed | default(false) | bool
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.10) Discover ManifestWorks in Hub-side Spoke namespace"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_r_hub_manifestworks
+  failed_when: false
+  when: acm_dr_spoke_manager_remediation_needed | default(false) | bool
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.10b) Patch ManifestWork finalizers in Hub-side Spoke namespace"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    name: "{{ item }}"
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: >-
+    {{ (acm_dr_spoke_manager_r_hub_manifestworks.resources | default([]))
+       | map(attribute='metadata.name') | list }}
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_remediation_needed | default(false) | bool
+    - (acm_dr_spoke_manager_r_hub_manifestworks.resources | default([])) | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.11) Patch KlusterletAddonConfig finalizers on the Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+    definition:
+      metadata:
+        finalizers: []
+  failed_when: false  # KlusterletAddonConfig may not exist depending on ACM version
+  when: acm_dr_spoke_manager_remediation_needed | default(false) | bool
+
+# After cleaning sub-resources, force-remove the ManagedCluster's own
+# finalizers. This is the step that unblocks the MC deletion.
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.12) Force-remove stuck finalizers from ManagedCluster on the Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+    definition:
+      metadata:
+        finalizers: []
+  failed_when: false  # MC may have been deleted naturally between 2.2.8 and now
+  when: acm_dr_spoke_manager_remediation_needed | default(false) | bool
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.13) ⏳ Wait for ManagedCluster to disappear after finalizer remediation"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_r_mc_post_remediation
+  until: (acm_dr_spoke_manager_r_mc_post_remediation.resources | default([])) | length == 0
+  retries: "{{ acm_dr_spoke_manager_detach_finalizer_retries }}"
+  delay: "{{ acm_dr_spoke_manager_detach_finalizer_delay }}"
+  when: acm_dr_spoke_manager_remediation_needed | default(false) | bool
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.2.14) Report inline break-glass remediation result"
+  ansible.builtin.debug:
+    msg:
+      - "{{ _outcome_icon }} INLINE BREAK-GLASS: {{ _outcome_text }}"
+  vars:
+    _mc_gone: "{{ (acm_dr_spoke_manager_r_mc_post_remediation.resources | default([])) | length == 0 }}"
+    _outcome_icon: "{{ '✅' if _mc_gone else '❌' }}"
+    _outcome_text: >-
+      {{ 'ManagedCluster removed successfully after finalizer remediation.'
+         if _mc_gone
+         else 'ManagedCluster STILL present after remediation. Manual intervention required.' }}
+  when: acm_dr_spoke_manager_remediation_needed | default(false) | bool
+
+# =============================================================================
+# PHASE 3: POST-REMOVAL STATUS VALIDATION AND ASSERTION
+# =============================================================================
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.1) Auditing the final state on the Hub and the Spoke"
+  ansible.builtin.debug:
+    msg:
+      - "🔍 [VALIDATION] Auditing the final state on the Hub and the Spoke to confirm detachment..."
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.2) Validate ManagedCluster absence on the Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_r_val_hub_cluster
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.3) Assert - ManagedCluster absent on the Hub"
+  ansible.builtin.assert:
+    that:
+      - (acm_dr_spoke_manager_r_val_hub_cluster.resources | default([])) | length == 0
+    fail_msg: "❌ FAILED! Oh. No! => ManagedCluster '{{ acm_dr_spoke_manager_cluster_name }}' is still present on the Hub!"
+    success_msg: "✅ PASSED! Oh. Yes! => ManagedCluster '{{ acm_dr_spoke_manager_cluster_name }}' absent on the Hub."
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.4) Validate Klusterlet absence on the Spoke"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: Klusterlet
+    name: klusterlet
+  register: acm_dr_spoke_manager_r_val_spoke_klusterlet
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.5) Assert - Klusterlet absent on the Spoke"
+  ansible.builtin.assert:
+    that:
+      - (acm_dr_spoke_manager_r_val_spoke_klusterlet.resources | default([])) | length == 0
+    fail_msg: "❌ FAILED! Oh. No! => The Klusterlet resource still exists on Spoke '{{ acm_dr_spoke_manager_spoke_k8s_context }}'!"
+    success_msg: "✅ PASSED! Oh. Yes! => Klusterlet object successfully purged from the Spoke."
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.6) Validate agent namespace absence on the Spoke"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+  loop:
+    - open-cluster-management-agent
+    - open-cluster-management-agent-addon
+  loop_control:
+    label: "{{ item }}"  # namespace name string
+  register: acm_dr_spoke_manager_r_val_spoke_namespaces
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.7) Assert - Namespaces absent or in Terminating phase"
+  ansible.builtin.assert:
+    that:
+      - item.resources | length == 0 or item.resources[0].status.phase == 'Terminating'
+    fail_msg: "❌ FAILED! Oh. No! => Namespace '{{ item.item }}' is still active on the Spoke!"
+    success_msg: "✅ PASSED! Oh. Yes! => Namespace '{{ item.item }}' purged or in final termination phase."
+  loop: "{{ acm_dr_spoke_manager_r_val_spoke_namespaces.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"  # namespace name from the k8s_info loop
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - item.resources is defined
+
+# =============================================================================
+# PHASE 4: FLEET SECRET CLEANUP (REMOVE SPOKE FROM HUB FLEET)
+# =============================================================================
+# After the ManagedCluster and klusterlet are removed, remove the detached
+# Spoke's SA context from the fleet Secret (spoke-fleet-kubeconfig) on the Hub.
+# Without this cleanup, stale entries accumulate and the failover pipeline
+# wastes time probing unreachable Spokes. Uses the same read-modify-write
+# pattern as the onboard Phase 3 (00_spoke_onboard.yml).
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.4.1) Read fleet Secret from Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_spoke_manager_fleet_secret_namespace }}"
+    name: "{{ acm_dr_spoke_manager_fleet_secret_name }}"
+  register: acm_dr_spoke_manager_detach_fleet_info
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  environment:
+    K8S_AUTH_HOST: ""
+    K8S_AUTH_API_KEY: ""
+    K8S_AUTH_VERIFY_SSL: "False"
+  when: acm_dr_spoke_manager_fleet_cleanup_on_detach | default(true) | bool
+
+# Parse the fleet kubeconfig, filter out the detached Spoke's context by name,
+# and flag whether the entry existed at all (to avoid a no-op write).
+- name: "[STAGE 02 - SPOKE DETACH] | 2.4.2) Remove detached Spoke entry from fleet kubeconfig"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_detach_fleet_cleaned:
+      apiVersion: v1
+      kind: Config
+      preferences: {}
+      clusters: >-
+        {{ _fleet_kc.clusters | default([])
+           | rejectattr('name', 'equalto', _ctx_name) | list }}
+      users: >-
+        {{ _fleet_kc.users | default([])
+           | rejectattr('name', 'equalto', _ctx_name) | list }}
+      contexts: >-
+        {{ _fleet_kc.contexts | default([])
+           | rejectattr('name', 'equalto', _ctx_name) | list }}
+    acm_dr_spoke_manager_detach_fleet_entry_existed: >-
+      {{ (_fleet_kc.contexts | default([])
+          | selectattr('name', 'equalto', _ctx_name) | list | length) > 0 }}
+  vars:
+    _fleet_kc: >-
+      {{
+        (acm_dr_spoke_manager_detach_fleet_info.resources[0].data[acm_dr_spoke_manager_fleet_secret_key]
+         | b64decode | from_yaml)
+        if (acm_dr_spoke_manager_detach_fleet_info.resources | default([]) | length > 0
+            and acm_dr_spoke_manager_detach_fleet_info.resources[0].data[acm_dr_spoke_manager_fleet_secret_key] is defined)
+        else {'clusters': [], 'users': [], 'contexts': []}
+      }}
+    # Resolve the fleet context name to remove: use the provided Spoke context
+    # (e.g. aro-spoke-01-sa), or default to <cluster_name>-sa when not provided.
+    _ctx_name: >-
+      {{ acm_dr_spoke_manager_spoke_k8s_context
+         | default(acm_dr_spoke_manager_cluster_name ~ '-sa', true) }}
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  when:
+    - acm_dr_spoke_manager_fleet_cleanup_on_detach | default(true) | bool
+    - acm_dr_spoke_manager_detach_fleet_info.resources | default([]) | length > 0
+
+# Write back only when the entry was actually found and removed. Avoids a
+# no-op API call that would still show changed=1 due to stringData semantics.
+- name: "[STAGE 02 - SPOKE DETACH] | 2.4.3) Write cleaned fleet Secret back to Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ acm_dr_spoke_manager_fleet_secret_name }}"
+        namespace: "{{ acm_dr_spoke_manager_fleet_secret_namespace }}"
+        labels:
+          cluster.open-cluster-management.io/backup: "cluster"
+          app.kubernetes.io/managed-by: "ansible-dr-orchestrator"
+      type: Opaque
+      stringData: >-
+        {{ { acm_dr_spoke_manager_fleet_secret_key:
+             (acm_dr_spoke_manager_detach_fleet_cleaned
+              | to_nice_yaml(indent=2, width=10000)) } }}
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  environment:
+    K8S_AUTH_HOST: ""
+    K8S_AUTH_API_KEY: ""
+    K8S_AUTH_VERIFY_SSL: "False"
+  when:
+    - acm_dr_spoke_manager_fleet_cleanup_on_detach | default(true) | bool
+    - acm_dr_spoke_manager_detach_fleet_entry_existed | default(false) | bool
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.4.4) Report fleet Secret cleanup result"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        '✅ Fleet Secret cleaned: removed context '''
+        ~ _ctx_name ~ ''' from '
+        ~ acm_dr_spoke_manager_fleet_secret_namespace ~ '/'
+        ~ acm_dr_spoke_manager_fleet_secret_name
+        ~ ' on Hub '''
+        ~ (acm_dr_spoke_manager_hub_context | default(k8s_target_context))
+        ~ ''' ('
+        ~ (acm_dr_spoke_manager_detach_fleet_cleaned.contexts | length) | string
+        ~ ' Spoke(s) remaining).'
+        if (acm_dr_spoke_manager_detach_fleet_entry_existed | default(false) | bool)
+        else '⚪ Fleet Secret: context '''
+             ~ _ctx_name
+             ~ ''' was not in the fleet Secret (already removed or never onboarded). No changes.'
+      }}
+  vars:
+    _ctx_name: >-
+      {{ acm_dr_spoke_manager_spoke_k8s_context
+         | default(acm_dr_spoke_manager_cluster_name ~ '-sa', true) }}
+  when:
+    - acm_dr_spoke_manager_fleet_cleanup_on_detach | default(true) | bool
+    - acm_dr_spoke_manager_detach_fleet_info.resources | default([]) | length > 0
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.4.5) ⚪ Fleet Secret not found on Hub (skipping cleanup)"
+  ansible.builtin.debug:
+    msg: >-
+      ⚪ Fleet Secret '{{ acm_dr_spoke_manager_fleet_secret_namespace }}/{{ acm_dr_spoke_manager_fleet_secret_name }}'
+      does not exist on Hub '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}'.
+      No fleet cleanup needed. This is normal if the fleet was not provisioned via JT 12 onboarding.
+  when:
+    - acm_dr_spoke_manager_fleet_cleanup_on_detach | default(true) | bool
+    - acm_dr_spoke_manager_detach_fleet_info.resources | default([]) | length == 0
+
+# =============================================================================
+# PHASE 5: MIRRORED SA TOKEN SECRET CLEANUP ON HUB
+# =============================================================================
+# Deletes the per-Spoke mirrored Secret written during Phase 3.5 of onboarding.
+# Without this, detached Spokes leave stale fallback Secrets on the Hub that
+# Stage 07 Operation C would pick up and attempt to reconnect.
+#
+# Always runs unconditionally - state: absent with failed_when: false is safe
+# whether or not the Secret was ever written (mirror disabled at onboard time
+# means the Secret is simply absent; the delete is a no-op). Guarding this task
+# on hub_token_mirror_enabled would leave stale Secrets when a Spoke was onboarded
+# with the mirror enabled but detached with it disabled.
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.5.1) Delete mirrored SA token Secret from Hub (unconditional cleanup)"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "{{ acm_dr_spoke_manager_hub_token_mirror_prefix }}{{ acm_dr_spoke_manager_cluster_name }}-sa-token"
+    namespace: "{{ acm_dr_spoke_manager_hub_token_mirror_namespace }}"
+  failed_when: false  # no-op if the Secret never existed (mirror was disabled at onboard time)
+  environment:
+    K8S_AUTH_HOST: ""
+    K8S_AUTH_API_KEY: ""
+    K8S_AUTH_VERIFY_SSL: "False"
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.5.2) ✅ Hub mirrored token Secret cleanup attempted"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ Attempted deletion of mirrored Secret
+      '{{ acm_dr_spoke_manager_hub_token_mirror_namespace }}/{{ acm_dr_spoke_manager_hub_token_mirror_prefix }}{{ acm_dr_spoke_manager_cluster_name }}-sa-token'
+      from Hub '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}'.
+      No-op if the Secret did not exist (mirror was disabled at onboard time).
+
+- name: "[STAGE 02 - SPOKE DETACH] | 2.3.8) Display successful completion banner"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_spoke_manager_banner_sep_char: "-"
+    acm_dr_spoke_manager_banner_title: "✅ SUCCESS AND VALIDATION COMPLETE: Spoke cluster '{{ acm_dr_spoke_manager_cluster_name }}' detached!"
+    acm_dr_spoke_manager_banner_lines:
+      - "🎯  Target Hub:   {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+      - "🎯  Target Spoke: {{ acm_dr_spoke_manager_spoke_k8s_context | default(acm_dr_spoke_manager_spoke_context, true) | default('N/A', true) }}"
+      - "🧹 Deep cleanup (KCS 5950901) and assertion audit completed successfully."
+  run_once: true
+...

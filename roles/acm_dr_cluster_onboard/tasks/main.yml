@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# acm_dr_cluster_onboard - task entry point
+#
+# Imports task files in sequential order. Each file owns one logical stage
+# so individual stages can be targeted with --tags if needed.
+# =============================================================================
+
+- name: "[BOOTSTRAP] | Import preflight and connectivity checks"
+  ansible.builtin.import_tasks: 01_preflight.yml
+  tags: [bootstrap_preflight, bootstrap]
+
+- name: "[BOOTSTRAP] | Import RBAC provisioning tasks"
+  ansible.builtin.import_tasks: 02_rbac.yml
+  tags: [bootstrap_rbac, bootstrap]
+
+- name: "[BOOTSTRAP] | Import token readiness wait"
+  ansible.builtin.import_tasks: 03_wait_token.yml
+  tags: [bootstrap_token, bootstrap]
+
+- name: "[BOOTSTRAP] | Import post-run credential instructions"
+  ansible.builtin.import_tasks: 04_report.yml
+  tags: [bootstrap_report, bootstrap]
+
+- name: "[BOOTSTRAP] | Import AAP credential self-registration"
+  ansible.builtin.import_tasks: 05_aap_credential.yml
+  tags: [bootstrap_aap_register, bootstrap]
+...

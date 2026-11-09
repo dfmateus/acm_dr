@@ -1,0 +1,107 @@
+---
+# examples/aap/import-vars.yml.example
+# =============================================================================
+# ENVIRONMENT-SPECIFIC VARIABLES FOR setup-aap-from-casc.yml
+# =============================================================================
+# Copy this file to examples/aap/import-vars.yml (gitignored), fill in
+# your environment values, and pass it to ansible-playbook:
+#
+#   cp examples/aap/import-vars.yml.example examples/aap/import-vars.yml
+#   # edit import-vars.yml with your values
+#   ansible-playbook examples/setup-aap-from-casc.yml -e @examples/aap/import-vars.yml
+#
+# WHY A VARS FILE:
+#   ansible-core 2.19+ changed how -e "key=value with spaces" is parsed.
+#   Values with spaces must be passed via a vars file (@file.yml) or JSON format.
+#   Never use -e "key=multi word value" for any variable in this playbook.
+#
+# NEVER COMMIT import-vars.yml - it contains your AAP password.
+# It is already covered by .gitignore.
+
+# -----------------------------------------------------------------------------
+# AAP connection (required)
+# -----------------------------------------------------------------------------
+
+# Full URL of the AAP Gateway (not the controller-specific URL)
+controller_hostname: "https://aap.example.com"
+
+# API token of a user with org-admin on the target AAP organization.
+# Generate it in AAP UI: Access Management > Users > <user> > Tokens > Create (scope: write).
+# The token is shown only once at creation time - store it in a safe place.
+# Never commit this file after filling in this value.
+controller_oauthtoken: "REPLACE_WITH_AAP_API_TOKEN"
+
+# Set false for lab/dev clusters with self-signed certificates
+controller_validate_certs: false
+
+# -----------------------------------------------------------------------------
+# AAP object names (required)
+# -----------------------------------------------------------------------------
+
+# Organization name.
+# - "Default" uses the built-in organization; no new org is created.
+# - Any other value creates a new organization with that name.
+# Convention: ACM DR Operations, ACM DR Dev, ACM DR PRD
+aap_organization: "Default"
+
+# Project display name shown in the AAP Templates list.
+# Convention from ansible.md: "<Domain> Collection (<branch>)"
+aap_project: "ACM DR Collection (main)"
+
+# Inventory name. Convention: "<Domain> - <ENV>" where ENV = LAB/DEV/HML/PRD
+aap_inventory: "ACM DR - LAB"
+
+# Execution Environment display name.
+# Convention from ansible.md: "EE - <Domain> <version>"
+aap_execution_environment: "EE - ACM DR 1.0.0"
+
+# -----------------------------------------------------------------------------
+# Image and SCM source (required)
+# -----------------------------------------------------------------------------
+
+# Full image reference to the EE you built and pushed.
+# OCP internal registry (lab):
+#   image-registry.openshift-image-registry.svc:5000/ansible-automation-platform/acm-dr-orchestrator-ee:1.0.0
+# External registry (production):
+#   registry.example.com/acm-dr/acm-dr-orchestrator-ee:1.0.0
+aap_ee_image: "image-registry.openshift-image-registry.svc:5000/ansible-automation-platform/acm-dr-orchestrator-ee:1.0.0"
+
+# SCM URL where AAP syncs the collection playbooks.
+# Local bare repo (lab or air-gapped):
+#   file:///var/lib/awx/projects/acm_dr_orchestrator.git
+# GitHub (production, public repo):
+#   https://github.com/<your-org>/dfmateus.acm_dr.git
+aap_scm_url: "file:///var/lib/awx/projects/acm_dr_orchestrator.git"
+
+# -----------------------------------------------------------------------------
+# Optional
+# -----------------------------------------------------------------------------
+
+# SCM credential name in AAP - only required for private GitHub/GitLab repos.
+# Leave commented out for public repos or the local file:// lab setup.
+# aap_scm_credential: "GitHub dfmateus (PAT)"
+
+# -----------------------------------------------------------------------------
+# Credentials - used when running with --tags credentials (after all bootstraps)
+# -----------------------------------------------------------------------------
+# These values fill the REPLACE_WITH_* placeholders in controller_credentials.yml.
+# All values are sensitive - never commit import-vars.yml after filling them in.
+
+# AAP Bootstrap Automation (API Token) credential (used by Bootstrap JT for self-registration).
+# cred_aap_host is the same as controller_hostname above.
+# cred_aap_oauth_token can reuse the same controller_oauthtoken above.
+# cred_aap_host: "https://aap.example.com"
+# cred_aap_oauth_token: "{{ controller_oauthtoken }}"
+# cred_aap_validate_certs: false
+
+# Hub Primary - ACM DR - Target Cluster credential (SA token from bootstrap).
+# cred_primary_hub_host: "https://api.hub-primary.example.com:6443"
+# cred_primary_hub_token: "REPLACE_WITH_HUB_PRIMARY_SA_TOKEN"
+# cred_primary_hub_ca_data: ""
+# cred_primary_hub_context: "hub-01"
+
+# Hub Secondary - ACM DR - Target Cluster credential (SA token from bootstrap).
+# cred_dr_hub_host: "https://api.hub-secondary.example.com:6443"
+# cred_dr_hub_token: "REPLACE_WITH_HUB_SECONDARY_SA_TOKEN"
+# cred_dr_hub_ca_data: ""
+# cred_dr_hub_context: "hub-02"

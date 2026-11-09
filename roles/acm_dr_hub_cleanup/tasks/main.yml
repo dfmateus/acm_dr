@@ -1,0 +1,77 @@
+---
+# =============================================================================
+# INITIALIZATION TASK & OPERATIONAL METADATA
+# =============================================================================
+
+- name: "MAIN | Display Role initialization status and operational metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "🧹 INITIALIZING: ACM DR LAB CLEANUP FRAMEWORK"
+    acm_dr_hub_cleanup_banner_lines:
+      - "🎯 TARGET CONTEXT (K8S):  {{ k8s_target_context | default('NOT DEFINED') }}"
+      - >-
+        🔎 EXECUTION MODE:     {{ (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+        | ternary('DRY-RUN (simulation)', 'PRODUCTION (actual removal)') }}
+  run_once: true
+  tags:
+    - always
+
+- name: "[CLEANUP LAB DR] | Execute Stage 00 - Preflight & Safety Gates"
+  ansible.builtin.import_tasks: common/00_preflight.yml
+  tags:
+    - preflight
+    - stage00
+
+- name: "[CLEANUP LAB DR] | Execute Stage 01 - Remove Governance and GitOps (ArgoCD Instances)"
+  ansible.builtin.import_tasks: common/01_gitops_cleanup.yml
+  tags:
+    - gitops_cleanup
+    - stage01
+
+- name: "[CLEANUP LAB DR] | Execute Stage 02 - Remove OADP Configuration (DPA/BackupSchedule)"
+  ansible.builtin.import_tasks: common/02_oadp_cleanup.yml
+  tags:
+    - oadp_cleanup
+    - stage02
+
+- name: "[CLEANUP LAB DR] | Execute Stage 03 - Remove Observability (Thanos/MultiClusterObservability)"
+  ansible.builtin.import_tasks: common/03_observability_cleanup.yml
+  tags:
+    - observability_cleanup
+    - stage03
+
+- name: "[CLEANUP LAB DR] | Execute Stage 04 - Remove Red Hat ACM (MultiClusterHub + Operator)"
+  ansible.builtin.import_tasks: common/04_mch_acm_cleanup.yml
+  tags:
+    - mch_cleanup
+    - stage04
+
+# Provider-specific storage cleanup: include_tasks resolves the file
+# path at runtime based on cloud_provider (azure or aws). Each provider
+# has its own subfolder under tasks/.
+- name: "[CLEANUP LAB DR] | Execute Stage 05 - Optional Cloud Storage Purge"
+  ansible.builtin.include_tasks:
+    file: "{{ acm_dr_hub_cleanup_cloud_provider }}/05_storage_cleanup.yml"
+    apply:
+      tags:
+        - cloud_storage_cleanup
+        - stage05
+  tags:
+    - cloud_storage_cleanup
+    - azure_storage_cleanup
+    - aws_storage_cleanup
+    - stage05
+
+- name: "[CLEANUP LAB DR] | Execute Stage 06 - Remove Zero-Trust Automation Identity"
+  ansible.builtin.import_tasks: common/06_automation_rbac_cleanup.yml
+  tags:
+    - automation_cleanup
+    - stage06
+
+- name: "[CLEANUP LAB DR] | Execute Stage 07 - Final Cleanup Report"
+  ansible.builtin.import_tasks: common/07_final_report.yml
+  tags:
+    - always
+    - stage07
+...

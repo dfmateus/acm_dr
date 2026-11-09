@@ -1,0 +1,1203 @@
+---
+# roles/acm_dr_spoke_manager/tasks/01_spoke_prep.yml
+# =============================================================================
+# STAGE 01: AUTOMATED SPOKE ONBOARDING & HARDENING
+# =============================================================================
+
+- name: "[STAGE 01 - SPOKE PREP] | Display Spoke onboarding metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_spoke_manager_banner_title: "🌐 STAGE 01 - Automated Spoke Onboarding & Hardening"
+    acm_dr_spoke_manager_banner_lines:
+      - "🎛️  HUB CONTEXT:    {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+      - "🎯 SPOKE CONTEXT:  {{ acm_dr_spoke_manager_spoke_k8s_context | default('N/A (Token Manual)') }}"
+      - "🏷️  SPOKE NAME:     {{ acm_dr_spoke_manager_cluster_name }}"
+      - "🧹 CLEANUP SA:     {{ acm_dr_spoke_manager_cleanup_bootstrap_sa | default(true) }}"
+  run_once: true
+
+# =============================================================================
+# SCOPE SANITIZATION: RESET TEMPORARY FACTS FROM PREVIOUS ITERATION
+# =============================================================================
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.0) 🧹 SANITIZATION: Reset in-memory iteration variables"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_api_token: ""
+    acm_dr_spoke_manager_api_url: ""
+    acm_dr_spoke_manager_spoke_sa_secret_info: {}
+    acm_dr_spoke_manager_spoke_api_url_raw: {}
+    acm_dr_spoke_manager_spoke_infra_info: {}
+    acm_dr_spoke_manager_cluster_vendor: ""
+    acm_dr_spoke_manager_cluster_cloud: ""
+    acm_dr_spoke_manager_detected_cloud: ""  # internal: auto-detected cloud from Infrastructure CR
+  # Skip sanitization when:
+  # (a) action=onboard: 00_spoke_onboard.yml pre-sets api_token, api_url, vendor, cloud before
+  #     including this file; wiping them would force Phase 1 (bootstrap SA) to run unnecessarily.
+  # (b) credentials_provided=true: callers like Operation C (07_sanitize_passive_hub.yml task 7.2.4)
+  #     explicitly pass api_url and api_token via include_role vars. Clearing them here would discard
+  #     the correct values and fall through to ACM_DR_SPOKE_HOST/TOKEN env vars (which are not set
+  #     on JT-9 because no ACM DR - Spoke Cluster credential is attached at the failover JT level).
+  #     For non-OCP clusters (AKS, EKS, GKE, IKS) that reach Operation C, this causes the
+  #     auto-import-secret to receive an empty or wrong server URL, installing the klusterlet on
+  #     the wrong cluster.
+  when:
+    - acm_dr_spoke_manager_action | default('prep') != 'onboard'
+    - not (acm_dr_spoke_manager_credentials_provided | default(false) | bool)
+
+# =============================================================================
+# PHASE 1: AUTOMATED CREDENTIAL PREPARATION ON THE SPOKE CLUSTER
+# =============================================================================
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.1) Create automation Namespace on the Spoke - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    kind: Namespace
+    name: spoke-automation
+    state: present
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_api_token | default('')) | length == 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.2) Create bootstrap ServiceAccount on the Spoke - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: spoke-admin-sa
+        namespace: spoke-automation
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_api_token | default('')) | length == 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.3) Assign cluster-admin ClusterRoleBinding on the Spoke - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: spoke-admin-sa-binding
+      subjects:
+        - kind: ServiceAccount
+          name: spoke-admin-sa
+          namespace: spoke-automation
+      roleRef:
+        kind: ClusterRole
+        name: cluster-admin
+        apiGroup: rbac.authorization.k8s.io
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_api_token | default('')) | length == 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.4) Create permanent Token Secret on the Spoke - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: spoke-admin-sa-token
+        namespace: spoke-automation
+        annotations:
+          kubernetes.io/service-account.name: spoke-admin-sa
+      type: kubernetes.io/service-account-token
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_api_token | default('')) | length == 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.5) Extract ServiceAccount Token into memory - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: v1
+    kind: Secret
+    name: spoke-admin-sa-token
+    namespace: spoke-automation
+  register: acm_dr_spoke_manager_spoke_sa_secret_info
+  until:
+    - (acm_dr_spoke_manager_spoke_sa_secret_info.resources | default([])) | length > 0
+    - acm_dr_spoke_manager_spoke_sa_secret_info.resources[0].data.token is defined
+  retries: 10
+  delay: 3
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_api_token | default('')) | length == 0
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+# Reads the API server URL from the kubeconfig for the Spoke context.
+# Uses environment KUBECONFIG so kubectl resolves the runtime kubeconfig
+# assembled by acm_dr_kubeconfig_resolver (module_defaults only covers
+# kubernetes.core modules, not raw command calls).
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.6) Extract Spoke API Server URL from local Kubeconfig"
+  ansible.builtin.command: >-
+    kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' --context={{ acm_dr_spoke_manager_spoke_k8s_context }}
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  register: acm_dr_spoke_manager_spoke_api_url_raw
+  changed_when: false
+  failed_when: false  # allow 1.1.7b env var fallback when context is missing (rc=1)
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.7) Register extracted facts in runtime variables"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_api_token: "{{ acm_dr_spoke_manager_spoke_sa_secret_info.resources[0].data.token | b64decode }}"
+    acm_dr_spoke_manager_api_url: "{{ acm_dr_spoke_manager_spoke_api_url_raw.stdout | trim }}"
+  when:
+    - acm_dr_spoke_manager_spoke_sa_secret_info.resources is defined
+    - acm_dr_spoke_manager_spoke_api_url_raw.stdout is defined
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+# Safety net: if 1.1.6 was skipped or returned empty (e.g., the resolved context is not
+# present in the runtime kubeconfig), read ACM_DR_SPOKE_HOST and ACM_DR_SPOKE_TOKEN
+# directly from the env vars injected by the ACM DR - Spoke Cluster credential type.
+# This should not happen when the survey question is absent (the credential's env vars
+# feed the role default correctly), but guards against future survey regressions or
+# misconfigured credential types where the context name and kubeconfig disagree.
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.7b) Fall back to ACM_DR_SPOKE_HOST/TOKEN env vars when kubeconfig lookup returned empty"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_api_url: "{{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_HOST', default='') }}"
+    acm_dr_spoke_manager_api_token: "{{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_TOKEN', default='') }}"
+  when:
+    - acm_dr_spoke_manager_api_url | default('', true) | length == 0
+    - lookup('ansible.builtin.env', 'ACM_DR_SPOKE_HOST', default='') | length > 0
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+# Hard gate before auto-import-secret creation. All three resolution paths have now run:
+# (1) kubeconfig context extract (1.1.6/1.1.7), (2) bootstrap SA token (1.1.5),
+# (3) ACM_DR_SPOKE_HOST env var (1.1.7b), (4) caller pre-set via include_role vars
+# (guarded by credentials_provided in 1.1.0). If api_url is still empty at this point,
+# creating the auto-import-secret would inject an empty server field and the Hub would
+# silently fail to install the klusterlet. Fail loudly here instead.
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.7c) 🛡️ Guard: assert api_url resolved before creating auto-import-secret"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_spoke_manager_api_url | default('', true) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => acm_dr_spoke_manager_api_url is empty for Spoke
+      '{{ acm_dr_spoke_manager_cluster_name }}'. Cannot create auto-import-secret without a server URL.
+      Resolution paths checked: (1) fleet kubeconfig context
+      '{{ acm_dr_spoke_manager_spoke_k8s_context | default("(not set)") }}',
+      (2) bootstrap SA token extraction,
+      (3) ACM_DR_SPOKE_HOST env var (empty - no ACM DR - Spoke Cluster credential attached).
+      Fix: ensure the ACM DR - Spoke Cluster credential for this spoke has the correct API URL
+      in ACM_DR_SPOKE_HOST, or add the spoke context to the fleet kubeconfig with the correct server URL.
+      For Operation C callers: verify the mirrored SA token Secret
+      '{{ acm_dr_spoke_manager_hub_token_mirror_prefix }}{{ acm_dr_spoke_manager_cluster_name }}-sa-token'
+      on the Hub has a non-empty 'host' field.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => api_url resolved: {{ acm_dr_spoke_manager_api_url }}
+
+# =============================================================================
+# PROPHYLAXIS & SELF-HEALING: FINALIZER AND NAMESPACE UNBLOCKING
+# =============================================================================
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.8) 🧹 PROPHYLAXIS: Remove Add-on and Observability finalizers on the Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: observability.open-cluster-management.io/v1beta1
+    kind: ObservabilityAddon
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+    name: observability-addon
+    state: patched
+    definition:
+      metadata:
+        finalizers: []
+  failed_when: false
+
+# The original task used k8s_json_patch without a 'name' parameter, which
+# silently failed (name is required). Replaced with a list+loop approach
+# that also deletes the ManifestWorks after stripping finalizers. Stale
+# ManifestWorks from a previous import confuse the import controller on
+# re-import: it sees existing ManifestWorks and skips the direct-apply
+# bootstrap path, then fails because no work-agent is running on the Spoke.
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.9) 🧹 PROPHYLAXIS: Discover orphaned ManifestWorks on the Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_stale_manifestworks
+  failed_when: false
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.9a) 🧹 PROPHYLAXIS: Remove finalizers from orphaned ManifestWorks"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+    name: "{{ item.metadata.name }}"
+    patch:
+      - op: replace
+        path: /metadata/finalizers
+        value: []
+  loop: "{{ acm_dr_spoke_manager_stale_manifestworks.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  when: (acm_dr_spoke_manager_stale_manifestworks.resources | default([])) | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.1.9b) 🧹 PROPHYLAXIS: Delete orphaned ManifestWorks to unblock re-import"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: work.open-cluster-management.io/v1
+    kind: ManifestWork
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+    name: "{{ item.metadata.name }}"
+    state: absent
+  loop: "{{ acm_dr_spoke_manager_stale_manifestworks.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  when: (acm_dr_spoke_manager_stale_manifestworks.resources | default([])) | length > 0
+
+# Strips finalizers from a stuck Terminating namespace on the Hub via raw API.
+# Needs KUBECONFIG set for the same reason as task 1.1.6 above.
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.0a) 🛡️ SELF-HEALING: Unblock Namespace if stuck in Terminating"
+  ansible.builtin.shell: |
+    set -o pipefail
+    oc get ns {{ acm_dr_spoke_manager_cluster_name }} --context {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }} -o json 2>/dev/null \
+    | jq '.spec.finalizers = []' \
+    | oc replace --raw /api/v1/namespaces/{{ acm_dr_spoke_manager_cluster_name }}/finalize \
+      --context {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }} -f - 2>/dev/null || true
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  register: acm_dr_spoke_manager_ns_finalize_cmd
+  # rc is always 0 because the pipeline ends with || true.
+  # stdout is non-empty only when oc get ns found the namespace and oc replace ran.
+  changed_when: acm_dr_spoke_manager_ns_finalize_cmd.stdout | length > 0
+  failed_when: false
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.0b) ⏳ WAIT - Polling for complete purge of Terminating Namespace on the Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_hub_ns_check
+  # Guard with default([]) because k8s_info returns a dict without .resources
+  # when the API call itself fails (namespace already gone, transient error).
+  until: >
+    (acm_dr_spoke_manager_hub_ns_check.resources | default([])) | length == 0 or
+    ((acm_dr_spoke_manager_hub_ns_check.resources | default([]))[0].status.phase | default('')) != 'Terminating'
+  retries: 30
+  delay: 5
+  failed_when: false
+
+# =============================================================================
+# PHASE 2: AUTO-IMPORT AND SPOKE REGISTRATION ON THE HUB CLUSTER
+# =============================================================================
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.1) Create Spoke Namespace on the Hub - {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    kind: Namespace
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+    state: present
+
+# Deletes the existing auto-import-secret before creating a fresh one. The
+# RHACM import controller tracks retry state against this Secret; on the 5th
+# failed attempt it writes autoImportRetry=5 and stops permanently. Simply
+# patching the secret (state: present) does not reset the controller's
+# internal retry counter. Deleting forces a clean import cycle.
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.1b) 🧹 PROPHYLAXIS: Delete stale auto-import-secret to reset import retry counter"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+    name: auto-import-secret
+  failed_when: false
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.2) Create Auto-Import Secret on the Hub - {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: auto-import-secret
+        namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+      type: Opaque
+      stringData:
+        autoImportRetry: "5"
+        kubeconfig: |
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              insecure-skip-tls-verify: true
+              server: {{ acm_dr_spoke_manager_api_url }}
+            name: {{ acm_dr_spoke_manager_cluster_name }}
+          contexts:
+          - context:
+              cluster: {{ acm_dr_spoke_manager_cluster_name }}
+              user: {{ acm_dr_spoke_manager_cluster_name }}-admin
+            name: {{ acm_dr_spoke_manager_cluster_name }}
+          current-context: {{ acm_dr_spoke_manager_cluster_name }}
+          users:
+          - name: {{ acm_dr_spoke_manager_cluster_name }}-admin
+            user:
+              token: {{ acm_dr_spoke_manager_api_token }}
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.2b) Detect actual Spoke vendor (OpenShift vs Kubernetes) - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: config.openshift.io/v1
+    kind: Infrastructure
+    name: cluster
+  register: acm_dr_spoke_manager_spoke_infra_info
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+# Note (Real-World Finding): the 'vendor' label was hardcoded to 'OpenShift' for all Spokes,
+# including Azure Kubernetes Service (AKS) / native Kubernetes clusters. This caused the 'ocp-azure-placement' Placement
+# (used by the example repository's governance Policies, filtered by vendor=OpenShift) to
+# incorrectly select AKS / native K8s Spokes, applying OpenShift-exclusive Policies (namespace
+# 'openshift-config', StorageClass 'managed-csi' with conflicting immutable fields, etc.) that
+# never converge there. The detection below queries the Infrastructure CR (only exists on
+# OpenShift/ARO) in the Spoke's own context to populate the label with the actual vendor.
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.2c) Register the actual detected Spoke vendor"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_cluster_vendor: >-
+      {{
+        'OpenShift'
+        if (
+          not (acm_dr_spoke_manager_spoke_k8s_context is defined and acm_dr_spoke_manager_spoke_k8s_context | length > 0)
+          or (
+            acm_dr_spoke_manager_spoke_infra_info.resources is defined and
+            acm_dr_spoke_manager_spoke_infra_info.resources | length > 0
+          )
+        )
+        else 'Kubernetes'
+      }}
+  # Skip when vendor is already set (e.g., by 00_spoke_onboard.yml Phase 2).
+  # In the normal prep flow, the sanitization at 1.1.0 resets vendor to "",
+  # so this condition is true and the task runs as before.
+  when:
+    - (acm_dr_spoke_manager_cluster_vendor | default('')) | length == 0
+
+# Cloud auto-detection: on OCP Spokes the Infrastructure CR exposes status.platform
+# (AWS, Azure, GCP, IBMCloud, etc.) which is translated to the RHACM-canonical cloud
+# label via acm_dr_spoke_manager_platform_to_cloud_map. The mapping is needed because
+# the Infrastructure CR uses platform-native names (e.g., AWS) while RHACM expects
+# its own names (e.g., Amazon) for the ManagedCluster cloud label and console icon.
+# On non-OCP Spokes the CR is absent, so we fall back to the user-supplied variable
+# or 'Other'. Stores the result in acm_dr_spoke_manager_detected_cloud (not
+# acm_dr_spoke_manager_cluster_cloud) because AAP surveys inject the user-facing
+# variable as an extra var that set_fact cannot override.
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.2d) Detect actual Spoke cloud provider"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_detected_cloud: >-
+      {{
+        acm_dr_spoke_manager_platform_to_cloud_map[
+          acm_dr_spoke_manager_spoke_infra_info.resources[0].status.platform | default('')
+        ] | default(
+          acm_dr_spoke_manager_spoke_infra_info.resources[0].status.platform | default('Other')
+        )
+        if (
+          acm_dr_spoke_manager_spoke_infra_info.resources is defined and
+          acm_dr_spoke_manager_spoke_infra_info.resources | length > 0
+        )
+        else 'Other'
+      }}
+  when:
+    - (acm_dr_spoke_manager_cluster_cloud | default('')) | length == 0
+    - (acm_dr_spoke_manager_detected_cloud | default('')) | length == 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.3) Declare ManagedCluster for the Spoke"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: cluster.open-cluster-management.io/v1
+      kind: ManagedCluster
+      metadata:
+        name: "{{ acm_dr_spoke_manager_cluster_name }}"
+        labels:
+          # User override (extra var or survey) takes priority; auto-detected
+          # value is the fallback; 'Other' is the last resort.
+          cloud: "{{ acm_dr_spoke_manager_cluster_cloud if (acm_dr_spoke_manager_cluster_cloud | default('', true) | length > 0) else (acm_dr_spoke_manager_detected_cloud | default('Other')) }}"
+          vendor: "{{ acm_dr_spoke_manager_cluster_vendor | default('OpenShift') }}"
+          environment: "{{ acm_dr_spoke_manager_cluster_environment | default('lab') }}"
+          # Required by Placement rules in the ACM policy repo and by the
+          # failover fleet-discovery stage. Every spoke registered through
+          # this role is a DR spoke by definition.
+          acm-dr-spoke: "true"
+      spec:
+        hubAcceptsClient: true
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.4) Configure KlusterletAddonConfig for the Spoke - {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: agent.open-cluster-management.io/v1
+      kind: KlusterletAddonConfig
+      metadata:
+        name: "{{ acm_dr_spoke_manager_cluster_name }}"
+        namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+      spec:
+        clusterName: "{{ acm_dr_spoke_manager_cluster_name }}"
+        clusterNamespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+        applicationManager:
+          enabled: true
+        certPolicyController:
+          enabled: true
+        iamPolicyController:
+          enabled: true
+        policyController:
+          enabled: true
+        searchCollector:
+          enabled: true
+
+# =============================================================================
+# BOOTSTRAP RBAC FIX (klusterlet v2.9.5 reflector 403 workaround)
+# =============================================================================
+# Klusterlet v2.9.5 (deployed by RHACM 2.14) initializes a reflector that
+# calls list on managedclusters during bootstrap registration. The import
+# controller's managed ClusterRole (system:open-cluster-management:managedcluster:
+# bootstrap:<spoke>) only grants get and create, which causes a 403 Forbidden.
+# client-go treats 403 as non-recoverable and the reflector stops permanently
+# without backoff - the klusterlet never connects unless the pods are restarted.
+#
+# The import controller reverts direct patches to its managed ClusterRole within
+# ~5 seconds. The fix uses a SEPARATE ClusterRole + ClusterRoleBinding under the
+# 'acm-dr:' prefix (outside the controller's naming pattern) so it survives
+# indefinitely. This is idempotent - re-running spoke_prep is safe.
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.4b) 🛡️ Create supplemental ClusterRole on Hub for bootstrap list fix"
+  # Creates once; state: present makes it idempotent across re-runs.
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: acm-dr:managedcluster:bootstrap-list-fix
+        labels:
+          app.kubernetes.io/managed-by: acm-dr-bootstrap-fix
+      rules:
+        # list + watch on managedclusters so the klusterlet v2.9.5 reflector does not
+        # receive a 403. The import controller's bootstrap ClusterRole only grants
+        # get + create, which is the root cause of the permanent reflector stop.
+        - apiGroups: ["cluster.open-cluster-management.io"]
+          resources: ["managedclusters"]
+          verbs: ["list", "watch"]
+
+# =============================================================================
+# KLUSTERLET BOOTSTRAP FALLBACK (stale ImportSucceeded condition workaround)
+# =============================================================================
+# After an OADP Restore, the ManagedCluster on the new Hub carries a stale
+# ManagedClusterImportSucceeded: True condition from the backup. The import
+# controller sees this, recreates the klusterlet ManifestWorks, but skips
+# the direct-apply bootstrap that deploys the klusterlet operator to the
+# Spoke. The ManifestWorks remain with status: null because no work-agent
+# is running on the Spoke to apply them, and the Spoke stays
+# AVAILABLE=Unknown indefinitely.
+#
+# This fallback waits briefly after auto-import-secret creation, checks
+# whether the klusterlet namespace exists on the Spoke, and if not,
+# extracts the klusterlet manifests from the Hub ManifestWorks and applies
+# them directly. On fresh imports (no stale condition) or already-connected
+# Spokes, the namespace exists and the block is skipped.
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.5) ⏳ Wait for import controller to process auto-import-secret"
+  ansible.builtin.pause:
+    seconds: "{{ acm_dr_spoke_manager_import_bootstrap_wait }}"
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+# Grant the bootstrap SA the supplemental list + watch permission. By this point
+# (after the import_bootstrap_wait grace period) the import controller has created
+# the <spoke>-bootstrap-sa in the Spoke's namespace on the Hub. The CRB references
+# a non-existent SA subject safely - Kubernetes does not validate subject existence,
+# so the CRB is created even if SA provisioning is still in flight, and takes effect
+# the moment the SA appears.
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.5b) 🛡️ Create supplemental CRB for Spoke bootstrap SA (list fix)"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "acm-dr:bootstrap-list-fix:{{ acm_dr_spoke_manager_cluster_name }}"
+        labels:
+          app.kubernetes.io/managed-by: acm-dr-bootstrap-fix
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: acm-dr:managedcluster:bootstrap-list-fix
+      subjects:
+        - kind: ServiceAccount
+          # Bootstrap SA created by the import controller in the Spoke's namespace.
+          # Pattern: <spoke-name>-bootstrap-sa in namespace <spoke-name> on the Hub.
+          name: "{{ acm_dr_spoke_manager_cluster_name }}-bootstrap-sa"
+          namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.6) Check if klusterlet namespace exists on Spoke - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    api_version: v1
+    kind: Namespace
+    name: open-cluster-management-agent
+  register: acm_dr_spoke_manager_klusterlet_ns_check
+  failed_when: false
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+# =============================================================================
+# HUB FORCE-SWITCH (klusterlet connected to a different hub)
+# =============================================================================
+# Applies to failback and any re-import where the spoke's klusterlet is already
+# running and connected to the previous active hub.
+#
+# Root cause: "soft fencing" pauses the old hub's BackupSchedule but leaves its
+# API server running. The klusterlet keeps renewing its lease on the old hub
+# indefinitely and ignores the new bootstrap-hub-kubeconfig written by the
+# import controller. Without this block, spoke prep times out after 900s with
+# ManagedClusterLeaseUpdateStopped on the target hub.
+#
+# Fix: read bootstrap-hub-kubeconfig from the target hub's klusterlet ManifestWork
+# (created by the import controller, but never applied because the work-agent is
+# reading from the old hub), apply it directly to the spoke, then delete
+# hub-kubeconfig-secret to force the klusterlet to fall back to bootstrap and
+# re-register with the target hub.
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.6b) Check current ManagedCluster availability on target hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_pre_avail_check
+  failed_when: false
+  # Only needed when the klusterlet namespace already exists on the spoke.
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_klusterlet_ns_check.resources | default([])) | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.6c) Compute whether force-switch is needed"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_already_available: >-
+      {{
+        (acm_dr_spoke_manager_pre_avail_check.resources | default([]) | length > 0) and
+        ((acm_dr_spoke_manager_pre_avail_check.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'ManagedClusterConditionAvailable')
+          | selectattr('status', 'equalto', 'True')
+          | list | length) > 0)
+      }}
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_klusterlet_ns_check.resources | default([])) | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | Hub force-switch (klusterlet connected to a different hub)"
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_klusterlet_ns_check.resources | default([])) | length > 0
+    - not (acm_dr_spoke_manager_already_available | default(false) | bool)
+  block:
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.6d) ⚠️ Active klusterlet on different hub - forcing re-registration"
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️ Spoke '{{ acm_dr_spoke_manager_cluster_name }}' has a running klusterlet but is
+          not AVAILABLE on '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}'.
+          The klusterlet is connected to a previous hub. Applying new bootstrap kubeconfig
+          from the target hub's ManifestWork and forcing re-registration.
+
+    # The import controller on the target hub already created the klusterlet
+    # ManifestWork with the correct bootstrap-hub-kubeconfig, but the spoke's
+    # work-agent never applied it (it reads ManifestWorks from the old hub).
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.6e) Read klusterlet ManifestWork from target hub"
+      kubernetes.core.k8s_info:
+        context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+        api_version: work.open-cluster-management.io/v1
+        kind: ManifestWork
+        name: "{{ acm_dr_spoke_manager_cluster_name }}-klusterlet"
+        namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+      register: acm_dr_spoke_manager_kl_mw_switch
+      failed_when: false
+
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.6f) Extract bootstrap-hub-kubeconfig manifest from ManifestWork"
+      ansible.builtin.set_fact:
+        acm_dr_spoke_manager_bootstrap_switch_secret: >-
+          {{
+            (acm_dr_spoke_manager_kl_mw_switch.resources[0].spec.workload.manifests | default([]))
+            | selectattr('kind', 'equalto', 'Secret')
+            | selectattr('metadata.name', 'equalto', 'bootstrap-hub-kubeconfig')
+            | list | first | default({})
+          }}
+      when: (acm_dr_spoke_manager_kl_mw_switch.resources | default([])) | length > 0
+
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.6g) ⚠️ ManifestWork not found - import controller not ready yet"
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️ ManifestWork '{{ acm_dr_spoke_manager_cluster_name }}-klusterlet' not found on
+          hub '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}'.
+          The import controller may not have created it yet. The polling loop will continue
+          to wait. If the spoke does not reach AVAILABLE, trigger a manual Project sync in
+          AAP and re-run the failover job.
+      when: (acm_dr_spoke_manager_kl_mw_switch.resources | default([])) | length == 0
+
+    # Apply the new bootstrap kubeconfig directly to the spoke. This bypasses the
+    # work-agent (which reads from the old hub) and points the klusterlet at the
+    # target hub before forcing re-bootstrap below.
+    # no_log: the secret data contains a Hub API bearer token.
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.6h) Apply new bootstrap-hub-kubeconfig to spoke"
+      kubernetes.core.k8s:
+        context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+        state: present
+        definition: "{{ acm_dr_spoke_manager_bootstrap_switch_secret }}"
+      no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+      when:
+        - acm_dr_spoke_manager_bootstrap_switch_secret is defined
+        - (acm_dr_spoke_manager_bootstrap_switch_secret | default({})) | length > 0
+
+    # Deleting hub-kubeconfig-secret forces the klusterlet registration agent to
+    # fall back to bootstrap-hub-kubeconfig (updated above) and re-register with
+    # the target hub. Without this deletion, the klusterlet continues renewing
+    # its lease on the old hub and never detects the new bootstrap.
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.6i) Delete hub-kubeconfig-secret to force klusterlet re-bootstrap"
+      kubernetes.core.k8s:
+        context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+        state: absent
+        api_version: v1
+        kind: Secret
+        namespace: open-cluster-management-agent
+        name: hub-kubeconfig-secret
+      failed_when: false
+      when:
+        - acm_dr_spoke_manager_bootstrap_switch_secret is defined
+        - (acm_dr_spoke_manager_bootstrap_switch_secret | default({})) | length > 0
+
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.6j) ⏳ Wait for klusterlet registration agent to restart"
+      ansible.builtin.pause:
+        seconds: "{{ acm_dr_spoke_manager_bootstrap_switch_restart_wait }}"
+      when:
+        - acm_dr_spoke_manager_bootstrap_switch_secret is defined
+        - (acm_dr_spoke_manager_bootstrap_switch_secret | default({})) | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.2.7) ⚠️ Klusterlet not deployed - import controller stale condition detected"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ The open-cluster-management-agent namespace does not exist on Spoke
+      '{{ acm_dr_spoke_manager_cluster_name }}' after {{ acm_dr_spoke_manager_import_bootstrap_wait }}s.
+      Stale ManagedClusterImportSucceeded condition detected (from OADP Restore).
+      Falling back to direct klusterlet bootstrap from ManifestWork content.
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_klusterlet_ns_check.resources | default([])) | length == 0
+
+# Block groups the ManifestWork extraction and direct-apply logic so the
+# whole fallback section is cleanly scoped and skipped on the happy path.
+- name: "[STAGE 01 - SPOKE PREP] | Klusterlet bootstrap fallback (stale ImportSucceeded workaround)"
+  when:
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+    - (acm_dr_spoke_manager_klusterlet_ns_check.resources | default([])) | length == 0
+  block:
+    # Read the klusterlet-crds ManifestWork from the Hub. The import
+    # controller creates this as <spoke>-klusterlet-crds and it contains
+    # the Klusterlet CRD that must be established before the operator.
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.8) 🔎 Read klusterlet-crds ManifestWork from Hub"
+      kubernetes.core.k8s_info:
+        context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+        api_version: work.open-cluster-management.io/v1
+        kind: ManifestWork
+        name: "{{ acm_dr_spoke_manager_cluster_name }}-klusterlet-crds"
+        namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+      register: acm_dr_spoke_manager_kl_crds_mw
+      failed_when: false
+
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.8a) Apply klusterlet CRDs directly to Spoke"
+      kubernetes.core.k8s:
+        context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+        state: present
+        definition: "{{ item }}"
+      loop: >-
+        {{ (acm_dr_spoke_manager_kl_crds_mw.resources[0].spec.workload.manifests | default([]))
+           if (acm_dr_spoke_manager_kl_crds_mw.resources | default([]) | length > 0)
+           else [] }}
+      loop_control:
+        label: "{{ item.kind | default('unknown') }}/{{ (item.metadata | default({})).name | default('unknown') }}"
+
+    # The Klusterlet CRD must be established before the Klusterlet CR
+    # and operator Deployment can be applied. This pause ensures the API
+    # server recognizes the new CRD.
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.8b) ⏳ Wait for klusterlet CRDs to establish"
+      ansible.builtin.pause:
+        seconds: "{{ acm_dr_spoke_manager_crd_establish_wait }}"
+      when: (acm_dr_spoke_manager_kl_crds_mw.resources | default([]) | length > 0)
+
+    # Read the klusterlet ManifestWork which contains the namespace, RBAC,
+    # bootstrap-hub-kubeconfig Secret, klusterlet Deployment, and Klusterlet CR.
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.9) 🔎 Read klusterlet ManifestWork from Hub"
+      kubernetes.core.k8s_info:
+        context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+        api_version: work.open-cluster-management.io/v1
+        kind: ManifestWork
+        name: "{{ acm_dr_spoke_manager_cluster_name }}-klusterlet"
+        namespace: "{{ acm_dr_spoke_manager_cluster_name }}"
+      register: acm_dr_spoke_manager_kl_mw
+      failed_when: false
+
+    # Apply each klusterlet manifest directly to the Spoke. This replicates
+    # what the import controller's bootstrap path does when ImportSucceeded
+    # is not stale. no_log is set because one of the manifests is the
+    # bootstrap-hub-kubeconfig Secret containing a Hub API token.
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.9a) Apply klusterlet manifests directly to Spoke (bootstrap fallback)"
+      kubernetes.core.k8s:
+        context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+        state: present
+        definition: "{{ item }}"
+      loop: >-
+        {{ (acm_dr_spoke_manager_kl_mw.resources[0].spec.workload.manifests | default([]))
+           if (acm_dr_spoke_manager_kl_mw.resources | default([]) | length > 0)
+           else [] }}
+      loop_control:
+        label: "{{ item.kind | default('unknown') }}/{{ (item.metadata | default({})).name | default('unknown') }}"
+      no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+
+    - name: "[STAGE 01 - SPOKE PREP] | 1.2.9b) ✅ Klusterlet bootstrap fallback applied successfully"
+      ansible.builtin.debug:
+        msg: >-
+          ✅ Direct klusterlet bootstrap completed for Spoke '{{ acm_dr_spoke_manager_cluster_name }}'.
+          Applied CRDs and klusterlet resources directly to the Spoke because the import controller
+          had a stale ImportSucceeded condition from OADP Restore. The klusterlet should connect
+          to Hub '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}' within 30-60s.
+
+# =============================================================================
+# SPOKE IMPORT WAIT AND RECONCILIATION PHASE (with inline diagnostic)
+# =============================================================================
+# Uses ignore_errors on the polling task so the play continues into a
+# diagnostic section when the Spoke fails to reach AVAILABLE. This approach
+# works regardless of how the file is loaded (import_tasks or include_tasks
+# with apply:), because it does not depend on block/rescue.
+
+# -------------------------------------------------------------------
+# 1.3) Reconciliation polling
+# -------------------------------------------------------------------
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.3.1) ⏳ NOTICE: Spoke import and reconciliation in progress (3-7 MINUTES)"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/01_spoke_prep_waiting.j2').split('\n') }}"
+  run_once: true
+
+# The until/retries loop polls the Hub every acm_dr_spoke_manager_spoke_reconcile_delay
+# seconds for up to acm_dr_spoke_manager_spoke_reconcile_retries × delay seconds.
+# ignore_errors lets execution continue to the diagnostic section when retries
+# are exhausted, instead of crashing the play with a raw JSON dump.
+- name: "[STAGE 01 - SPOKE PREP] | 1.3.2) ⏳ WAIT - Polling Spoke reconciliation on the Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_spoke_import_status
+  until: >-
+    (acm_dr_spoke_manager_spoke_import_status.resources | default([])) | length > 0 and
+    ((acm_dr_spoke_manager_spoke_import_status.resources | default([]))[0].status.conditions | default([]) |
+      selectattr('type', 'equalto', 'ManagedClusterConditionAvailable') |
+      selectattr('status', 'equalto', 'True') | list | length > 0)
+  retries: "{{ acm_dr_spoke_manager_spoke_reconcile_retries }}"  # count - see defaults/main.yml
+  delay: "{{ acm_dr_spoke_manager_spoke_reconcile_delay }}"  # seconds between retries
+  ignore_errors: true  # continue to diagnostic section on timeout
+
+# =====================================================================
+# DIAGNOSTIC SECTION (runs only when polling timed out)
+# =====================================================================
+# Every task below has when: ... is failed, so the section is a no-op on
+# the happy path. On timeout, it gathers evidence from the Hub and Spoke,
+# builds a structured report with troubleshooting hints, then fails with
+# an actionable message so the AAP job shows FAILED with context.
+
+# D.1) Re-read ManagedCluster conditions from the Hub. The object should
+#      exist (created at 1.2.3), so conditions reveal whether the
+#      klusterlet connected, timed out, or crashed.
+- name: "[SPOKE PREP DIAGNOSTIC] | D.1) Read ManagedCluster conditions from Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_diag_mc_info
+  failed_when: false  # must not crash the diagnostic itself
+  when: acm_dr_spoke_manager_spoke_import_status is failed
+
+# D.2) Build a one-line-per-condition summary from the ManagedCluster
+#      status so the operator can scan conditions at a glance.
+- name: "[SPOKE PREP DIAGNOSTIC] | D.2) Extract condition summary"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_diag_conditions: >-
+      {% set conds = acm_dr_spoke_manager_diag_mc_info.resources[0].status.conditions | default([]) %}
+      {% for c in conds %}
+      {{ c.type }}: {{ c.status }} - {{ c.message | default('(no message)') }}
+      {% endfor %}
+  when:
+    - acm_dr_spoke_manager_spoke_import_status is failed
+    - acm_dr_spoke_manager_diag_mc_info.resources | default([]) | length > 0
+
+# D.3) Query klusterlet pods on the Spoke to detect ImagePullBackOff,
+#      CrashLoopBackOff, missing pods, or scheduling failures.
+#      Tries the onboard-flow variables first (host/api_key set at
+#      Phase 0 of 00_spoke_onboard.yml), then falls back to
+#      defaults/main.yml vars, then kubeconfig context for prep flows.
+- name: "[SPOKE PREP DIAGNOSTIC] | D.3) Check klusterlet pods on the Spoke"
+  kubernetes.core.k8s_info:
+    host: >-
+      {{ acm_dr_spoke_manager_onboard_spoke_host | default('')
+         if (acm_dr_spoke_manager_onboard_spoke_host | default('') | length > 0)
+         else (acm_dr_spoke_manager_api_url | default('')
+               if (acm_dr_spoke_manager_api_url | default('') | length > 0)
+               else omit) }}
+    api_key: >-
+      {{ acm_dr_spoke_manager_onboard_sa_token | default('')
+         if (acm_dr_spoke_manager_onboard_spoke_host | default('') | length > 0)
+         else (acm_dr_spoke_manager_api_token | default('')
+               if (acm_dr_spoke_manager_api_url | default('') | length > 0)
+               else omit) }}
+    validate_certs: false
+    context: >-
+      {{ acm_dr_spoke_manager_spoke_k8s_context
+         if (acm_dr_spoke_manager_onboard_spoke_host | default('') | length == 0
+             and acm_dr_spoke_manager_api_url | default('') | length == 0
+             and acm_dr_spoke_manager_spoke_k8s_context | default('') | length > 0)
+         else omit }}
+    api_version: v1
+    kind: Pod
+    namespace: open-cluster-management-agent
+  register: acm_dr_spoke_manager_diag_klusterlet_pods
+  failed_when: false  # Spoke may be unreachable
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  when: acm_dr_spoke_manager_spoke_import_status is failed
+
+# D.4) Extract a human-readable pod status summary with container wait
+#      reasons (the symptom that tells the operator what broke).
+- name: "[SPOKE PREP DIAGNOSTIC] | D.4) Build klusterlet pod diagnosis"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_diag_pod_summary: >-
+      {% set pods = acm_dr_spoke_manager_diag_klusterlet_pods.resources | default([]) %}
+      {% if pods | length == 0 %}
+      No pods found in open-cluster-management-agent namespace.
+      The klusterlet may not have been deployed to the Spoke yet.
+      {% else %}
+      {% for pod in pods %}
+      Pod: {{ pod.metadata.name }} | Phase: {{ pod.status.phase | default('Unknown') }}
+      {%   for cs in pod.status.containerStatuses | default([]) %}
+      {%     if cs.state.waiting is defined %}
+        -> Container '{{ cs.name }}': {{ cs.state.waiting.reason | default('Waiting') }}{% if cs.state.waiting.message is defined %} ({{ cs.state.waiting.message[:200] }}){% endif %}
+
+      {%     endif %}
+      {%   endfor %}
+      {% endfor %}
+      {% endif %}
+  when: acm_dr_spoke_manager_spoke_import_status is failed
+
+# D.5) Match observed symptoms against known failure patterns.
+#      Each hint gives the operator a concrete action to fix the issue.
+- name: "[SPOKE PREP DIAGNOSTIC] | D.5) Generate troubleshooting hints"
+  ansible.builtin.set_fact:
+    acm_dr_spoke_manager_diag_hints: >-
+      {% set pod_text = acm_dr_spoke_manager_diag_pod_summary | default('') %}
+      {% set cond_text = acm_dr_spoke_manager_diag_conditions | default('') %}
+      {% set hints = [] %}
+      {% if 'ImagePullBackOff' in pod_text or 'ErrImagePull' in pod_text %}
+      {%   set _ = hints.append(
+             'REGISTRY ACCESS: The Spoke cannot pull images from registry.redhat.io. '
+             ~ 'Common causes: '
+             ~ '(1) IKS VPC with Outbound Traffic Protection enabled '
+             ~ '(fix: ibmcloud ks vpc outbound-traffic-protection disable --cluster <name>), '
+             ~ '(2) missing Public Gateway on the VPC subnet, '
+             ~ '(3) firewall or proxy blocking egress to registry.redhat.io:443, '
+             ~ '(4) missing Red Hat pull secret on the Spoke.') %}
+      {% endif %}
+      {% if 'CrashLoopBackOff' in pod_text %}
+      {%   set _ = hints.append(
+             'KLUSTERLET CRASH: The klusterlet agent started but keeps crashing. '
+             ~ 'Check Spoke node resources (CPU/memory) and klusterlet logs '
+             ~ 'with: kubectl logs -n open-cluster-management-agent <pod-name>.') %}
+      {% endif %}
+      {% if 'LeaseUpdateStopped' in cond_text or 'unreachable' in cond_text %}
+      {%   set _ = hints.append(
+             'LEASE TIMEOUT: The klusterlet stopped updating its Hub lease. '
+             ~ 'Common causes: '
+             ~ '(1) FAILBACK - klusterlet still connected to the previous hub (soft fencing leaves '
+             ~ 'the old hub API reachable). Check open-cluster-management-agent/hub-kubeconfig-secret '
+             ~ 'on the Spoke: if it points to the old hub, the force-switch (task 1.2.6i) may have '
+             ~ 'skipped because the ManifestWork was not ready. Trigger an AAP Project sync, then '
+             ~ 're-run this job to retry the force-switch. '
+             ~ '(2) Network connectivity loss between Spoke and Hub. '
+             ~ 'Check Spoke-to-Hub routing and firewall rules.') %}
+      {% endif %}
+      {% if 'AutoImportSecretInvalid' in cond_text or 'Unauthorized' in cond_text %}
+      {%   set _ = hints.append(
+             'INVALID IMPORT CREDENTIALS: auto-import-secret rejected with Unauthorized. '
+             ~ 'The ServiceAccount token in the Spoke Cluster credential has expired or been rotated. '
+             ~ 'Run scripts/02_provision_automation_sa.sh against the Spoke to regenerate the SA token, '
+             ~ 'update the AAP Spoke Cluster credential with the new token, then re-run this job.') %}
+      {% endif %}
+      {% if 'Pending' in pod_text %}
+      {%   set _ = hints.append(
+             'SCHEDULING: One or more klusterlet pods are stuck in Pending state. '
+             ~ 'The Spoke may lack sufficient CPU/memory or have taints that '
+             ~ 'prevent scheduling. Check node resources and taints.') %}
+      {% endif %}
+      {% if hints | length == 0 %}
+      {%   set _ = hints.append(
+             'No specific pattern matched. Check the ManagedCluster conditions above '
+             ~ 'and the klusterlet pod logs on the Spoke for details: '
+             ~ 'kubectl logs -n open-cluster-management-agent -l app=klusterlet --context <spoke-ctx>') %}
+      {% endif %}
+      {{ hints }}
+  when: acm_dr_spoke_manager_spoke_import_status is failed
+
+# D.6) Print the structured diagnostic report. This replaces the raw
+#      JSON dump that Ansible shows on retry exhaustion.
+- name: "[SPOKE PREP DIAGNOSTIC] | D.6) ❌ RECONCILIATION FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ SPOKE RECONCILIATION FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "FAILED TASK:"
+      - "  [STAGE 01 - SPOKE PREP] | 1.3.2) Polling Spoke reconciliation"
+      - ""
+      - "ATTEMPTS:"
+      - "  {{ acm_dr_spoke_manager_spoke_import_status.attempts | default('?') }} of 30 retries exhausted"
+      - ""
+      - "MANAGEDCLUSTER CONDITIONS ON HUB:"
+      - "{{ acm_dr_spoke_manager_diag_conditions | default('  (could not read ManagedCluster)') }}"
+      - ""
+      - "KLUSTERLET POD STATUS ON SPOKE:"
+      - "{{ acm_dr_spoke_manager_diag_pod_summary | default('  (could not reach Spoke)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_spoke_manager_diag_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: acm_dr_spoke_manager_spoke_import_status is failed
+
+# D.7) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[SPOKE PREP DIAGNOSTIC] | D.7) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Spoke '{{ acm_dr_spoke_manager_cluster_name }}' did not
+      reach AVAILABLE state after {{ acm_dr_spoke_manager_spoke_import_status.attempts | default('?') }}
+      polling attempts ({{ (acm_dr_spoke_manager_spoke_import_status.attempts | default(30) | int) * 15 }}s).
+      See the diagnostic report above for ManagedCluster conditions, klusterlet pod
+      status, and troubleshooting hints.
+  when: acm_dr_spoke_manager_spoke_import_status is failed
+
+# -------------------------------------------------------------------
+# 1.4) Bootstrap resource cleanup on the Spoke
+# -------------------------------------------------------------------
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.4.1) Remove bootstrap ClusterRoleBinding on the Spoke - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: spoke-admin-sa-binding
+  when:
+    - (acm_dr_spoke_manager_cleanup_bootstrap_sa | default(true)) | bool
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.4.2) Remove bootstrap automation Namespace on the Spoke - {{ acm_dr_spoke_manager_spoke_k8s_context }}"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_spoke_k8s_context }}"
+    state: absent
+    kind: Namespace
+    name: spoke-automation
+  when:
+    - (acm_dr_spoke_manager_cleanup_bootstrap_sa | default(true)) | bool
+    - acm_dr_spoke_manager_spoke_k8s_context is defined
+    - acm_dr_spoke_manager_spoke_k8s_context | length > 0
+
+# -------------------------------------------------------------------
+# 1.5) Final validation assert
+# -------------------------------------------------------------------
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.5.1) Collect ManagedCluster status on the Hub - {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+  register: acm_dr_spoke_manager_spoke_validation_info
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.5.2) 🕵️ Assert JOINED and AVAILABLE state of the Spoke"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_spoke_manager_spoke_validation_info.resources | length > 0
+      - >-
+        (acm_dr_spoke_manager_spoke_validation_info.resources[0].status.conditions | default([]) |
+          selectattr('type', 'equalto', 'ManagedClusterJoined') |
+          selectattr('status', 'equalto', 'True') | list | length > 0)
+      - >-
+        (acm_dr_spoke_manager_spoke_validation_info.resources[0].status.conditions | default([]) |
+          selectattr('type', 'equalto', 'ManagedClusterConditionAvailable') |
+          selectattr('status', 'equalto', 'True') | list | length > 0)
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Spoke cluster '{{ acm_dr_spoke_manager_cluster_name }}' has been imported
+      and validated successfully! Status: JOINED = True | AVAILABLE = True.
+      The klusterlet is operational on Hub '{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}'.
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Spoke cluster
+      '{{ acm_dr_spoke_manager_cluster_name }}' did not reach the expected state.
+  ignore_errors: false
+
+# RHACM appends a new URL to spec.managedClusterClientConfigs each time an
+# auto-import-secret is processed but never removes old ones. A stale entry with
+# a wrong URL slows Stage 06 GC: RHACM GC controllers try each entry in order,
+# timing out on bad URLs before reaching the correct one. Removing stale entries
+# here ensures the Hub uses only the confirmed-working URL for this spoke.
+# Reuses acm_dr_spoke_manager_spoke_validation_info from task 1.5.1 - no extra API call.
+- name: "[STAGE 01 - SPOKE PREP] | 1.5.3) Compute stale clientConfigs entries to remove"
+  ansible.builtin.set_fact:
+    # Keep only entries whose URL matches the confirmed spoke URL.
+    # If none match (all entries are wrong URLs), fall back to a single correct entry
+    # so the patch does not wipe the array and leave clientConfigs empty.
+    acm_dr_spoke_manager_clean_client_configs: >-
+      {{
+        (acm_dr_spoke_manager_spoke_validation_info.resources[0].spec.managedClusterClientConfigs | default([]))
+        | selectattr('url', 'equalto', acm_dr_spoke_manager_api_url)
+        | list
+        if (
+          (acm_dr_spoke_manager_spoke_validation_info.resources[0].spec.managedClusterClientConfigs | default([]))
+          | selectattr('url', 'equalto', acm_dr_spoke_manager_api_url)
+          | list | length > 0
+        )
+        else [{"url": acm_dr_spoke_manager_api_url}]
+      }}
+    acm_dr_spoke_manager_stale_client_configs: >-
+      {{
+        (acm_dr_spoke_manager_spoke_validation_info.resources[0].spec.managedClusterClientConfigs | default([]))
+        | rejectattr('url', 'equalto', acm_dr_spoke_manager_api_url)
+        | list
+      }}
+  when:
+    - acm_dr_spoke_manager_api_url | default('', true) | length > 0
+    - (acm_dr_spoke_manager_spoke_validation_info.resources | default([])) | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.5.4) ⚠️ Report stale clientConfigs entries found on Hub"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ Stale clientConfigs found on ManagedCluster '{{ acm_dr_spoke_manager_cluster_name }}':
+      {{ acm_dr_spoke_manager_stale_client_configs | map(attribute='url') | list }}.
+      Confirmed spoke URL: {{ acm_dr_spoke_manager_api_url }}.
+      Removing stale entries now to prevent Stage 06 GC timeout from bad-URL retries.
+  when:
+    - (acm_dr_spoke_manager_stale_client_configs | default([])) | length > 0
+
+# Uses JSON Patch (op: replace) to atomically swap the full array - strategic merge
+# patch cannot reliably drop individual list entries without a merge key.
+- name: "[STAGE 01 - SPOKE PREP] | 1.5.5) 🧹 Remove stale URLs from ManagedCluster clientConfigs"
+  kubernetes.core.k8s_json_patch:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ acm_dr_spoke_manager_cluster_name }}"
+    patch:
+      - op: replace
+        path: /spec/managedClusterClientConfigs
+        value: "{{ acm_dr_spoke_manager_clean_client_configs }}"
+  when:
+    - (acm_dr_spoke_manager_stale_client_configs | default([])) | length > 0
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.5.6) Display Spoke Onboarding completion banner"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_spoke_manager_banner_sep_char: "-"
+    acm_dr_spoke_manager_banner_title: "✅  SUCCESS AND VALIDATION COMPLETE: Spoke cluster '{{ acm_dr_spoke_manager_cluster_name }}' activated successfully!"
+    acm_dr_spoke_manager_banner_lines:
+      - "🎛️   Target Hub:   {{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+      - "🎯  Target Spoke: {{ acm_dr_spoke_manager_spoke_k8s_context | default('N/A (Manual Token)') }}"
+      - "🚀  Status Klusterlet: JOINED = True | AVAILABLE = True"
+  run_once: true
+
+# =============================================================================
+# PHASE 6: MIRROR PERMANENT SA TOKEN TO HUB FOR OPERATION C FAILOVER FALLBACK
+# =============================================================================
+# After prep succeeds, write the permanent ansible-dr-orchestrator SA credentials
+# (host + token) as a Secret in the Hub's ansible-automation namespace. The OADP
+# backup label replicates this Secret to every passive Hub in the next
+# BackupSchedule cycle. During failover, Stage 07 Operation C reads this Secret
+# to reconnect the Spoke to the new active Hub without requiring a fleet kubeconfig
+# context - eliminating the need to run 03_build_spoke_fleet.sh manually.
+#
+# Prerequisite: the ACM DR - Spoke Cluster credential must be attached at launch
+# time. That credential injects ACM_DR_SPOKE_TOKEN and ACM_DR_SPOKE_HOST.
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.6.1) 🛡️ Assert Operation C credential is present for this Spoke"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'ACM_DR_SPOKE_TOKEN', default='') | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => ACM_DR_SPOKE_TOKEN is empty for Spoke '{{ acm_dr_spoke_manager_cluster_name }}'.
+      The 'ACM DR - Spoke Cluster' credential is not attached to this job.
+      Without it, Operation C will not function for this Spoke during failover.
+      Stage 07 will have no mirrored token Secret to fall back on.
+      To proceed without it, set acm_dr_spoke_manager_allow_missing_spoke_credential=true.
+      That requires independent confirmation that this Spoke will always be present
+      in the OADP fleet kubeconfig Secret after restore.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => ACM_DR_SPOKE_TOKEN is set for Spoke '{{ acm_dr_spoke_manager_cluster_name }}'.
+      Operation C fallback will be available after the next OADP BackupSchedule cycle.
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"  # that: list resolves ACM_DR_SPOKE_TOKEN
+  when:
+    - acm_dr_spoke_manager_hub_token_mirror_enabled | default(true) | bool
+    - not (acm_dr_spoke_manager_allow_missing_spoke_credential | default(false) | bool)
+
+- name: "[STAGE 01 - SPOKE PREP] | 1.6.2) Mirror permanent SA token to Hub for Operation C failover fallback"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_spoke_manager_hub_context | default(k8s_target_context) }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: "{{ acm_dr_spoke_manager_hub_token_mirror_prefix }}{{ acm_dr_spoke_manager_cluster_name }}-sa-token"
+        namespace: "{{ acm_dr_spoke_manager_hub_token_mirror_namespace }}"
+        labels:
+          # OADP backup label causes the cluster-level BackupSchedule to include
+          # this Secret in the next backup to Azure Storage. The passive Hub's
+          # Restore CR applies it, making the token available for failover Stage 07.
+          cluster.open-cluster-management.io/backup: cluster
+          app.kubernetes.io/managed-by: ansible-dr-orchestrator
+      data:
+        token: "{{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_TOKEN', default='') | b64encode }}"
+        host: "{{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_HOST', default='') | b64encode }}"
+  no_log: "{{ acm_dr_spoke_manager_debug_no_log | default(true) | bool }}"
+  when:
+    - acm_dr_spoke_manager_hub_token_mirror_enabled | default(true) | bool
+    - lookup('ansible.builtin.env', 'ACM_DR_SPOKE_TOKEN', default='') | length > 0
+    - lookup('ansible.builtin.env', 'ACM_DR_SPOKE_HOST', default='') | length > 0
+...

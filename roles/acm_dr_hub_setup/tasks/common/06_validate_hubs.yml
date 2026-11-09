@@ -1,0 +1,149 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 06 METADATA DISPLAY (VALIDATION)
+# =============================================================================
+
+- name: "[STAGE 06 - Validate Hubs] | Display Hub audit metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    _is_primary: "{{ (acm_dr_hub_setup_is_primary_hub | default(is_primary_hub | default(true))) | bool }}"
+    acm_dr_hub_setup_banner_title: "🔍 STAGE 06 - Hub Health & Compliance Audit"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT:  {{ k8s_target_context }}"
+      - "🎛️  HUB TYPE:        {{ _is_primary | ternary('PRIMARY HUB (ACTIVE)', 'SECONDARY / PASSIVE HUB (DR)') }}"
+  run_once: true
+# =============================================================================
+# STEP 6.1: INFRASTRUCTURE COMPONENT CHECKS
+# =============================================================================
+
+- name: "[STAGE 06 - Validate Hubs] | 6.1.1) Auditing RHACM MultiClusterHub status - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_setup_mch_name }}"
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+  register: acm_dr_hub_setup_audit_mch
+
+- name: "[STAGE 06 - Validate Hubs] | 6.1.2) Auditing ArgoCD OpenShift GitOps instances - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    namespace: "{{ item.namespace }}"
+    name: "{{ item.name }}"
+  loop:
+    - { name: "openshift-gitops-acm-server", namespace: "{{ acm_dr_hub_setup_gitops_namespace_acm }}" }
+    - { name: "openshift-gitops-appdemo-server", namespace: "{{ acm_dr_hub_setup_gitops_namespace_appdemo }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  register: acm_dr_hub_setup_audit_gitops
+  # Skip GitOps deployment checks when Stage 04 was not executed.
+  when: acm_dr_hub_setup_enable_gitops | default(true) | bool
+
+- name: "[STAGE 06 - Validate Hubs] | 6.1.3) Auditing MultiClusterObservability mesh status - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: observability.open-cluster-management.io/v1beta2
+    kind: MultiClusterObservability
+    name: observability
+  register: acm_dr_hub_setup_audit_mco
+
+- name: "[STAGE 06 - Validate Hubs] | 6.1.4) Auditing OADP BackupStorageLocation (BSL) connectivity - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: velero.io/v1
+    kind: BackupStorageLocation
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('openshift-adp') }}"
+  register: acm_dr_hub_setup_audit_bsl
+
+- name: "[STAGE 06 - Validate Hubs] | 6.1.5) Auditing BackupSchedule Custom Resource presence - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('openshift-adp') }}"
+  register: acm_dr_hub_setup_audit_schedule
+
+- name: "[STAGE 06 - Validate Hubs] | 6.1.6) Auditing visibility of backups stored in cloud storage - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: velero.io/v1
+    kind: Backup
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('openshift-adp') }}"
+  register: acm_dr_hub_setup_audit_backups
+
+# Audit the passive sync Restore CR - expected to exist on passive hubs when
+# acm_dr_hub_setup_passive_restore_enabled is true (the assert in 6.2.1 validates this)
+- name: "[STAGE 06 - Validate Hubs] | 6.1.7) Auditing passive sync Restore CR presence - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+  register: acm_dr_hub_setup_audit_restore
+
+# Query ClusterVersion to extract the cluster's clusterID - used for topology
+# correlation and backup resolution traceability in multi-hub environments.
+# The clusterID is the unique identifier that the acm_dr_failover_manager uses
+# to resolve explicit backups via the backup-cluster label.
+- name: "[STAGE 06 - Validate Hubs] | 6.1.8) Auditing ClusterVersion for cluster identity (clusterID) - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterVersion
+    name: version
+  register: acm_dr_hub_setup_audit_cluster_version
+  # ClusterVersion may not exist on non-OCP clusters (AKS, EKS, GKE)
+  failed_when: false
+
+# =============================================================================
+# STEP 6.2: STRICT STATE ASSERTIONS (COMPLIANCE AUDIT)
+# =============================================================================
+
+- name: "[STAGE 06 - Validate Hubs] | 6.2.1) 🔍 ASSERT - Validate Hub operational compliance - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_audit_mch.resources | length > 0
+      - (acm_dr_hub_setup_audit_mch.resources[0].status.phase | default('')) == "Running"
+      - >-
+        (not (acm_dr_hub_setup_enable_gitops | default(true) | bool)) or
+        ((acm_dr_hub_setup_audit_gitops.results
+        | selectattr('resources', 'defined')
+        | map(attribute='resources')
+        | flatten
+        | selectattr('status.readyReplicas', 'defined')
+        | selectattr('status.readyReplicas', 'gt', 0)
+        | list
+        | length) == 2)
+      - acm_dr_hub_setup_audit_mco.resources | length > 0
+      - >-
+        (acm_dr_hub_setup_audit_mco.resources[0].status.conditions
+        | default([])
+        | selectattr('type', 'equalto', 'Ready')
+        | selectattr('status', 'equalto', 'True')
+        | list
+        | length) > 0
+      - acm_dr_hub_setup_audit_bsl.resources | length > 0
+      - (acm_dr_hub_setup_audit_bsl.resources[0].status.phase | default('')) == "Available"
+      - >-
+        (acm_dr_hub_setup_is_primary_hub | bool and acm_dr_hub_setup_audit_schedule.resources | length > 0) or
+        (not acm_dr_hub_setup_is_primary_hub | bool and acm_dr_hub_setup_audit_schedule.resources | length == 0)
+      # Passive hub with passive sync enabled must have at least one Restore CR.
+      # Primary hubs and passive hubs with the feature disabled skip this check.
+      - >-
+        (acm_dr_hub_setup_is_primary_hub | bool) or
+        (not acm_dr_hub_setup_passive_restore_enabled | bool) or
+        (acm_dr_hub_setup_audit_restore.resources | length > 0)
+    success_msg: "✅ PASSED! Oh. Yes! => All compliance criteria for context '{{ k8s_target_context }}' have been validated."
+    fail_msg: "❌ FAILED! Oh. No! => Context '{{ k8s_target_context }}' presented inconsistencies in the compliance audit."
+
+# =============================================================================
+# STEP 6.3: FINAL SUMMARY AND OPERATIONAL STATUS DASHBOARD
+# =============================================================================
+
+- name: "[STAGE 06 - Validate Hubs] | Display consolidated Hub status dashboard - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/06_validate_hubs_summary.j2').split('\n') }}"
+  run_once: true
+...

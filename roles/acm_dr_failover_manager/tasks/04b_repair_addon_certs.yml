@@ -1,0 +1,228 @@
+---
+# roles/acm_dr_failover_manager/tasks/04b_repair_addon_certs.yml
+#
+# Stage 05b: Addon Hub-Kubeconfig CA Mismatch Repair (post-OADP-restore)
+#
+# OADP restore brings ManifestWorks from the source hub onto the destination hub.
+# Those ManifestWorks push addon agent hub-kubeconfig secrets containing client
+# certificates signed by the SOURCE hub's CSR signer CA. The DESTINATION hub
+# trusts only its own CSR signer CA, so all addon agents on every spoke receive
+# HTTP 401 when connecting to the destination hub after the restore completes.
+#
+# Root cause: each hub cluster (ARO, AKS-hosted, etc.) generates its own
+# kube-controller-manager CSR signer with a unique timestamp in its CN
+# (CN=kube-csr-signer_@<unix-epoch>). These CAs are never shared between
+# clusters, so a cert signed on Hub A is structurally untrusted by Hub B.
+#
+# Fix: delete every ManagedClusterAddon for each reachable spoke on the
+# destination hub. The addon manager recreates them within seconds. The addon
+# registration controller issues fresh CSRs, signs them with the destination
+# hub's CA, and pushes updated hub-kubeconfigs to the spokes via ManifestWork.
+# Addon agents on the spokes restart and become healthy within 1-2 minutes.
+#
+# Why 'oc' instead of kubernetes.core.k8s_info/k8s here:
+# The Python kubernetes client caches the API group discovery list for the
+# lifetime of the Ansible process. After OADP restore, the addon-manager pod
+# restarts and temporarily unregisters the addon.open-cluster-management.io
+# API group. The cache becomes stale and k8s_info returns api_found=false even
+# after the controller recovers. 'oc' does fresh discovery on every invocation
+# and is unaffected by this cache. All addon operations in this stage use 'oc'.
+
+- name: "[STAGE 05b - Addon Cert Repair] | Display addon cert repair metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🔐 STAGE 05b - Addon Hub-Kubeconfig CA Mismatch Repair"
+    acm_dr_failover_manager_banner_lines:
+      - "✅ NEW HUB: {{ passive_hub }}"
+      - "🌐  REPAIRING:  {{ (acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list)) | length | string }} reachable Spoke(s)"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+# Wait for the addon API group to be available on the destination hub. After OADP
+# restore the addon-manager pod restarts and briefly unregisters its CRDs. This
+# probe uses 'oc get managedclusteraddon' with server-side version negotiation
+# (no explicit API version) and checks that at least one addon exists, meaning
+# the addon controller has finished starting and populated the addon list.
+# 24 retries x 15s = 360s (6 minutes); failed_when: false continues as a no-op
+# if the window is exceeded (addons self-recover via the addon framework anyway).
+- name: "[STAGE 05b - Addon Cert Repair] | 5b.0) Wait for addon API group to be discoverable on destination hub"
+  ansible.builtin.shell: |
+    set -o pipefail
+    oc get managedclusteraddon \
+      --context "{{ passive_hub }}" \
+      --all-namespaces --no-headers 2>/dev/null | wc -l | grep -qvE '^0$'
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  register: acm_dr_failover_manager_addon_api_probe
+  until: acm_dr_failover_manager_addon_api_probe.rc == 0
+  retries: "{{ acm_dr_failover_manager_addon_repair_retries }}"  # uses defaults/main.yml value (40 x 15s = 10 min max)
+  delay: "{{ acm_dr_failover_manager_addon_repair_delay }}"  # seconds between probes
+  changed_when: false
+  failed_when: false
+
+# Query addon names per spoke via 'oc' to bypass the Python k8s client discovery cache.
+# Output: one addon name per line (empty stdout when spoke has no addons or API unavailable).
+- name: "[STAGE 05b - Addon Cert Repair] | 5b.1) Query ManagedClusterAddon names for each reachable Spoke"
+  ansible.builtin.shell: |
+    oc get managedclusteraddon \
+      -n "{{ item }}" \
+      --context "{{ passive_hub }}" \
+      --no-headers -o custom-columns="NAME:.metadata.name" 2>/dev/null || true
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  loop: "{{ acm_dr_failover_manager_reachable_spoke_list | default(acm_dr_failover_manager_spoke_list) }}"
+  loop_control:
+    label: "{{ item }}"
+  register: acm_dr_failover_manager_addon_info
+  changed_when: false
+  failed_when: false
+
+- name: "[STAGE 05b - Addon Cert Repair] | 5b.2) Log discovered ManagedClusterAddons per Spoke"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 Spoke '{{ item.item }}': {{ (item.stdout_lines | default([])) | length }} addon(s) found:
+      {{ (item.stdout_lines | default([])) | join(', ') }}
+  loop: "{{ acm_dr_failover_manager_addon_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: acm_dr_failover_manager_addon_info is defined
+
+# Delete all ManagedClusterAddons for each spoke that has at least one addon.
+# The addon manager recreates each deleted addon within seconds and the registration
+# controller issues fresh CSRs signed by the destination hub's CA.
+#
+# Why --wait=false + explicit finalizer strip:
+# Some addons (application-manager, config-policy-controller, governance-policy-framework)
+# carry an addon-pre-delete finalizer that runs a cleanup ManifestWork on the spoke before
+# allowing deletion. When the spoke is Unknown on the destination hub (common immediately
+# after OADP restore, before the klusterlet reconnects), the ManifestWork cannot be
+# processed and the finalizer is never cleared. Without a timeout, 'oc delete' hangs
+# indefinitely - confirmed during lab testing to block for 3+ hours.
+#
+# Safe approach: issue --wait=false to set deletionTimestamp without blocking, then
+# immediately strip any stuck finalizers from Terminating addons. The addon controller
+# will not re-add a finalizer to an object that already has a deletionTimestamp, so
+# the patch wins the race reliably. Finally, wait up to 60s for full deletion.
+#
+# Parallelized: all spokes delete simultaneously (async/poll:0). Total time becomes
+# max(per-spoke-time) instead of sum(all-spoke-times). For 2 spokes with 9 addons each,
+# this saves ~65s compared to the old serial loop (2x ~7.2s/addon x 9 = ~130s serial -> ~65s parallel).
+- name: "[STAGE 05b - Addon Cert Repair] | 5b.3a) Launch parallel ManagedClusterAddon deletion per Spoke"
+  ansible.builtin.shell: |
+    # Trigger deletion without waiting; sets deletionTimestamp on each addon immediately.
+    oc delete managedclusteraddon --all \
+      -n "$SPOKE" \
+      --context "$DEST" \
+      --wait=false 2>/dev/null || true
+
+    # Give the API server 3s to persist the deletionTimestamp on all objects.
+    sleep 3
+
+    # Strip addon-pre-delete finalizers from any addon now in Terminating state.
+    # The addon controller will not re-add a finalizer to an object that already has a
+    # deletionTimestamp, so this patch wins the race regardless of spoke availability.
+    stuck=$(oc get managedclusteraddon \
+      -n "$SPOKE" \
+      --context "$DEST" \
+      -o jsonpath='{.items[?(@.metadata.deletionTimestamp)].metadata.name}' \
+      2>/dev/null || true)
+
+    if [ -n "$stuck" ]; then
+      echo "⚠️ Addons stuck in Terminating (stripping finalizers): $stuck"
+      for addon in $stuck; do
+        oc patch managedclusteraddon "$addon" \
+          -n "$SPOKE" \
+          --context "$DEST" \
+          --type=json \
+          -p '[{"op":"remove","path":"/metadata/finalizers"}]' \
+          2>/dev/null || true
+      done
+    fi
+
+    # Wait up to 60s for all addons to be fully removed. If any remain (the addon
+    # controller may immediately recreate them), that is not fatal - recreation is
+    # the desired outcome and new addons will get certs from the destination hub CA.
+    oc wait managedclusteraddon --all \
+      -n "$SPOKE" \
+      --context "$DEST" \
+      --for=delete \
+      --timeout=60s 2>/dev/null || true
+
+    echo "✅ Addon deletion complete for spoke $SPOKE"
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+    SPOKE: "{{ item.item }}"
+    DEST: "{{ passive_hub }}"
+  loop: "{{ acm_dr_failover_manager_addon_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - acm_dr_failover_manager_addon_info is defined
+    - (item.stdout_lines | default([]) | length) > 0
+  changed_when: true
+  failed_when: false  # script uses || true throughout; actual success checked by 5b.3b async_status
+  async: 120   # shell budget: 60s oc wait + 3s sleep + ~30s finalizer strip + 30s buffer
+  poll: 0      # fire-and-forget: all spokes delete simultaneously
+  register: acm_dr_failover_manager_addon_delete_jobs
+
+# Collect async exit codes from 5b.3a. async_status polls the job state file (not the
+# cluster), so this loop is cheap. The deletion shells are still running in parallel while
+# this collector iterates. Skipped spoke entries (no addons) won't have ansible_job_id.
+- name: "[STAGE 05b - Addon Cert Repair] | 5b.3b) Collect parallel addon deletion results"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop: "{{ acm_dr_failover_manager_addon_delete_jobs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item | default('unknown') }}"  # item.item is the 5b.3a loop entry; item.item.item is the spoke name
+  register: acm_dr_failover_manager_addon_delete_status
+  until: acm_dr_failover_manager_addon_delete_status.finished
+  retries: 10    # 10 x 15s = 150s collector budget; slightly above the 120s async limit
+  delay: 15      # seconds between async_status checks
+  when:
+    - acm_dr_failover_manager_addon_delete_jobs is defined
+    - item.ansible_job_id is defined  # skipped entries (spoke had no addons) have no job ID
+
+# Poll per spoke until the addon manager has recreated ManagedClusterAddons after deletion.
+# The addon manager typically recreates them within 5-10 seconds; exiting as soon as they
+# appear saves ~20-25s vs the old fixed 30s pause. Uses 'oc' (not k8s_info) to avoid the
+# stale API-discovery cache issue documented in the Stage 05b header comment.
+# Stage 08 postflight is the real availability gate; this step confirms recreation only.
+- name: "[STAGE 05b - Addon Cert Repair] | 5b.4) Wait for addon manager to recreate ManagedClusterAddons per Spoke"
+  ansible.builtin.shell: |
+    set -o pipefail
+    oc get managedclusteraddon \
+      -n "$SPOKE" \
+      --context "$DEST" \
+      --no-headers 2>/dev/null | wc -l | grep -qvE '^0$'
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+    SPOKE: "{{ item.item }}"
+    DEST: "{{ passive_hub }}"
+  loop: "{{ acm_dr_failover_manager_addon_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: acm_dr_failover_manager_addon_recreate_check
+  until: acm_dr_failover_manager_addon_recreate_check.rc == 0
+  retries: "{{ acm_dr_failover_manager_addon_recreate_retries | default(12) }}"
+  delay: "{{ acm_dr_failover_manager_addon_recreate_delay | default(5) }}"
+  when:
+    - acm_dr_failover_manager_addon_info is defined
+    - (item.stdout_lines | default([]) | length) > 0
+  changed_when: false
+  failed_when: false
+
+- name: "[STAGE 05b - Addon Cert Repair] | 5b.5) ✅ Addon cert re-bootstrap deletion complete"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ Stage 05b complete. Deleted all ManagedClusterAddons for
+      {{ (acm_dr_failover_manager_addon_info.results
+          | default([])
+          | selectattr('stdout_lines', 'defined')
+          | selectattr('stdout_lines', 'ne', [])
+          | list
+          | length) | string }} spoke(s). The addon manager on {{ passive_hub }}
+      will recreate each MCA and issue hub-kubeconfig certs signed by its own CSR signer.
+      Full addon availability is confirmed by the Stage 08 postflight check.
+  when: acm_dr_failover_manager_addon_info is defined
+...

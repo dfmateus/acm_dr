@@ -1,0 +1,272 @@
+---
+# playbooks/check-approval-outcome.yml
+# =============================================================================
+# CHECK APPROVAL OUTCOME (WJT FAILURE PATH HANDLER)
+#
+# Description:
+#   Called from the failure branch of a Workflow Job Template when an Approval
+#   Node is denied or expires by timeout. Queries the AAP REST API to classify
+#   the outcome as "explicit denial" or "timeout", then sends a distinct
+#   notification via the configured webhook credential.
+#
+#   This distinction matters for incident triage: a timeout suggests nobody was
+#   reachable within the window, while a denial means an operator actively
+#   blocked the action. Routing both outcomes to the same generic failure alert
+#   loses that signal.
+#
+#   Always exits rc=0. The parent WJT is already on the failure path; this JT
+#   adds notification only.
+#
+# Credentials required:
+#   ACM DR - AAP Automation Token   - injects CONTROLLER_HOST,
+#                                     CONTROLLER_OAUTH_TOKEN, CONTROLLER_VERIFY_SSL
+#   ACM DR - Notification Webhook   - injects NOTIF_WEBHOOK_URL, NOTIF_WEBHOOK_FORMAT
+#
+# Variables (extra_vars, all optional):
+#   wf_name  - display name of the workflow shown in the notification body.
+#              Default: (unknown workflow)
+#
+# NOTE: awx_job_id is an Ansible extra_var injected automatically by AAP into every
+# job execution (not a shell env var). Do not use lookup('env', 'AWX_JOB_ID').
+#
+# Exit codes:
+#   0 - notification sent, or gracefully skipped when API or webhook is unreachable
+#   1 - required credential env vars are absent (nothing can be done without them)
+#
+# Dependencies:
+#   collections: ansible.builtin
+# =============================================================================
+
+- name: Check Approval Outcome and Send Classified Notification
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    wf_name: "(unknown workflow)"  # workflow display name for the notification body
+
+  tasks:
+    # -----------------------------------------------------------------
+    # PRE-FLIGHT: read injected env vars and validate prerequisites
+    # -----------------------------------------------------------------
+    - name: "[PRE-FLIGHT] | Read AAP and webhook credentials from environment"
+      ansible.builtin.set_fact:
+        _controller_host: "{{ lookup('ansible.builtin.env', 'CONTROLLER_HOST', default='') }}"
+        _controller_token: "{{ lookup('ansible.builtin.env', 'CONTROLLER_OAUTH_TOKEN', default='') }}"
+        _controller_verify_ssl: >-
+          {{ lookup('ansible.builtin.env', 'CONTROLLER_VERIFY_SSL', default='true') | bool }}
+        # awx_job_id is an Ansible extra_var injected by AAP, not a shell env var.
+        _awx_job_id: "{{ awx_job_id | default('') }}"
+        _webhook_url: "{{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_URL', default='') }}"
+        _webhook_format: >-
+          {{ lookup('ansible.builtin.env', 'NOTIF_WEBHOOK_FORMAT', default='generic-json') }}
+      no_log: true  # _controller_token and _webhook_url are secrets
+
+    - name: "[PRE-FLIGHT] | Assert required vars and credentials are present"
+      ansible.builtin.assert:
+        that:
+          - _awx_job_id | length > 0
+          - _controller_host | length > 0
+          - _controller_token | length > 0
+          - _webhook_url | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => One or more required vars are missing.
+          awx_job_id is an Ansible extra_var injected automatically by AAP (not a shell env var).
+          CONTROLLER_HOST and CONTROLLER_OAUTH_TOKEN come from the ACM DR - AAP Automation Token
+          credential. NOTIF_WEBHOOK_URL comes from the ACM DR - Notification Webhook credential.
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => All required vars are present.
+          awx_job_id={{ _awx_job_id }} CONTROLLER_HOST={{ _controller_host }}.
+
+    # -----------------------------------------------------------------
+    # STEP 1: resolve the parent WJT job ID from the current job
+    # -----------------------------------------------------------------
+
+    # The current job (awx_job_id) is a regular JT execution. Its
+    # related.workflow_job field points back to the enclosing WJT run,
+    # which is what the workflow_approvals API filters on.
+    - name: "[APPROVAL CHECK] | 1.1) Query current job details to get parent WJT link"
+      ansible.builtin.uri:
+        url: "{{ _controller_host }}/api/controller/v2/jobs/{{ _awx_job_id }}/"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _controller_token }}"
+          Content-Type: "application/json"
+        validate_certs: "{{ _controller_verify_ssl }}"
+        status_code: [200]
+      register: _job_detail
+      no_log: true  # Authorization header carries the bearer token
+      # API unavailability must not prevent rc=0 exit; check .status afterward
+      failed_when: false
+
+    - name: "[APPROVAL CHECK] | 1.2) Extract WJT job ID from related link"
+      ansible.builtin.set_fact:
+        # AAP 2.7 Gateway uses 'source_workflow_job' (not 'workflow_job') in the related
+        # block. The value is a path like /api/controller/v2/workflow_jobs/42/; extract
+        # the numeric ID with regex to avoid failures when the list is empty.
+        _wjt_job_id: >-
+          {{
+            (_job_detail.json.related.source_workflow_job | default(''))
+            | regex_search('workflow_jobs/(\d+)/', '\1') | first | default('')
+          }}
+        _api_reachable: true
+      when: _job_detail.status | default(-1) == 200
+
+    - name: "[APPROVAL CHECK] | 1.3) Record API failure when job query did not return 200"
+      ansible.builtin.set_fact:
+        _wjt_job_id: ""
+        _api_reachable: false
+      when: _job_detail.status | default(-1) != 200
+
+    # -----------------------------------------------------------------
+    # STEP 2: read the approval outcome from the WFT job's nodes
+    #
+    # The workflow_approvals endpoint has no usable filter for the parent WFT
+    # job ID. Instead: query the WFT job's nodes, find the node where
+    # summary_fields.unified_job_template.unified_job_type == 'workflow_approval',
+    # and read timed_out directly from summary_fields.job.timed_out.
+    # No second API call needed.
+    # -----------------------------------------------------------------
+    - name: "[APPROVAL CHECK] | 2.1) Query WFT job nodes to find the approval node"
+      ansible.builtin.uri:
+        url: "{{ _controller_host }}/api/controller/v2/workflow_jobs/{{ _wjt_job_id }}/workflow_nodes/?page_size=50"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _controller_token }}"
+          Content-Type: "application/json"
+        validate_certs: "{{ _controller_verify_ssl }}"
+        status_code: [200]
+      register: _wft_nodes_query
+      no_log: true
+      failed_when: false
+      when: _api_reachable and _wjt_job_id | length > 0
+
+    - name: "[APPROVAL CHECK] | 2.2) Extract timed_out and name from the approval node"
+      ansible.builtin.set_fact:
+        # The approval node carries unified_job_type='workflow_approval'.
+        # timed_out is already embedded in summary_fields.job - no extra API call.
+        _approval_found: true
+        _approval_timed_out: >-
+          {{
+            ((_wft_nodes_query.json.results | default([]))
+            | selectattr('summary_fields.unified_job_template.unified_job_type', 'defined')
+            | selectattr('summary_fields.unified_job_template.unified_job_type', 'equalto', 'workflow_approval')
+            | map(attribute='summary_fields.job') | list | first | default({})
+            ).get('timed_out', false) | bool
+          }}
+        _approval_name: >-
+          {{
+            ((_wft_nodes_query.json.results | default([]))
+            | selectattr('summary_fields.unified_job_template.unified_job_type', 'defined')
+            | selectattr('summary_fields.unified_job_template.unified_job_type', 'equalto', 'workflow_approval')
+            | map(attribute='summary_fields.job') | list | first | default({})
+            ).get('name', '(unnamed approval)')
+          }}
+      when:
+        - _api_reachable
+        - _wft_nodes_query.status | default(-1) == 200
+        - >-
+          (_wft_nodes_query.json.results | default([])
+          | selectattr('summary_fields.unified_job_template.unified_job_type', 'defined')
+          | selectattr('summary_fields.unified_job_template.unified_job_type', 'equalto', 'workflow_approval')
+          | list | length) > 0
+
+    - name: "[APPROVAL CHECK] | 2.3) Set defaults when no approval node found or query failed"
+      ansible.builtin.set_fact:
+        _approval_found: false
+        _approval_timed_out: false
+        _approval_name: "(not found)"
+      when: _approval_found is not defined
+
+    # -----------------------------------------------------------------
+    # STEP 3: classify the outcome and build notification text
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 3.1) Classify: approval timed out"
+      ansible.builtin.set_fact:
+        _outcome_label: "Approval Timed Out"
+        _outcome_body: >-
+          Workflow '{{ wf_name }}' stopped because approval '{{ _approval_name }}'
+          expired without a response. No operator acted within the configured window.
+          Review the approval timeout setting and on-call escalation procedure before
+          re-triggering the workflow.
+        _outcome_severity: "warning"
+      when: _approval_found and _approval_timed_out
+
+    - name: "[NOTIFY] | 3.2) Classify: approval explicitly denied"
+      ansible.builtin.set_fact:
+        _outcome_label: "Approval Denied"
+        _outcome_body: >-
+          Workflow '{{ wf_name }}' stopped because approval '{{ _approval_name }}'
+          was explicitly denied by an operator. Review the denial reason in the AAP
+          approval history before deciding whether to re-trigger the workflow.
+        _outcome_severity: "warning"
+      when: _approval_found and not _approval_timed_out
+
+    - name: "[NOTIFY] | 3.3) Classify: API unreachable or no approval record found"
+      ansible.builtin.set_fact:
+        _outcome_label: "Approval Outcome Unknown"
+        _outcome_body: >-
+          Workflow '{{ wf_name }}' is on the failure path, but the approval outcome
+          could not be determined (API reachable: {{ _api_reachable }},
+          approval record found: {{ _approval_found }}). Check the AAP audit log
+          manually to determine whether the approval was denied or timed out.
+        _outcome_severity: "warning"
+      when: not _approval_found
+
+    # -----------------------------------------------------------------
+    # STEP 4: build format-specific webhook payload
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 4.1) Build Slack payload"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          text: "*{{ _outcome_label }}*\n{{ _outcome_body }}"
+      when: _webhook_format == 'slack'
+
+    - name: "[NOTIFY] | 4.2) Build Teams Adaptive Card payload"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          type: "message"
+          attachments:
+            - contentType: "application/vnd.microsoft.card.adaptive"
+              content:
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json"
+                type: "AdaptiveCard"
+                version: "1.4"
+                body:
+                  - type: "TextBlock"
+                    text: "{{ _outcome_label }}"
+                    weight: "Bolder"
+                    size: "Medium"
+                  - type: "TextBlock"
+                    text: "{{ _outcome_body }}"
+                    wrap: true
+      when: _webhook_format == 'teams'
+
+    - name: "[NOTIFY] | 4.3) Build generic-json payload (fallback for all other formats)"
+      ansible.builtin.set_fact:
+        _webhook_payload:
+          title: "{{ _outcome_label }}"
+          body: "{{ _outcome_body }}"
+          severity: "{{ _outcome_severity }}"
+          workflow: "{{ wf_name }}"
+          approval: "{{ _approval_name }}"
+          timed_out: "{{ _approval_timed_out }}"
+      when: _webhook_format not in ['slack', 'teams']
+
+    # -----------------------------------------------------------------
+    # STEP 5: send the notification
+    # -----------------------------------------------------------------
+    - name: "[NOTIFY] | 5.1) POST to webhook endpoint"
+      ansible.builtin.uri:
+        url: "{{ _webhook_url }}"
+        method: POST
+        body: "{{ _webhook_payload | to_json }}"
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        status_code: [200, 202, 204]
+      no_log: true  # _webhook_url is a secret injected by the credential type
+      # Webhook delivery failure must not add another failed node to the WJT path.
+      # The WJT is already in failure state; this task is notification-only.
+      failed_when: false
+...

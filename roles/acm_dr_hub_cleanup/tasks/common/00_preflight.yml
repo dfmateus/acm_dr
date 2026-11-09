@@ -1,0 +1,217 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 00 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.0.1) Display prerequisite validation metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "📋 STAGE 00 - Preflight & Safety Validation"
+    acm_dr_hub_cleanup_banner_lines:
+      - "🎯 TARGET CONTEXT (K8S): {{ k8s_target_context | default('NOT DEFINED') }}"
+      - "🧹 SCOPE: RHACM (complete) + GitOps/OADP (config) + Observability + Automation RBAC"
+  run_once: true
+
+# =============================================================================
+# STEP 0.1: BASIC VALIDATION OF MANDATORY PARAMETERS
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.1.1) Assert mandatory variable k8s_target_context"
+  ansible.builtin.assert:
+    that:
+      - k8s_target_context | default('') | length > 0
+      - k8s_target_context | default('') != 'NOT DEFINED'
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => The variable 'k8s_target_context' is missing or empty.
+      Specify the Kubeconfig context of the cluster to be deactivated as a DR node
+      (e.g., -e k8s_target_context="acm-dr-hub").
+    success_msg: "✅ PASSED! Oh. Yes! => Target context '{{ k8s_target_context }}' validated."
+
+# =============================================================================
+# STEP 0.2: 🛡️ SAFETY GATE - MANDATORY EXPLICIT CONFIRMATION
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.2.1) 🛡️ SAFETY LOCK - Require explicit confirmation for destructive operation"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_cleanup_confirm | default(false) | bool
+    fail_msg:
+      - "❌ FAILED! Oh. No! => This role will PERMANENTLY remove from context '{{ k8s_target_context }}':"
+      - "   • Complete Red Hat ACM (MultiClusterHub + operator Subscription/CSV)"
+      - "   • MultiClusterObservability (Thanos) and its namespace"
+      - "   • Governance/AppDemo ArgoCD instances (GitOps). The GitOps Operator is preserved"
+      - "   • DataProtectionApplication and BackupSchedule (OADP). The OADP Operator is preserved"
+      - "   • The Zero-Trust automation identity (ansible-automation namespace)"
+      - "---------------------------------------------------------------------------------------------------"
+      - " To confirm you understand the scope and wish to proceed, re-run adding:"
+      - "    -e acm_dr_hub_cleanup_confirm=true"
+      - ""
+      - " 💡 Tip: run first with '-e acm_dr_hub_cleanup_dry_run=true' to see exactly what would"
+      - "    be removed, without applying any real changes."
+      - "---------------------------------------------------------------------------------------------------"
+    success_msg: "✅ PASSED! Oh. Yes! => Explicit confirmation received (acm_dr_hub_cleanup_confirm=true). Proceeding."
+
+# =============================================================================
+# STEP 0.3: CONNECTIVITY AND PERMISSIONS CHECK
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.3.1) Validate connectivity and access to Kubernetes cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Namespace
+    name: openshift-config
+  register: acm_dr_hub_cleanup_target_cluster_check
+  ignore_errors: true
+  no_log: "{{ acm_dr_hub_cleanup_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.3.2) Assert connectivity to OpenShift API - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - not acm_dr_hub_cleanup_target_cluster_check.failed | default(false)
+      - acm_dr_hub_cleanup_target_cluster_check.resources is defined
+      - acm_dr_hub_cleanup_target_cluster_check.resources | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Access to context '{{ k8s_target_context }}' was denied
+      or the cluster is unreachable. Run 'oc login' on the target terminal and try again.
+    success_msg: "✅ PASSED! Oh. Yes! => Connectivity and access to context '{{ k8s_target_context }}' validated successfully."
+
+- name: "[STAGE 00 - Preflight] | 0.3.3) Validate cluster-admin privileges in context - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Node
+  register: acm_dr_hub_cleanup_auth_check
+  failed_when: >
+    acm_dr_hub_cleanup_auth_check.resources is not defined or
+    acm_dr_hub_cleanup_auth_check.resources | length == 0
+
+# =============================================================================
+# STEP 0.4: CURRENT STATE DISCOVERY (WHAT ACTUALLY EXISTS IN THE CLUSTER)
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.4.1) Discover current state of MultiClusterHub - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_hub_cleanup_mch_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_mch_namespace }}"
+  register: acm_dr_hub_cleanup_discover_mch
+
+- name: "[STAGE 00 - Preflight] | 0.4.2) Discover current state of BackupSchedule (ACTIVE Hub indicator) - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+    name: "{{ acm_dr_hub_cleanup_schedule_name }}"
+  register: acm_dr_hub_cleanup_discover_schedule
+
+- name: "[STAGE 00 - Preflight] | 0.4.3) Set fact for indication of ACTIVE production Hub"
+  ansible.builtin.set_fact:
+    acm_dr_hub_cleanup_looks_like_active_hub: >-
+      {{
+        (acm_dr_hub_cleanup_discover_schedule.resources | default([]) | length > 0) and
+        not (acm_dr_hub_cleanup_discover_schedule.resources[0].spec.paused | default(false) | bool)
+      }}
+
+# =============================================================================
+# STEP 0.4a: CROSS-HUB STORAGE DEPENDENCY CHECK (MULTI-HUB AWARENESS)
+# =============================================================================
+# When cloud storage purge is requested (Azure or AWS), queries peer hubs (if
+# provided) to verify they do not depend on the same shared storage. Non-blocking:
+# emits warnings only. The purge still requires the explicit flag to proceed.
+
+# Unified flag: true when any storage purge is requested, regardless of provider
+- name: "[STAGE 00 - Preflight] | 0.4a.0) Compute storage purge flag"
+  ansible.builtin.set_fact:
+    acm_dr_hub_cleanup_any_storage_purge: >-
+      {{ (acm_dr_hub_cleanup_purge_azure_storage | default(false) | bool) or
+         (acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool) }}
+    # Human-readable label for the storage backend being purged
+    acm_dr_hub_cleanup_storage_label: >-
+      {{ (acm_dr_hub_cleanup_purge_aws_storage | default(false) | bool) |
+         ternary('AWS S3', 'Azure Storage') }}
+
+- name: "[STAGE 00 - Preflight] | 0.4a.1) ⚠️ Cross-hub storage dependency - generic caution (no peers specified)"
+  ansible.builtin.debug:
+    msg:
+      - "⚠️ [CROSS-HUB STORAGE CAUTION]: {{ acm_dr_hub_cleanup_storage_label }} purge requested, but no peer hubs"
+      - "   were specified (acm_dr_hub_cleanup_known_peer_hubs is empty). This automation"
+      - "   cannot verify whether other hubs depend on this storage. Ensure no other hub"
+      - "   uses this shared storage before proceeding."
+      - ""
+      - "   💡 Tip: pass -e acm_dr_hub_cleanup_known_peer_hubs='[\"acm-primary-hub-sa\"]'"
+      - "      to enable cross-hub verification."
+  when:
+    - acm_dr_hub_cleanup_any_storage_purge | bool
+    - acm_dr_hub_cleanup_known_peer_hubs | default([]) | length == 0
+
+# Query each known peer hub's BackupStorageLocation to check if it depends on
+# the same shared storage. Uses failed_when: false because the peer hub may be
+# unreachable or may not have the Velero CRD installed.
+- name: "[STAGE 00 - Preflight] | 0.4a.2) Query BSL on peer hub for cross-hub storage check - {{ item }}"
+  kubernetes.core.k8s_info:
+    context: "{{ item }}"
+    api_version: velero.io/v1
+    kind: BackupStorageLocation
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+  register: acm_dr_hub_cleanup_peer_bsl_results
+  loop: "{{ acm_dr_hub_cleanup_known_peer_hubs | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - acm_dr_hub_cleanup_any_storage_purge | bool
+    - acm_dr_hub_cleanup_known_peer_hubs | default([]) | length > 0
+  failed_when: false
+
+# Emit a warning for each peer hub that has an Available BSL (still depends on storage)
+- name: "[STAGE 00 - Preflight] | 0.4a.3) ⚠️ Cross-hub storage dependency - peer hub has Available BSL"
+  ansible.builtin.debug:
+    msg:
+      - "⚠️ [CROSS-HUB STORAGE WARNING]: Peer hub '{{ item.item }}' still has an Available"
+      - "   BackupStorageLocation in namespace '{{ acm_dr_hub_cleanup_oadp_namespace }}'."
+      - "   Purging this {{ acm_dr_hub_cleanup_storage_label }} will break backups/restores on that hub."
+  loop: "{{ acm_dr_hub_cleanup_peer_bsl_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - acm_dr_hub_cleanup_any_storage_purge | bool
+    - acm_dr_hub_cleanup_peer_bsl_results is defined
+    - item.resources is defined
+    - item.resources | selectattr('status.phase', 'defined') | selectattr('status.phase', 'equalto', 'Available') | list | length > 0
+
+# =============================================================================
+# STEP 0.5: 🛡️ SAFETY GATE - PROTECTION AGAINST DEACTIVATING THE ACTIVE HUB
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.5.1) 🛡️ SAFETY LOCK - Block cleanup of a Hub that appears to be ACTIVE"
+  ansible.builtin.assert:
+    that:
+      - not acm_dr_hub_cleanup_looks_like_active_hub | bool or (acm_dr_hub_cleanup_force | default(false) | bool)
+    fail_msg:
+      - "❌ FAILED! Oh. No! => Context '{{ k8s_target_context }}' has a BackupSchedule"
+      - " ('{{ acm_dr_hub_cleanup_schedule_name }}') that is PRESENT and NOT PAUSED. This is a strong indication that"
+      - " this cluster is the PRIMARY/ACTIVE production Hub, not a passive DR node to be deactivated."
+      - "---------------------------------------------------------------------------------------------------"
+      - " Removing Red Hat ACM from an active Hub interrupts Disaster Recovery protection for the entire fleet."
+      - "---------------------------------------------------------------------------------------------------"
+      - " If you are CERTAIN this is the correct node (e.g., a failover already promoted another Hub as"
+      - " active and this one was left with the BackupSchedule forgotten without pausing), re-run adding:"
+      - "    -e acm_dr_hub_cleanup_force=true"
+      - "---------------------------------------------------------------------------------------------------"
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => No indication of active production Hub detected (or 'acm_dr_hub_cleanup_force'
+      override applied consciously). Proceeding with DR node deactivation.
+
+# =============================================================================
+# STEP 0.6: COMPLETION SUMMARY AND STAGE 00 STATUS
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.6.1) Display prerequisite validation completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/00_preflight_summary.j2').split('\n') }}"
+  run_once: true
+...

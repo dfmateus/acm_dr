@@ -1,0 +1,20 @@
+---
+# examples/scripts/testing/mock_data/split_brain.yml
+# Scenario 2: Split-brain. Both Hubs have active BackupSchedules, which
+# means two writers on the same shared storage. Expects "SPLIT-BRAIN DETECTED".
+_scenario_name: "split_brain"
+
+acm_dr_failover_manager_is_split_brain_detected: true
+acm_dr_failover_manager_active_hub_count: 2
+acm_dr_failover_manager_active_hub_list:
+  - "acm-primary-hub-sa"
+  - "acm-dr-hub-sa"
+acm_dr_failover_manager_topology_hub_schedules:
+  - context: "acm-primary-hub-sa"
+    is_active: true
+    schedule_exists: true
+  - context: "acm-dr-hub-sa"
+    is_active: true
+    schedule_exists: true
+
+...

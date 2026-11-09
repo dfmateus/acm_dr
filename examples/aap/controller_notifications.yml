@@ -1,0 +1,179 @@
+---
+# examples/aap/controller_notifications.yml
+#
+# Notification template definitions for Red Hat Ansible Automation Platform.
+# Compatible with the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES: replace before importing:
+#   {{ aap_organization }}              → Your AAP Organization name
+#   {{ aap_notification_webhook_url }}  → Incoming webhook URL for your platform (Slack, Teams, etc.) SENSITIVE
+#   {{ aap_slack_token }}               → Slack Bot OAuth token (xoxb-...), SENSITIVE: pass via vault or extra-var
+#   {{ aap_slack_channel }}             → Slack channel name including # (e.g., "#acm-dr-alerts")
+#   {{ aap_email_host }}                → SMTP server hostname (e.g., smtp.example.com)
+#   {{ aap_email_from }}                → From address for email notifications
+#   {{ aap_email_recipients }}          → Comma-separated list of recipient email addresses
+#
+# ⚠️ SECURITY: the Slack token and SMTP credentials are SENSITIVE.
+#   Never commit real values to version control. Pass via:
+#     -e "aap_slack_token=$(vault kv get -field=token secret/aap/slack)"
+#   or use ansible-vault:
+#     ansible-vault encrypt_string 'xoxb-...' --name aap_slack_token >> vault.yml
+#     ansible-playbook ... -e @vault.yml --ask-vault-pass
+#
+# ATTACHING NOTIFICATIONS TO TEMPLATES:
+#   After importing these notification templates, attach them to the target Job
+#   Templates and Workflow Job Templates either:
+#   a) Via the AAP UI: Template → Notifications tab → select events (Started, Success, Failure)
+#   b) Via CasC: add notification_templates_started/success/error lists to the template
+#      entries in controller_job_templates.yml or controller_workflow_job_templates.yml.
+#
+#   Recommended attachments:
+#     WF - ACM DR - LAB - Hub Switchover          → all 3 events (started, success, error)
+#     WF - ACM DR - LAB - Planned Maintenance  → all 3 events
+#     ACM DR - LAB - Hub Setup                 → error only (setup failures need immediate attention)
+#     ACM DR - LAB - Hub Cleanup               → all 3 events (irreversible operation)
+#
+# Usage:
+#   ansible-playbook -e @examples/aap/controller_notifications.yml \
+#     -e "controller_hostname=https://aap.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=changeme" \
+#     -e "aap_organization=ACM DR Operations" \
+#     -e "aap_slack_token=xoxb-REPLACE" \
+#     -e "aap_slack_channel=#acm-dr-alerts" \
+#     infra.controller_configuration.notifications
+
+controller_notifications:
+
+  # ---------------------------------------------------------------------------
+  # Slack - Hub Switchover Events
+  # ---------------------------------------------------------------------------
+  # Sends a Slack message to the configured channel when a DR failover (or failback)
+  # Workflow starts, succeeds, or fails. Attach this to both WF-01 (Hub Switchover)
+  # and WF-02 (Planned Maintenance Switchover).
+  #
+  # PREREQUISITES:
+  #   1. Create a Slack App at https://api.slack.com/apps with the chat:write scope.
+  #   2. Install the app to your workspace.
+  #   3. Copy the Bot OAuth Token (xoxb-...) to aap_slack_token.
+  #   4. Invite the bot to the target channel: /invite @<app-name>
+  - name: "Slack - ACM Hub Switchover Events"
+    description: >-
+      Slack notification for DR failover and failback events. Covers Workflow started,
+      succeeded, and failed states. Attach to WF-01 (Hub Switchover) and WF-02 (Planned
+      Maintenance Failover) for real-time operator awareness.
+    organization: "{{ aap_organization }}"
+    notification_type: slack
+    # messages: {} tells the module to use AAP default message templates.
+    # The field is required as a dict by infra.controller_configuration 3.x.
+    messages: {}
+    notification_configuration:
+      # Slack Bot OAuth Token. Sensitive - do not commit real values. Pass via vault or extra-var.
+      token: "{{ aap_slack_token | default('REPLACE_WITH_SLACK_BOT_TOKEN') }}"
+      channels:
+        # Channel name must include the # prefix. The bot must be invited to the channel.
+        - "{{ aap_slack_channel | default('REPLACE_WITH_SLACK_CHANNEL') }}"
+
+  # ---------------------------------------------------------------------------
+  # Slack - Lab Setup and Cleanup Events
+  # ---------------------------------------------------------------------------
+  # Separate notification for Hub Setup and Hub Cleanup jobs. Failures are critical
+  # (Hub may be left in a partial state); successes confirm infrastructure is ready.
+  - name: "Slack - ACM DR Lab Ops"
+    description: >-
+      Slack notification for Hub Setup and Hub Cleanup jobs. Attach to setup and cleanup
+      Job Templates with at minimum the "Failed" event enabled. Failures here often require
+      immediate operator intervention to prevent orphaned resources.
+    organization: "{{ aap_organization }}"
+    notification_type: slack
+    messages: {}
+    notification_configuration:
+      token: "{{ aap_slack_token | default('REPLACE_WITH_SLACK_BOT_TOKEN') }}"
+      channels:
+        - "{{ aap_slack_channel | default('REPLACE_WITH_SLACK_CHANNEL') }}"
+
+  # ---------------------------------------------------------------------------
+  # Webhook - Hub Switchover Events (platform-agnostic, Tier 1)
+  # ---------------------------------------------------------------------------
+  # Platform-agnostic webhook for DR failover and failback WJT events. Works with
+  # Slack incoming webhooks, MS Teams incoming webhooks, PagerDuty Events API, and
+  # any system that accepts an HTTP POST with a JSON body.
+  #
+  # HOW TO CONFIGURE:
+  #   1. Generate an incoming webhook URL on your platform:
+  #      - Slack:  https://api.slack.com/messaging/webhooks (App Incoming Webhooks)
+  #      - Teams:  channel Settings → Connectors → Incoming Webhook
+  #      - PagerDuty: Service → Integrations → Add integration → Events API v2
+  #   2. Pass the URL via -e "aap_notification_webhook_url=https://hooks.slack.com/..."
+  #      or ansible-vault. Never commit the real URL - it authenticates your webhook.
+  #   3. Attach to WF-01 (Hub Switchover) and WF-02 (Planned Maintenance) via the
+  #      notification_templates_started / success / error fields in the WJT CasC.
+  #
+  # NOTE: AAP's native webhook format is a fixed JSON schema (job name, status, URL).
+  # For context-rich notifications (approval timeout vs denial, Hub state after failure),
+  # use JT-10 (Check Approval Outcome) and JT-11 (Switchover State Diagnostics), which
+  # read NOTIF_WEBHOOK_URL from the ACM DR - Notification Webhook credential type.
+  - name: "ACM DR - Failover Events (Webhook)"
+    description: >-
+      Platform-agnostic webhook notification for DR failover and failback WJT events.
+      Fires on started, success, and error. Accepts any HTTP POST endpoint: Slack
+      incoming webhooks, MS Teams incoming webhooks, PagerDuty Events API, or generic
+      ITSM middleware. Attach to WF-01 (Hub Switchover) and WF-02 (Planned Maintenance).
+    organization: "{{ aap_organization }}"
+    notification_type: webhook
+    messages: {}
+    notification_configuration:
+      url: "{{ aap_notification_webhook_url | default('https://REPLACE-WITH-YOUR-WEBHOOK-URL') }}"
+      http_method: POST
+      username: ""
+      password: ""
+      headers: {}
+
+  # ---------------------------------------------------------------------------
+  # Webhook - Lab Ops Events (platform-agnostic, Tier 1)
+  # ---------------------------------------------------------------------------
+  # Platform-agnostic webhook for lab Hub Setup, Spoke Onboarding, and Full Lab
+  # Rebuild WJT events. Configured separately from the failover webhook so lab
+  # teams can route lab alerts to a different channel or endpoint.
+  #
+  # Configure the same way as ACM DR - Failover Events (Webhook) above.
+  # Attach to WF-03 (Full Lab Rebuild) and WF-04 (Spoke Onboarding Batch).
+  - name: "ACM DR - Lab Ops (Webhook)"
+    description: >-
+      Platform-agnostic webhook notification for lab Hub Setup, Spoke Onboarding
+      Batch, and Full Lab Rebuild WJT events. Fires on success and error. Attach to
+      WF-03 (Full Lab Rebuild) and WF-04 (Spoke Onboarding Batch).
+    organization: "{{ aap_organization }}"
+    notification_type: webhook
+    messages: {}
+    notification_configuration:
+      url: "{{ aap_notification_webhook_url | default('https://REPLACE-WITH-YOUR-WEBHOOK-URL') }}"
+      http_method: POST
+      username: ""
+      password: ""
+      headers: {}
+
+  # ---------------------------------------------------------------------------
+  # Email - Hub Switchover Events (optional)
+  # ---------------------------------------------------------------------------
+  # Email alternative for environments where Slack is not available. Disabled by
+  # default; uncomment and fill in SMTP details to activate.
+  #
+  # - name: "Email - ACM Hub Switchover Events"
+  #   description: >-
+  #     Email notification for DR failover and failback events.
+  #     Attach to Workflow Templates as a fallback to Slack notifications.
+  #   organization: "{{ aap_organization }}"
+  #   notification_type: email
+  #   notification_configuration:
+  #     host: "{{ aap_email_host | default('smtp.example.com') }}"
+  #     port: 587  # integer - SMTP submission port (TLS); use 465 for SMTPS
+  #     username: "{{ aap_email_username | default('') }}"
+  #     password: "{{ aap_email_password | default('') }}"  # sensitive - use vault
+  #     use_tls: true
+  #     use_ssl: false
+  #     sender: "{{ aap_email_from | default('acm-dr@example.com') }}"
+  #     recipients:
+  #       - "{{ aap_email_recipients | default('ops-team@example.com') }}"
+  #     subject: "AAP {{ job_status }}: {{ job.name }}"
+...

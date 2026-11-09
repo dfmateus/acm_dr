@@ -1,0 +1,21 @@
+{# OADP OLM Subscription for AWS STS clusters (ROSA HCP).
+   On non-STS clusters, the MCH cluster-backup component auto-provisions this.
+   On STS clusters, OADP must be installed manually BEFORE enabling cluster-backup
+   per the RHACM 2.17 Business Continuity docs:
+   https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index
+   The Subscription name and spec.name match the MCH-generated resource so OLM
+   does not see a conflict. The channel is resolved from the PackageManifest
+   defaultChannel (varies by OCP version: "stable-1.4" on 4.18, "stable" on 4.22+).
+   The channel value uses the dynamically resolved fact from the PackageManifest
+   (task 5.1.1b), falling back to the role default if resolution was skipped. #}
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: "{{ acm_dr_hub_setup_oadp_subscription_cr_name }}"
+  namespace: "{{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}"
+spec:
+  channel: "{{ acm_dr_hub_setup_oadp_resolved_channel | default(acm_dr_hub_setup_oadp_channel) }}"
+  installPlanApproval: Automatic
+  name: "{{ acm_dr_hub_setup_oadp_subscription_name }}"
+  source: "{{ acm_dr_hub_setup_oadp_source }}"
+  sourceNamespace: openshift-marketplace

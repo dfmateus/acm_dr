@@ -1,0 +1,30 @@
+---
+galaxy_info:
+  role_name: acm_dr_kubeconfig_resolver
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Runtime kubeconfig assembly from per-cluster credentials. Bridges
+    AAP custom credential types and CLI workflows into a unified
+    kubeconfig for all downstream roles.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "9"
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - rhacm
+    - kubernetes
+    - openshift
+    - kubeconfig
+    - credentials
+    - aap
+    - dr
+
+dependencies: []
+...

@@ -1,0 +1,11 @@
+# .shellcheckrc - ShellCheck project configuration
+# Run: shellcheck scripts/*.sh
+# Install: dnf install ShellCheck (Fedora) / apt install shellcheck (Debian/Ubuntu)
+
+# Default shell dialect
+shell=bash
+
+# SC2086: Double quote to prevent globbing and word splitting
+# Disabled - oc/kubectl arguments are intentionally unquoted in several scripts
+# (e.g. context names, jsonpath expressions passed as variables)
+disable=SC2086

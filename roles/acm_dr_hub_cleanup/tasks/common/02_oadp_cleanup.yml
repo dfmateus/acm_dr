@@ -1,0 +1,205 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 02 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 02 - OADP Cleanup] | Display OADP configuration removal metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "🛡️ STAGE 02 - Remove BackupSchedule/DataProtectionApplication (OADP)"
+    acm_dr_hub_cleanup_banner_lines:
+      - "⚠️  The Red Hat OADP Operator and its namespace are PRESERVED (not removed)"
+  run_once: true
+
+# =============================================================================
+# STEP 2.0: REMOVE RESTORE CRs (PASSIVE SYNC AND ORPHANED RESTORES)
+# =============================================================================
+# Discovers and removes all ACM Restore CRs in the OADP namespace. This ensures
+# no orphaned passive sync Restore CRs remain after decommissioning. Without
+# this step, a passive hub's sync Restore would continue running even after ACM
+# is removed, because the Restore CRD belongs to the cluster-backup-operator
+# (not the MultiClusterHub operator).
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.0.1) Discover existing Restore CRs in OADP namespace - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+  register: acm_dr_hub_cleanup_discovered_restores
+  # CRD may not exist if ACM backup components were never installed
+  failed_when: false
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.0.2) Remove discovered Restore CRs - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+    name: "{{ item.metadata.name }}"
+  loop: "{{ acm_dr_hub_cleanup_discovered_restores.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: acm_dr_hub_cleanup_discovered_restores.resources | default([]) | length > 0
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# ---- Restore CR finalizer break-glass (2.0.3 - 2.0.5) ----
+# The cluster-backup controller handles the Restore CR finalizer
+# (restores.cluster.open-cluster-management.io/finalizer). If the controller
+# is stuck waiting for Velero Restores that will never finish (e.g. an
+# InProgress restore referencing a backup from a Hub that no longer exists),
+# the Restore CR stays in Terminating indefinitely and blocks the MCH
+# operator's cluster-backup component teardown. Real finding confirmed in
+# TC-07.2 testing (2026-08-10): restore-passive-sync stuck for 7+ hours
+# because a Velero Restore was InProgress with deletionTimestamp set.
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.0.3) Wait for ACM Restore CRs to disappear - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+  register: acm_dr_hub_cleanup_restore_cr_check
+  until: acm_dr_hub_cleanup_restore_cr_check.resources | default([]) | length == 0
+  retries: "{{ (acm_dr_hub_cleanup_restore_cr_wait_timeout | int / 10) | int }}"
+  delay: 10  # seconds
+  when:
+    - acm_dr_hub_cleanup_discovered_restores.resources | default([]) | length > 0
+    - not (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+  # CRD may be gone already
+  failed_when: false
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.0.4) Force-remove stuck Restore CR finalizers (inline break-glass) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: Restore
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: "{{ acm_dr_hub_cleanup_restore_cr_check.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when:
+    - acm_dr_hub_cleanup_restore_cr_check.resources | default([]) | length > 0
+    - not (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+  failed_when: false
+
+# Velero Restore objects (restore.velero.io) can also get stuck InProgress
+# with a deletionTimestamp when the backup controller deletes the ACM Restore
+# CR. Clean them up so the cluster-backup InternalHubComponent can finalize.
+- name: "[STAGE 02 - OADP Cleanup] | 2.0.5a) Discover stuck Velero Restore objects - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: velero.io/v1
+    kind: Restore
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+  register: acm_dr_hub_cleanup_velero_restores
+  failed_when: false
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.0.5b) Force-remove finalizers from stuck Velero Restore objects - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    api_version: velero.io/v1
+    kind: Restore
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: >-
+    {{
+      acm_dr_hub_cleanup_velero_restores.resources | default([])
+      | selectattr('metadata.deletionTimestamp', 'defined')
+      | list
+    }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when:
+    - acm_dr_hub_cleanup_velero_restores.resources | default([]) | selectattr('metadata.deletionTimestamp', 'defined') | list | length > 0
+    - not (acm_dr_hub_cleanup_dry_run | default(false) | bool)
+  failed_when: false
+
+# =============================================================================
+# STEP 2.1: REMOVE BACKUPSCHEDULE (STOPS GENERATING NEW ACM BACKUPS)
+# =============================================================================
+# Note: deleting the BackupSchedule only removes the scheduling (Velero Schedule)
+# managed by ACM. Existing Backups in Azure are NOT deleted by
+# this action; they remain intact until they expire by Velero's own TTL.
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.1.1) Remove RHACM BackupSchedule CR - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: cluster.open-cluster-management.io/v1beta1
+    kind: BackupSchedule
+    name: "{{ acm_dr_hub_cleanup_schedule_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# =============================================================================
+# STEP 2.2: REMOVE DATAPROTECTIONAPPLICATION (DISMOUNTS VELERO/NODE AGENT)
+# =============================================================================
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.2.1) Remove DataProtectionApplication CR (wait for Velero dismount) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: oadp.openshift.io/v1alpha1
+    kind: DataProtectionApplication
+    name: "{{ acm_dr_hub_cleanup_oadp_dpa_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}"
+  register: acm_dr_hub_cleanup_dpa_removal
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  ignore_errors: true
+
+- name: "[STAGE 02 - OADP Cleanup DIAGNOSTIC] | ❌ DPA removal timed out"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => DataProtectionApplication '{{ acm_dr_hub_cleanup_oadp_dpa_name }}'
+      removal timed out after {{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}s
+      on context '{{ k8s_target_context }}'.
+      The OADP operator may be unable to reconcile the deletion.
+      Check DPA finalizers and operator logs: oc get dpa -n {{ acm_dr_hub_cleanup_oadp_namespace }}
+      -o yaml --context {{ k8s_target_context }}.
+  when:
+    - acm_dr_hub_cleanup_dpa_removal is defined
+    - acm_dr_hub_cleanup_dpa_removal is failed
+
+# =============================================================================
+# STEP 2.3: REMOVE CLOUD CREDENTIALS SECRET FOR VELERO
+# =============================================================================
+# The secret name is "cloud-credentials" (standardized across all providers
+# for OADP 1.6+ compatibility), set in defaults/main.yml.
+
+- name: "[STAGE 02 - OADP Cleanup] | 2.3.1) Remove cloud credentials Secret - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "{{ acm_dr_hub_cleanup_oadp_cloud_secret_name }}"
+    namespace: "{{ acm_dr_hub_cleanup_oadp_namespace }}"
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# =============================================================================
+# STEP 2.4: COMPLETION SUMMARY AND STAGE 02 STATUS
+# =============================================================================
+
+- name: "[STAGE 02 - OADP Cleanup] | Display OADP configuration removal completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/02_oadp_cleanup_summary.j2').split('\n') }}"
+  run_once: true
+...

@@ -1,0 +1,63 @@
+---
+# examples/aap/controller_inventories.yml
+#
+# Inventory and host definitions for Red Hat Ansible Automation Platform.
+# Compatible with the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES - replace before importing:
+#   {{ aap_organization }} → Your AAP Organization name
+#   {{ aap_inventory }}    → Your localhost Inventory name (e.g., "localhost Inventory")
+#                            Must match the value used in controller_job_templates.yml.
+#
+# WHY A LOCALHOST INVENTORY:
+#   Every playbook in this collection runs with `hosts: localhost` and targets the
+#   Kubernetes/OpenShift API via the kubernetes.core modules. No SSH connections
+#   are made to any managed node. The inventory is a required field in AAP but it
+#   exists purely to satisfy the platform's data model - it is not the cluster inventory.
+#   All cluster targeting happens through kubeconfig contexts and per-cluster credentials.
+#
+# Usage:
+#   ansible-playbook -e @examples/aap/controller_inventories.yml \
+#     -e "controller_hostname=https://aap.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=changeme" \
+#     -e "aap_organization=ACM DR Operations" \
+#     -e "aap_inventory=localhost Inventory" \
+#     infra.controller_configuration.inventories
+#   # Then add the localhost host:
+#   ansible-playbook -e @examples/aap/controller_inventories.yml \
+#     ... \
+#     infra.controller_configuration.hosts
+#
+# IMPORT ORDER: create the organization first, then inventories, then hosts.
+
+controller_inventories:
+
+  # ---------------------------------------------------------------------------
+  # Localhost Inventory
+  # ---------------------------------------------------------------------------
+  - name: "{{ aap_inventory }}"
+    description: >-
+      Single-host localhost inventory for ACM DR automation. All playbooks target
+      the Kubernetes API via kubeconfig - not SSH - so this inventory exists only
+      to satisfy the AAP data model. The actual cluster targets come from the
+      per-cluster credentials attached at job launch time.
+    organization: "{{ aap_organization }}"
+    # No dynamic inventory source - localhost is always reachable from the EE container.
+    # variables must be a dict for infra.controller_configuration 3.x (not a block scalar string)
+    variables:
+      ansible_connection: local
+
+# ---------------------------------------------------------------------------
+# Localhost Host
+# ---------------------------------------------------------------------------
+# Defined separately so this file can drive both the inventories and hosts roles
+# in a single ansible-playbook invocation (load both variable keys from the same file).
+controller_hosts:
+
+  - name: localhost
+    inventory: "{{ aap_inventory }}"
+    description: "Execution node - the AAP EE container itself. Targets Kubernetes API via kubeconfig."
+    variables:
+      ansible_connection: local
+...

@@ -1,0 +1,392 @@
+---
+# roles/acm_dr_failover_manager/tasks/01_discover_fleet.yml
+
+- name: "[STAGE 01 - Discover Fleet] | Display discovery stage header"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🌐 STAGE 01 - Discover Fleet (ManagedCluster Mapping)"
+    acm_dr_failover_manager_banner_lines:
+      - "🌐 SOURCE HUB: {{ active_hub }}"
+      - "{{ '🔎 MODE: DRY-RUN (simulation - no changes applied)' if (acm_dr_failover_manager_dry_run | default(false) | bool) else '🔥 MODE: PRODUCTION (live changes active)' }}"
+  run_once: true
+
+- name: "[STAGE 01 - Discover Fleet] | 1.1.1) Map ManagedClusters on the Source Hub - {{ active_hub }}"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+  register: acm_dr_failover_manager_managed_clusters
+
+- name: "[STAGE 01 - Discover Fleet] | 1.1.2) Filter local-cluster and structure active Spoke metadata"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_spoke_fleet: "{{ raw_fleet_json | from_json }}"
+    acm_dr_failover_manager_spoke_list: >-
+      {{ acm_dr_failover_manager_managed_clusters.resources
+        | map(attribute='metadata.name')
+        | reject('equalto', 'local-cluster')
+        | list }}
+  vars:
+    raw_fleet_json: >-
+      {% set fleet = [] %}
+      {% for cluster in acm_dr_failover_manager_managed_clusters.resources %}
+        {% if cluster.metadata.name != 'local-cluster' %}
+          {% set claims = cluster.status.clusterClaims | default([]) %}
+          {% set prod_claim = claims
+            | selectattr('name', 'equalto', 'product.open-cluster-management.io')
+            | map(attribute='value')
+            | first
+            | default(cluster.metadata.labels.vendor | default('N/A')) %}
+          {% set plat_claim = claims
+            | selectattr('name', 'equalto', 'platform.open-cluster-management.io')
+            | map(attribute='value')
+            | first
+            | default(cluster.metadata.labels.cloud | default('N/A')) %}
+          {% set kube_ver = cluster.status.version.kubernetes | default('N/A') %}
+          {% set ocp_ver = cluster.metadata.labels.openshiftVersion | default('N/A') %}
+          {% set client_configs = cluster.spec.managedClusterClientConfigs | default([{}]) %}
+          {% set api_url = client_configs[0].url | default('N/A') %}
+          {% set _ = fleet.append({
+            'name': cluster.metadata.name,
+            'product': prod_claim,
+            'platform': plat_claim,
+            'kubernetes_version': kube_ver,
+            'openshift_version': ocp_ver,
+            'api_url': api_url
+          }) %}
+        {% endif %}
+      {% endfor %}
+      {{ fleet | to_json }}
+
+- name: "[STAGE 01 - Discover Fleet] | 1.1.3) Structured log of the identified Spoke fleet"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/spoke_fleet_report.j2').split('\n') }}"
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# 1.2 - Fleet-wide version compatibility assessment (Planned Maintenance)
+# ---------------------------------------------------------------------------
+
+- name: "[STAGE 01 - Discover Fleet] | 1.2.1) Build fleet-wide compatibility assessment against destination RHACM"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_fleet_compat: "{{ compat_list_json | from_json }}"
+    acm_dr_failover_manager_fleet_compat_all_ok: >-
+      {{ (compat_list_json | from_json)
+         | rejectattr('dest_rhacm_supported', 'equalto', true)
+         | list | length == 0 }}
+    acm_dr_failover_manager_fleet_compat_incompatible_count: >-
+      {{ (compat_list_json | from_json)
+         | rejectattr('dest_rhacm_supported', 'equalto', true)
+         | list | length }}
+  vars:
+    dest_minor: "{{ acm_dr_failover_manager_effective_acm_minor | default(acm_dr_failover_manager_dest_acm_minor | default('Unknown')) | trim }}"
+    supported_ocp_list: "{{ acm_dr_failover_manager_acm_ocp_matrix[dest_minor] | default([]) }}"
+    compat_list_json: >-
+      {% set result = [] %}
+      {% for spoke in acm_dr_failover_manager_spoke_fleet %}
+        {% set ocp_ver = spoke.openshift_version | default('N/A') | trim %}
+        {% if ocp_ver == 'N/A' or ocp_ver == '' %}
+          {% set ocp_minor = 'N/A' %}
+          {% set supported = true %}
+        {% else %}
+          {% set ocp_minor = ocp_ver.split('.')[:2] | join('.') %}
+          {% if dest_minor == 'Unknown' or supported_ocp_list | length == 0 %}
+            {% set supported = true %}
+          {% else %}
+            {% set supported = (ocp_minor in supported_ocp_list) %}
+          {% endif %}
+        {% endif %}
+        {% set _ = result.append({
+          'name': spoke.name,
+          'product': spoke.product | default('N/A'),
+          'openshift_version': ocp_ver,
+          'kubernetes_version': spoke.kubernetes_version | default('N/A'),
+          'ocp_minor': ocp_minor,
+          'dest_rhacm_supported': supported
+        }) %}
+      {% endfor %}
+      {{ result | to_json }}
+  when:
+    - (acm_dr_failover_manager_version_check | default(true)) | bool
+    - acm_dr_failover_manager_spoke_fleet is defined
+    - acm_dr_failover_manager_spoke_fleet | length > 0
+
+- name: "[STAGE 01 - Discover Fleet] | 1.2.2) Display fleet-wide version compatibility report"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/fleet_compatibility_report.j2').split('\n') }}"
+  run_once: true
+  when:
+    - (acm_dr_failover_manager_version_check | default(true)) | bool
+    - acm_dr_failover_manager_fleet_compat is defined
+
+- name: "[STAGE 01 - Discover Fleet] | 1.2.3) 🛡️ Fleet compatibility gate: block if Spokes incompatible with destination RHACM"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (acm_dr_failover_manager_skip_version_gate | default(false)) | bool
+        or (acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim == 'Unknown')
+        or (acm_dr_failover_manager_fleet_compat_all_ok | default(true)) | bool
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => FLEET COMPATIBILITY GATE FAILED:
+      {{ acm_dr_failover_manager_fleet_compat_incompatible_count | default(0) }} Spoke(s) run
+      an OCP version NOT supported by RHACM
+      {{ acm_dr_failover_manager_effective_acm_version | default(acm_dr_failover_manager_dest_acm_version | default('Unknown')) | trim }}.
+      Supported OCP range for RHACM
+      {{ acm_dr_failover_manager_effective_acm_minor | default(acm_dr_failover_manager_dest_acm_minor | default('Unknown')) | trim }}:
+      {{ acm_dr_failover_manager_acm_ocp_matrix[acm_dr_failover_manager_effective_acm_minor | default(acm_dr_failover_manager_dest_acm_minor | default('Unknown')) | trim] | default(['matrix entry missing']) | join(', ') }}.
+      Incompatible Spokes:
+      {{ acm_dr_failover_manager_fleet_compat | default([])
+         | rejectattr('dest_rhacm_supported', 'equalto', true)
+         | map(attribute='name') | list | join(', ') }}.
+      Override with: -e acm_dr_failover_manager_skip_version_gate=true
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Fleet compatibility gate passed. All
+      {{ acm_dr_failover_manager_spoke_fleet | default([]) | length }} Spoke(s) are
+      compatible with RHACM
+      {{ acm_dr_failover_manager_effective_acm_version | default(acm_dr_failover_manager_dest_acm_version | default('Unknown')) | trim }}.
+  when:
+    - (acm_dr_failover_manager_version_check | default(true)) | bool
+    - acm_dr_failover_manager_fleet_compat is defined
+
+# ---------------------------------------------------------------------------
+# 1.3 - Spoke kubeconfig context pre-validation
+# ---------------------------------------------------------------------------
+# Catches missing Spoke contexts in the runtime kubeconfig BEFORE any
+# mutations happen (Stage 02 fences the Hubs). Without this check, the
+# failover pauses schedules and creates a Restore, then fails at Stage 07
+# fleet reconnection when a context is missing - leaving both Hubs fenced
+# and requiring manual recovery.
+
+# Resolve each Spoke's expected kubeconfig context name using the same logic
+# as Stage 07 (spoke_context_map override, then default suffix).
+- name: "[STAGE 01 - Discover Fleet] | 1.3.1) Resolve expected Spoke kubeconfig contexts"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_expected_spoke_contexts: >-
+      {% set ns = namespace(items=[]) %}
+      {% for spoke in acm_dr_failover_manager_spoke_list %}
+        {% set ctx = (acm_dr_failover_manager_spoke_context_map | default({}))[spoke]
+           | default(spoke ~ (acm_dr_failover_manager_spoke_context_suffix | default('-sa'))) %}
+        {% set _ = ns.items.append({'spoke': spoke, 'context': ctx}) %}
+      {% endfor %}
+      {{ ns.items | to_json }}
+
+# Use kubectl to list available contexts from the runtime kubeconfig (or the
+# monolithic kubeconfig fallback). kubectl reads the same file that
+# kubernetes.core modules will use during Stage 07.
+- name: "[STAGE 01 - Discover Fleet] | 1.3.2) List available contexts in runtime kubeconfig"
+  ansible.builtin.command: >-
+    kubectl config get-contexts -o name
+  environment:
+    KUBECONFIG: "{{ acm_dr_kubeconfig_path | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true), true) }}"
+  register: acm_dr_failover_manager_available_contexts
+  changed_when: false
+  failed_when: acm_dr_failover_manager_available_contexts.rc != 0
+  check_mode: false  # read-only; must run in --check to validate spoke context gate
+
+# Compare each expected context against the available list and collect misses.
+- name: "[STAGE 01 - Discover Fleet] | 1.3.3) Identify Spokes with missing kubeconfig contexts"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_missing_spoke_contexts: >-
+      {{ (acm_dr_failover_manager_expected_spoke_contexts | from_json)
+         | rejectattr('context', 'in', acm_dr_failover_manager_available_contexts.stdout_lines | default([]))
+         | list }}
+
+# For Spokes that have no fleet kubeconfig context, check if the Source Hub holds
+# a mirrored SA token Secret (written by spoke_manager action=prep, task 1.6.2).
+# A present Secret means Stage 07 Operation C can reconnect this Spoke using
+# host+token directly, so the context gate should not abort the failover for it.
+- name: "[STAGE 01 - Discover Fleet] | 1.3.3b) Check Source Hub for mirrored SA tokens (Operation C candidates)"
+  kubernetes.core.k8s_info:
+    context: "{{ active_hub }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_failover_manager_hub_token_mirror_namespace }}"
+    name: "{{ acm_dr_failover_manager_hub_token_mirror_prefix }}{{ item.spoke }}-sa-token"
+  loop: "{{ acm_dr_failover_manager_missing_spoke_contexts }}"
+  loop_control:
+    label: "{{ item.spoke }}"
+  register: acm_dr_failover_manager_mirror_token_check
+  no_log: true  # resources field carries token data
+  when: acm_dr_failover_manager_missing_spoke_contexts | length > 0
+
+# Build two disjoint lists from the mirror token check:
+#   unrecoverable_spokes: no context AND no mirrored Secret - hard gate failure
+#   operation_c_spokes:   no context BUT mirrored Secret present - Stage 07 handles them
+- name: "[STAGE 01 - Discover Fleet] | 1.3.3c) Classify Spokes as Operation C recoverable or unrecoverable"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_unrecoverable_spokes: >-
+      {{ acm_dr_failover_manager_mirror_token_check.results
+         | default([])
+         | selectattr('resources', 'defined')
+         | selectattr('resources', 'equalto', [])
+         | map(attribute='item.spoke')
+         | list }}
+    acm_dr_failover_manager_operation_c_spokes: >-
+      {{ (acm_dr_failover_manager_missing_spoke_contexts | map(attribute='spoke') | list)
+         | difference(
+             acm_dr_failover_manager_mirror_token_check.results
+             | default([])
+             | selectattr('resources', 'defined')
+             | selectattr('resources', 'equalto', [])
+             | map(attribute='item.spoke')
+             | list
+           ) }}
+  when: acm_dr_failover_manager_missing_spoke_contexts | length > 0
+
+- name: "[STAGE 01 - Discover Fleet] | 1.3.3d) ⚠️ Report Spokes that will use Operation C reconnection (no fleet kubeconfig context)"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ {{ acm_dr_failover_manager_operation_c_spokes | length }} Spoke(s) have no fleet kubeconfig
+      context but have a mirrored SA token Secret on the Source Hub. Stage 07 will reconnect them
+      via Operation C (host + token from
+      '{{ acm_dr_failover_manager_hub_token_mirror_namespace }}/{{ acm_dr_failover_manager_hub_token_mirror_prefix }}<spoke>-sa-token'):
+      {{ acm_dr_failover_manager_operation_c_spokes | join(', ') }}.
+  when:
+    - acm_dr_failover_manager_missing_spoke_contexts | length > 0
+    - (acm_dr_failover_manager_operation_c_spokes | default([])) | length > 0
+
+# Gate: abort only if a Spoke is missing both a kubeconfig context AND a mirrored
+# SA token Secret. Those Spokes are genuinely unrecoverable - Stage 07 has no path
+# to reconnect them after the Hub mutations (fencing, Restore) commit.
+# Spokes with a mirrored token pass here and reconnect via Operation C in Stage 07.
+- name: "[STAGE 01 - Discover Fleet] | 1.3.4) 🛡️ Spoke context gate: block if any Spoke is unrecoverable (no context, no mirrored token)"
+  ansible.builtin.assert:
+    that:
+      - (acm_dr_failover_manager_unrecoverable_spokes | default([]) | length) == 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => SPOKE CONTEXT GATE FAILED:
+      {{ acm_dr_failover_manager_unrecoverable_spokes | default([]) | length }} Spoke(s) are missing
+      from the runtime kubeconfig AND have no mirrored SA token Secret on the Source Hub.
+      Fleet reconnection at Stage 07 would fail after mutations (fencing, Restore) have already been applied.
+      Unrecoverable: {{ acm_dr_failover_manager_unrecoverable_spokes | default([]) | join(', ') }}.
+      Fix: run 'Spoke Lifecycle action=prep' with an 'ACM DR - Spoke Cluster' credential attached.
+      The prep action mirrors the permanent SA token to
+      '{{ acm_dr_failover_manager_hub_token_mirror_namespace }}/{{ acm_dr_failover_manager_hub_token_mirror_prefix }}<spoke>-sa-token'
+      on the Source Hub, enabling Operation C reconnection in Stage 07 without a fleet kubeconfig.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => All {{ acm_dr_failover_manager_spoke_list | length }} Spoke(s) accounted for.
+      {{ (acm_dr_failover_manager_spoke_list | length) - (acm_dr_failover_manager_missing_spoke_contexts | default([]) | length) }}
+      via fleet kubeconfig context,
+      {{ acm_dr_failover_manager_operation_c_spokes | default([]) | length }} via Operation C mirrored token.
+  when:
+    - acm_dr_failover_manager_spoke_list | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+# =============================================================================
+# 1.4 - SPOKE API CONNECTIVITY PROBE
+# =============================================================================
+# After validating that kubeconfig contexts exist (1.3.x), probe each Spoke's
+# API to detect clusters that are unreachable (deactivated without detach,
+# network partition, maintenance window). Follows the same pattern as
+# 05a_recycle_passive_hubs.yml: probe with failed_when: false, warn, filter
+# to reachable, operate on reachable only. Unreachable Spokes are listed in
+# the compliance report (Stage 08) and skipped during sanitization (Stage 07)
+# and verification (Stage 04).
+
+# Probe the Spoke API by fetching the 'default' namespace (guaranteed to exist
+# on any Kubernetes cluster). The query runs via the Spoke's kubeconfig context,
+# not the Hub API, so a timeout or connection refused means the cluster is down.
+- name: "[STAGE 01 - Discover Fleet] | 1.4.1) Probe Spoke API reachability"
+  kubernetes.core.k8s_info:
+    context: "{{ item.context }}"
+    api_version: v1
+    kind: Namespace
+    name: default
+  loop: "{{ acm_dr_failover_manager_expected_spoke_contexts | from_json }}"
+  loop_control:
+    label: "{{ item.spoke }} ({{ item.context }})"
+  register: acm_dr_failover_manager_spoke_connectivity
+  failed_when: false
+  when:
+    - acm_dr_failover_manager_spoke_list | length > 0
+    - not (acm_dr_failover_manager_dry_run | default(false) | bool)
+
+# Emit a per-Spoke warning for each unreachable cluster so the operator sees
+# exactly which Spokes will be skipped and can take corrective action.
+- name: "[STAGE 01 - Discover Fleet] | 1.4.2) ⚠️ Warn about unreachable Spokes"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ [SPOKE UNREACHABLE]: Cannot reach Spoke '{{ item.item.spoke }}' via context
+      '{{ item.item.context }}'. This Spoke will be SKIPPED during sanitization (Stage 07)
+      and verification (Stage 04). If this cluster was permanently deactivated, run a
+      detach operation (acm_dr_spoke_manager_action=detach) to remove it from the fleet.
+  loop: "{{ acm_dr_failover_manager_spoke_connectivity.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.spoke | default('unknown') }}"
+  when:
+    - acm_dr_failover_manager_spoke_connectivity is defined
+    - acm_dr_failover_manager_spoke_connectivity.results is defined
+    - item.resources is not defined or item.resources | length == 0
+
+# Build the reachable list from probe results: Spokes whose API returned at
+# least one resource (the 'default' namespace). Uses the same selectattr
+# pattern as 05a_recycle_passive_hubs.yml.
+- name: "[STAGE 01 - Discover Fleet] | 1.4.3) Build reachable Spoke list"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_reachable_spoke_list: >-
+      {{ acm_dr_failover_manager_spoke_connectivity.results | default([])
+         | selectattr('resources', 'defined')
+         | selectattr('resources', 'ne', [])
+         | map(attribute='item')
+         | map(attribute='spoke')
+         | list }}
+  when:
+    - acm_dr_failover_manager_spoke_connectivity is defined
+    - acm_dr_failover_manager_spoke_connectivity.results is defined
+
+# Unreachable list is the complement: every Spoke in the fleet that is not in
+# the reachable list. Using difference() avoids duplicating the filter logic.
+- name: "[STAGE 01 - Discover Fleet] | 1.4.4) Build unreachable Spoke list (complement of reachable)"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_unreachable_spoke_list: >-
+      {{ acm_dr_failover_manager_spoke_list
+         | difference(acm_dr_failover_manager_reachable_spoke_list | default([])) }}
+  when:
+    - acm_dr_failover_manager_spoke_connectivity is defined
+    - acm_dr_failover_manager_spoke_connectivity.results is defined
+
+# In dry-run mode or when the fleet is empty, the probe does not run. Default
+# all Spokes to reachable so downstream tasks use the full list without error.
+- name: "[STAGE 01 - Discover Fleet] | 1.4.5) Default reachable list (probe skipped)"
+  ansible.builtin.set_fact:
+    acm_dr_failover_manager_reachable_spoke_list: "{{ acm_dr_failover_manager_spoke_list }}"
+    acm_dr_failover_manager_unreachable_spoke_list: []
+  when:
+    - acm_dr_failover_manager_spoke_connectivity is not defined
+      or acm_dr_failover_manager_spoke_connectivity.results is not defined
+
+# Hard gate: when fail_on_unreachable_spokes is true, abort the pipeline
+# before any mutations (fencing, Restore) if any Spoke cannot be reached.
+- name: "[STAGE 01 - Discover Fleet] | 1.4.6) 🛡️ Unreachable Spoke gate"
+  ansible.builtin.assert:
+    that:
+      - (acm_dr_failover_manager_unreachable_spoke_list | default([]) | length) == 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => {{ acm_dr_failover_manager_unreachable_spoke_list | length }}
+      Spoke(s) are unreachable: {{ acm_dr_failover_manager_unreachable_spoke_list | join(', ') }}.
+      Set acm_dr_failover_manager_fail_on_unreachable_spokes=false to skip unreachable
+      Spokes with a warning instead of aborting.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => All {{ acm_dr_failover_manager_reachable_spoke_list | default([]) | length }}
+      Spoke(s) are reachable.
+  when:
+    - (acm_dr_failover_manager_fail_on_unreachable_spokes | default(false)) | bool
+    - (acm_dr_failover_manager_unreachable_spoke_list | default([]) | length) > 0
+
+# Summary banner: shows fleet reachability at a glance. Only displayed when
+# at least one Spoke is unreachable (otherwise the context gate already
+# confirmed everything is present).
+- name: "[STAGE 01 - Discover Fleet] | 1.4.7) Display Spoke reachability summary"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_failover_manager_banner_title: "🌐 SPOKE FLEET REACHABILITY"
+    acm_dr_failover_manager_banner_sep_char: "-"
+    acm_dr_failover_manager_banner_lines:
+      - " 📋 TOTAL SPOKES IN FLEET:  {{ acm_dr_failover_manager_spoke_list | length }}"
+      - " ✅ REACHABLE:              {{ acm_dr_failover_manager_reachable_spoke_list | default([]) | length }}"
+      - " ⚠️  UNREACHABLE (SKIPPED):  {{ acm_dr_failover_manager_unreachable_spoke_list | default([]) | length }}"
+      - "    {{ acm_dr_failover_manager_unreachable_spoke_list | default([]) | join(', ') }}"
+  when:
+    - (acm_dr_failover_manager_unreachable_spoke_list | default([]) | length) > 0
+...

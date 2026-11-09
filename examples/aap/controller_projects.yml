@@ -1,0 +1,66 @@
+---
+# examples/aap/controller_projects.yml
+#
+# Project definition for Red Hat Ansible Automation Platform.
+# Compatible with the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES: replace before importing:
+#   {{ aap_organization }} → Your AAP Organization name
+#   {{ aap_project }}      → Your project name (e.g., "ACM DR Orchestrator")
+#                            Must match the value used in controller_job_templates.yml.
+#   {{ aap_scm_url }}      → Git repository URL for your deployment environment.
+#                            LAB default: file:///tmp/acm_dr_orchestrator.git
+#                            Production: https://github.com/<your-org>/ansible-acm-dr.git
+#
+# LAB vs PRODUCTION SCM URL:
+#   The AAP instance in this lab uses a local git repo inside the EE container at
+#   /tmp/acm_dr_orchestrator.git (pushed via the 4-step bare-repo sync procedure).
+#   For production, replace with a real git URL and set scm_credential if the repo
+#   is private. The aap_scm_url extra-var makes this switchable without editing this file.
+#
+# Usage:
+#   # Lab environment (local git):
+#   ansible-playbook -e @examples/aap/controller_projects.yml \
+#     -e "controller_hostname=https://aap.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=changeme" \
+#     -e "aap_organization=ACM DR Operations" \
+#     -e "aap_project=ACM DR Orchestrator" \
+#     -e "aap_scm_url=file:///tmp/acm_dr_orchestrator.git" \
+#     infra.controller_configuration.projects
+#
+#   # Production (GitHub, public repo):
+#   ... -e "aap_scm_url=https://github.com/<your-org>/ansible-acm-dr.git" ...
+#
+# IMPORT ORDER: create the organization first, then projects.
+
+controller_projects:
+
+  # ---------------------------------------------------------------------------
+  # ACM DR Orchestrator Project
+  # ---------------------------------------------------------------------------
+  - name: "{{ aap_project }}"
+    description: >-
+      RHACM Multi-Cluster Business Continuity playbooks. Source for all
+      ACM DR Job Templates and Workflow Templates. Lab environments use a local
+      git repo inside the EE container; production environments point to a shared
+      git server.
+    organization: "{{ aap_organization }}"
+    scm_type: git
+    # aap_scm_url is passed as an extra-var at import time.
+    # LAB: file:///tmp/acm_dr_orchestrator.git
+    # Production: https://github.com/<your-org>/ansible-acm-dr.git
+    scm_url: "{{ aap_scm_url | default('REPLACE_WITH_GIT_URL') }}"
+    scm_branch: main
+    # scm_credential is only required for private repositories.
+    # Leave empty for public repos or the local file:// lab setup.
+    scm_credential: "{{ aap_scm_credential | default(omit) }}"
+    scm_clean: false          # preserve any local-only worktree changes between syncs
+    scm_delete_on_update: false  # do not wipe the project cache before every sync
+    # update_on_launch: true - always sync from git before running a job.
+    # Set to false only in airgapped environments where git is unavailable at launch time.
+    update_on_launch: true
+    # allow_override: false - operators cannot change the branch at launch time.
+    # Prevents accidental execution of feature-branch code in production.
+    allow_override: false
+...

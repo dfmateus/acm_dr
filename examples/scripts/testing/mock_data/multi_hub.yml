@@ -1,0 +1,28 @@
+---
+# examples/scripts/testing/mock_data/multi_hub.yml
+# Scenario 4: 3-hub fleet topology. 1 active Hub, 2 passive. Hub-03 is
+# unreachable, so its passive sync Restore could not be verified.
+_scenario_name: "multi_hub"
+
+acm_dr_failover_manager_topology_hub_schedules:
+  - context: "acm-primary-hub-sa"
+    is_active: false
+    schedule_exists: true
+  - context: "acm-dr-hub-sa"
+    is_active: true
+    schedule_exists: true
+  - context: "acm-dr-hub-02-sa"
+    is_active: false
+    schedule_exists: false
+acm_dr_failover_manager_active_hub_count: 1
+acm_dr_failover_manager_active_hub_list:
+  - "acm-dr-hub-sa"
+
+# Additional passive hub status (Hub-03 unreachable)
+acm_dr_failover_manager_passive_hub_status:
+  - context: "acm-dr-hub-02-sa"
+    reachable: false
+    restore_found: false
+    schedule_active: false
+
+...

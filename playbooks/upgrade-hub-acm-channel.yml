@@ -1,0 +1,63 @@
+---
+# playbooks/upgrade-hub-acm-channel.yml
+# =============================================================================
+# ACM OPERATOR CHANNEL UPGRADE (PLANNED MAINTENANCE FAILOVER - STAGE UPGRADE)
+#
+# Description:
+#   Patches the ACM operator Subscription to a new OLM channel on the target
+#   Hub and waits for the MultiClusterHub to reach Running. Runs automatically
+#   inside WF - ACM DR - LAB - Planned Maintenance Switchover after the approval
+#   gate, while the Hub is idle (BackupSchedule paused, fleet on peer Hub).
+#
+#   The Hub must be idle before this playbook runs. OLM installs the latest CSV
+#   in the target channel; the upgrade takes 15-30 minutes for a minor version.
+#
+# Example (local run):
+#   ansible-playbook playbooks/upgrade-hub-acm-channel.yml \
+#     -e k8s_target_context="acmdr-lab-hub-01-sa" \
+#     -e acm_dr_upgrade_manager_target_acm_version="2.15"
+#
+# Variables (required):
+#   k8s_target_context                           - kubeconfig context for the idle Hub.
+#                                                  Injected via 'ACM DR - Target Cluster' credential.
+#   acm_dr_upgrade_manager_target_acm_version    - Target RHACM major.minor (e.g. '2.15').
+#                                                  Also accepted as acm_dr_failover_manager_target_acm_version
+#                                                  when launched from WF-19 survey.
+#
+# Expected outcome:
+#   Exit 0 - ACM Subscription channel patched and MCH is Running at the new version.
+#   Exit 1 - Preflight gate fails (already at target, MCH not Running before patch)
+#             or MCH does not reach Running within 30 minutes.
+# =============================================================================
+
+- name: "[ACM CHANNEL UPGRADE] | Patch ACM Subscription channel and wait for MCH Running"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]
+      tags: [always]
+
+    # ACM_DR_TARGET_CONTEXT is injected by the 'ACM DR - Target Cluster' credential
+    # type (ARO Hub Primary 01 (SA) / ARO Hub Secondary 01 (SA)).
+    - name: "[PRE-FLIGHT] | Derive target context from ACM DR Target Cluster credential"
+      ansible.builtin.set_fact:
+        k8s_target_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') }}"  # noqa var-naming[no-role-prefix]
+      when:
+        - k8s_target_context is not defined
+        - lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') | length > 0
+
+  roles:
+    - role: "{{ playbook_dir }}/../roles/acm_dr_upgrade_manager"
+...

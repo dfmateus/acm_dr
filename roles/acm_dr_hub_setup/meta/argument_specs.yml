@@ -1,0 +1,551 @@
+---
+argument_specs:
+  main:
+    short_description: RHACM Hub infrastructure provisioning for DR
+    description:
+      - >-
+        Installs and configures the full Disaster Recovery stack on both Hubs (Active and Passive):
+        cloud object storage (Azure Blob or AWS S3, selected via cloud_provider),
+        MultiClusterHub, MultiClusterObservability (Thanos),
+        OpenShift GitOps (multi-instance ArgoCD), OADP/DPA/BackupSchedule, and
+        Zero-Trust automation identity.
+    author:
+      - Diego Felipe Mateus
+    options:
+      # --- AESTHETIC PARAMETERS AND LOGGING ---
+      acm_dr_hub_setup_separator_char:
+        description: Character used for visual separators in task output.
+        type: str
+        default: "="
+        version_added: "1.0.0"
+      acm_dr_hub_setup_default_message_padding:
+        description: Number of padding characters for formatted task messages.
+        type: int
+        default: 4
+        version_added: "1.0.0"
+      acm_dr_hub_setup_debug_no_log:
+        description: >-
+          Suppress task output for security-sensitive operations (tokens, secrets, kubeconfig content).
+          Set to false to reveal no_log task output during troubleshooting sessions.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      # --- HUB CONTROL ---
+      is_primary_hub:
+        description: >-
+          Flag indicating whether the target Hub is the primary/active one (true) or the secondary/passive DR Hub (false).
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_dr_hub_setup_is_primary_hub:
+        description: Role-namespaced variable for Primary/Active Hub identification (derived from is_primary_hub).
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_hub_setup_primary_hub_context:
+        description: Kubeconfig context name for the primary Hub (used for automatic detection).
+        type: str
+        default: "acm-primary-hub"
+        version_added: "1.0.0"
+      # --- DR TOPOLOGY DETECTION ---
+      acm_dr_hub_setup_topology_detection:
+        description: >-
+          Enable DR topology detection at preflight. Queries BackupSchedule, Restore CRs,
+          DPA, and BSL on the target cluster to determine its current DR role before provisioning.
+        type: bool
+        default: true
+        version_added: "1.2.0"
+      acm_dr_hub_setup_allow_existing_dr:
+        description: >-
+          Allow provisioning on a cluster that already has DR artifacts (BackupSchedule,
+          passive sync Restore, DPA). Required when adding a new passive hub to an existing
+          topology or re-provisioning after topology changes.
+        type: bool
+        default: false
+        version_added: "1.2.0"
+      # --- CLOUD PROVIDER SELECTOR ---
+      acm_dr_hub_setup_cloud_provider:
+        description: >-
+          Cloud storage backend for OADP backups and Thanos observability.
+          Controls which provider-specific task files, templates, and credential
+          validations run. "azure" provisions Azure Blob Storage via
+          azure.azcollection modules; "aws" provisions S3 buckets via
+          amazon.aws modules. Must be "azure" or "aws".
+        type: str
+        default: "azure"
+        choices:
+          - azure
+          - aws
+        version_added: "1.6.0"
+      # --- AWS CREDENTIALS AND STORAGE ---
+      acm_dr_hub_setup_aws_access_key_id:
+        description: >-
+          AWS IAM Access Key ID for S3 operations (read from env
+          AWS_ACCESS_KEY_ID). Required when cloud_provider=aws.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_setup_aws_secret_access_key:
+        description: >-
+          AWS IAM Secret Access Key for S3 operations (read from env
+          AWS_SECRET_ACCESS_KEY). Required when cloud_provider=aws.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_setup_aws_region:
+        description: >-
+          AWS region for S3 bucket provisioning (e.g. us-east-1, eu-west-1).
+          Required when cloud_provider=aws.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_setup_aws_s3_bucket_backup:
+        description: >-
+          S3 bucket name for OADP/Velero backups. Must be globally unique
+          across all AWS accounts. Required when cloud_provider=aws.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_setup_aws_s3_bucket_observability:
+        description: >-
+          S3 bucket name for Thanos observability data. Must be globally
+          unique. Required when cloud_provider=aws.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      acm_dr_hub_setup_aws_s3_bucket_prefix:
+        description: >-
+          Object key prefix inside the backup S3 bucket (maps to
+          DPA objectStorage.prefix). Allows multiple Hubs to share
+          a single bucket with distinct prefix paths.
+        type: str
+        default: "hub"
+        version_added: "1.6.0"
+      acm_dr_hub_setup_aws_storage_allow_reuse:
+        description: >-
+          Allow reuse of existing S3 buckets (for the secondary Hub
+          sharing storage with the primary). Equivalent of
+          azure_storage_allow_reuse for the AWS path.
+        type: bool
+        default: false
+        version_added: "1.6.0"
+      acm_dr_hub_setup_aws_kms_key_id:
+        description: >-
+          Optional AWS KMS key ID for S3 server-side encryption. When
+          empty (default), buckets use AES-256 (SSE-S3). When set,
+          buckets use SSE-KMS with the specified key.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.6.0"
+      # --- AZURE CREDENTIALS ---
+      acm_dr_hub_setup_guid:
+        description: >-
+          Optional shorthand identifier. When provided, constructs the Storage
+          Account name as 'acmsa<guid>' and the Resource Group fallback as
+          'openenv-<guid>'. Not needed when providing storage_account_name and
+          resource_group directly (via extra-var, AAP survey, or env vars).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_subscription_id:
+        description: Azure Subscription ID (read from env SUBSCRIPTION).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_tenant_id:
+        description: Azure Tenant ID (read from env TENANT).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_client_id:
+        description: Azure Service Principal Client ID (read from env CLIENT_ID).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_client_secret:
+        description: Azure Service Principal Client Secret (read from env PASSWORD).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_storage_account_key:
+        description: Azure Storage Account access key (read from env AZURE_STORAGE_KEY).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_resource_group:
+        description: >-
+          Azure Resource Group for storage resources. Resolution: extra-var >
+          RESOURCEGROUP env var > AZURE_RESOURCE_GROUP env var >
+          openenv-<guid> construction.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_location:
+        description: Azure region for resource provisioning.
+        type: str
+        default: "eastus"
+        version_added: "1.0.0"
+      # --- AZURE STORAGE ---
+      acm_dr_hub_setup_azure_storage_allow_reuse:
+        description: Allow reuse of an existing Storage Account (for the secondary Hub).
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_storage_account_name:
+        description: >-
+          Azure Storage Account name (3-24 chars, lowercase + digits only,
+          globally unique). Resolution: extra-var > AZURE_STORAGE_ACCOUNT env
+          var > acmsa<guid> construction.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_computed_storage_account:
+        description: Computed Storage Account name (derived from acm_dr_hub_setup_azure_storage_account_name).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_container_backup:
+        description: Azure Blob container name for ACM backups.
+        type: str
+        default: "acm-backup"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_azure_container_observability:
+        description: Azure Blob container name for observability data.
+        type: str
+        default: "acm-observability"
+        version_added: "1.0.0"
+      # --- RED HAT ACM ---
+      acm_dr_hub_setup_mch_channel:
+        description: ACM operator update channel (read from env ACM_CHANNEL).
+        type: str
+        default: "release-2.14"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_mch_namespace:
+        description: MultiClusterHub namespace.
+        type: str
+        default: "open-cluster-management"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_mch_name:
+        description: MultiClusterHub Custom Resource name.
+        type: str
+        default: "multiclusterhub"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_mch_pull_secret:
+        description: Pull secret name for ACM operator images.
+        type: str
+        default: "rhacm-pull-secret"
+        version_added: "1.0.0"
+      # --- GITOPS ---
+      acm_dr_hub_setup_github_repo_url:
+        description: Git repository URL for policies/ApplicationSets.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_github_username:
+        description: GitHub username for repository authentication (read from env GITHUB_USER).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_github_pat:
+        description: GitHub Personal Access Token (read from env GITHUB_PAT).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_gitops_operator_namespace:
+        description: OpenShift GitOps operator namespace.
+        type: str
+        default: "openshift-gitops-operator"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_gitops_channel:
+        description: OpenShift GitOps operator update channel.
+        type: str
+        default: "auto"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_gitops_approval:
+        description: OpenShift GitOps operator InstallPlan approval mode.
+        type: str
+        default: "Automatic"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_gitops_starting_csv:
+        description: OpenShift GitOps operator starting ClusterServiceVersion (empty for latest).
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_hub_setup_gitops_namespace_acm:
+        description: Namespace for ACM-scoped ArgoCD instance.
+        type: str
+        default: "openshift-gitops-acm"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_policies_namespace:
+        description: Namespace for ACM policies ApplicationSet.
+        type: str
+        default: "acm-policies"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_github_policies_path:
+        description: Path to policies directory in the GitHub repository.
+        type: str
+        default: "Politicas"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_gitops_namespace_appdemo:
+        description: Namespace for application demo ArgoCD instance.
+        type: str
+        default: "openshift-gitops-appdemo"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_github_target_revision:
+        description: Target Git branch/revision for ApplicationSets.
+        type: str
+        default: "main"
+        version_added: "1.0.0"
+      # --- OADP ---
+      acm_dr_hub_setup_oadp_namespace:
+        description: OADP/Velero and BackupSchedule namespace.
+        type: str
+        default: "open-cluster-management-backup"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_acm_backup_namespace:
+        description: ACM backup namespace (aligned with acm_dr_hub_setup_oadp_namespace).
+        type: str
+        default: "open-cluster-management-backup"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_oadp_dpa_name:
+        description: DataProtectionApplication (DPA) name.
+        type: str
+        default: "dpa-hub"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_dpa_name_max_length:
+        description: >-
+          Maximum allowed length for the DPA name. The DPA name becomes part of
+          a Kubernetes Route (Velero/OADP BSL access), constrained to 63 characters
+          by RFC 1123. Validated at preflight (Stage 00).
+        type: int
+        default: 63
+        version_added: "1.4.0"
+      acm_dr_hub_setup_oadp_cloud_secret_name:
+        description: >-
+          Name of the Secret containing cloud credentials for OADP/Velero.
+          OADP 1.6+ requires the literal name "cloud-credentials" for
+          reconciliation, so this is now the same across all providers.
+        type: str
+        default: "cloud-credentials"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_schedule_name:
+        description: ACM-managed BackupSchedule name.
+        type: str
+        default: "schedule-acm-hub"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_backup_cron_schedule:
+        description: Cron expression for the backup schedule.
+        type: str
+        default: "0 */2 * * *"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_backup_ttl:
+        description: Backup time-to-live (TTL).
+        type: str
+        default: "120h"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_backup_no_backup_on_start:
+        description: >-
+          Suppress the immediate first backup that ACM fires on BackupSchedule
+          creation. When true, the first backup waits for the next cron interval
+          instead of firing at T+0.
+        type: bool
+        default: false
+        version_added: "1.4.0"
+      acm_dr_hub_setup_managed_service_account_ttl:
+        description: >-
+          ManagedServiceAccount token rotation interval for the BackupSchedule.
+          Empty string uses the ACM default. Requires RHACM 2.16+.
+          Example: "720h0m0s" (30 days).
+        type: str
+        default: ""
+        version_added: "1.4.0"
+      acm_dr_hub_setup_oadp_subscription_name:
+        description: Standardized OADP Operator Subscription name.
+        type: str
+        default: "redhat-oadp-operator"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_oadp_channel:
+        description: >-
+          OLM channel for the OADP Operator Subscription. Task 5.1.1b resolves
+          the actual channel from the PackageManifest defaultChannel at runtime
+          (varies by OCP version: "stable-1.4" on 4.18, "stable" on 4.22+);
+          this value is the fallback when PackageManifest lookup fails.
+        type: str
+        default: "stable-1.4"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_oadp_source:
+        description: CatalogSource name for the OADP Operator Subscription.
+        type: str
+        default: "redhat-operators"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_oadp_operatorgroup_name:
+        description: OperatorGroup name in the OADP/backup namespace.
+        type: str
+        default: "redhat-oadp-operator-group"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_oadp_subscription_cr_name:
+        description: >-
+          Subscription CR metadata.name for the OADP Operator (matches the
+          MCH-generated name for consistency).
+        type: str
+        default: "redhat-oadp-operator-subscription"
+        version_added: "1.0.0"
+      # --- PASSIVE SYNC RESTORE ---
+      acm_dr_hub_setup_passive_restore_enabled:
+        description: >-
+          Enable passive sync Restore CR on non-primary hubs (syncRestoreWithNewBackups: true).
+          Per RHACM 2.17 official docs, passive hubs should continuously pull credentials and
+          resources from shared storage to stay pre-positioned for faster failover activation.
+        type: bool
+        default: true
+        version_added: "1.1.0"
+      acm_dr_hub_setup_passive_restore_name:
+        description: Name for the passive sync Restore Custom Resource (metadata.name).
+        type: str
+        default: "restore-passive-sync"
+        version_added: "1.1.0"
+      acm_dr_hub_setup_passive_restore_sync_interval:
+        description: >-
+          How often the passive sync Restore checks for new backups (e.g., 10m, 30m).
+          Maps to Restore.spec.restoreSyncInterval. Default 30m per official docs.
+        type: str
+        default: "30m"
+        version_added: "1.1.0"
+      # --- DPA RESOURCE LIMITS ---
+      acm_dr_hub_setup_dpa_resource_requests:
+        description: >-
+          Velero pod CPU/memory requests for large fleets (2000+ managed clusters).
+          Empty dict uses Kubernetes defaults. Example: { cpu: "2", memory: "4Gi" }.
+          Per RHACM 2.17 official docs sizing guidance.
+        type: dict
+        default: {}
+        version_added: "1.1.0"
+      acm_dr_hub_setup_dpa_resource_limits:
+        description: >-
+          Velero pod CPU/memory limits for large fleets (3500+ managed clusters).
+          Empty dict uses Kubernetes defaults. Example: { cpu: "4", memory: "8Gi" }.
+          Per RHACM 2.17 official docs sizing guidance.
+        type: dict
+        default: {}
+        version_added: "1.1.0"
+      # --- BACKUP HEALTH MONITORING (PROMETHEUSRULE) ---
+      acm_dr_hub_setup_prometheusrule_enabled:
+        description: >-
+          Deploy an optional PrometheusRule that monitors backup pipeline health
+          via two alerts (ACMBackupPolicyNonCompliant, VeleroBackupStale).
+          Disabled by default to avoid breaking clusters that lack the
+          monitoring.coreos.com CRD or Prometheus Operator.
+        type: bool
+        default: false
+        version_added: "1.5.0"
+      acm_dr_hub_setup_prometheusrule_name:
+        description: Name of the PrometheusRule CR deployed in the backup namespace.
+        type: str
+        default: "acm-dr-backup-health"
+        version_added: "1.5.0"
+      acm_dr_hub_setup_policy_noncompliant_threshold:
+        description: >-
+          How long the backup-restore-enabled governance Policy must be
+          NonCompliant before the ACMBackupPolicyNonCompliant alert fires.
+          Prometheus duration format (e.g. 15m, 1h).
+        type: str
+        default: "15m"
+        version_added: "1.5.0"
+      acm_dr_hub_setup_backup_stale_threshold:
+        description: >-
+          Maximum age of the last successful validation backup before the
+          VeleroBackupStale alert fires. Human-readable form used in alert
+          descriptions (e.g. 7h, 24h).
+        type: str
+        default: "7h"
+        version_added: "1.5.0"
+      acm_dr_hub_setup_backup_stale_seconds:
+        description: >-
+          Same threshold as backup_stale_threshold expressed in seconds for
+          the PromQL expression. Must match backup_stale_threshold.
+          7h = 25200 seconds.
+        type: int
+        default: 25200
+        version_added: "1.5.0"
+      acm_dr_hub_setup_backup_failure_lookback:
+        description: >-
+          PromQL lookback window for counting Velero backup failures
+          (velero_backup_failure_total counter) in the VeleroBackupFailed alert.
+          Prometheus duration format (e.g. 1h, 30m).
+        type: str
+        default: "1h"
+        version_added: "1.5.0"
+      acm_dr_hub_setup_backup_partial_failure_lookback:
+        description: >-
+          PromQL lookback window for counting partial Velero backup failures
+          (velero_backup_partial_failure_total) in the VeleroBackupPartiallyFailed
+          alert. Prometheus duration format (e.g. 1h, 30m).
+        type: str
+        default: "1h"
+        version_added: "1.5.0"
+      acm_dr_hub_setup_velero_pod_unhealthy_threshold:
+        description: >-
+          How long the Velero pod must be absent or not running before the
+          VeleroPodNotReady alert fires. Prometheus duration format (e.g. 5m, 10m).
+        type: str
+        default: "5m"
+        version_added: "1.5.0"
+      acm_dr_hub_setup_policy_severe_threshold:
+        description: >-
+          Number of NonCompliant governance policy templates (policy_governance_info
+          metric) that triggers the ACMBackupPolicySevereDegradation alert.
+          The ACMBackupPolicyNonCompliant alert fires at > 0; this alert targets
+          severe systemic failures where multiple templates fail simultaneously.
+        type: int
+        default: 3
+        version_added: "1.5.0"
+      # --- OBSERVABILITY ---
+      acm_dr_hub_setup_observability_namespace:
+        description: MultiClusterObservability namespace.
+        type: str
+        default: "open-cluster-management-observability"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_observability_storage_class:
+        description: >-
+          StorageClass for Thanos PVCs. Empty string (default) triggers
+          auto-discovery from the cluster's default StorageClass annotation.
+          Set explicitly only when the cluster's default is not suitable
+          for block storage (unlikely on ARO Classic, ARO HCP, or ROSA).
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      # --- ZERO-TRUST AUTOMATION ---
+      acm_dr_hub_setup_automation_namespace:
+        description: Zero-Trust automation identity namespace.
+        type: str
+        default: "ansible-automation"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_automation_sa_name:
+        description: Automation ServiceAccount name.
+        type: str
+        default: "ansible-dr-orchestrator"
+        version_added: "1.0.0"
+      acm_dr_hub_setup_automation_secret_name:
+        description: Automation ServiceAccount token Secret name.
+        type: str
+        default: "ansible-dr-orchestrator-token"
+        version_added: "1.0.0"
+...

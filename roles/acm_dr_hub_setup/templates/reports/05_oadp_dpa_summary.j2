@@ -1,0 +1,13 @@
+{% set _sep = (acm_dr_hub_setup_separator_char | default('=')) * 70 %}
+{% set _backup_schedule = (acm_dr_hub_setup_schedule_name | default('schedule-acm-hub') ~ ' (ACTIVE - ' ~ acm_dr_hub_setup_backup_cron_schedule ~ ')') if (acm_dr_hub_setup_is_primary_hub | bool) else 'SKIPPED (PASSIVE / SECONDARY HUB)' %}
+{{ _sep }}
+ ✅ STAGE 05 - OADP, DPA & BACKUPSCHEDULE FULLY DEPLOYED & READY
+{{ _sep }}
+ 🎯 TARGET CONTEXT:         {{ k8s_target_context }}
+ 📂 OADP NAMESPACE:        {{ acm_dr_hub_setup_oadp_namespace | default('open-cluster-management-backup') }}
+ ☁️ CLOUD STORAGE:         {{ (acm_dr_hub_setup_cloud_provider == 'aws') | ternary('S3 bucket ' ~ acm_dr_hub_setup_aws_s3_bucket_backup | default('N/A'), 'Azure SA ' ~ acm_dr_hub_setup_azure_storage_account_name | default('N/A')) }}
+ ⚙️  DPA CR INSTANTIATED:   {{ acm_dr_hub_setup_oadp_dpa_name | default('dpa-hub') }}
+ 🌐 VELERO BSL STATUS:     {{ acm_dr_hub_setup_bsl_info.resources[0].status.phase | default('N/A') }} ({{ (acm_dr_hub_setup_cloud_provider == 'aws') | ternary('S3', 'Azure') }} Connectivity Validated)
+ 📅 BACKUP SCHEDULE:       {{ _backup_schedule }}
+ 📦 RUNNING PODS:           {{ acm_dr_hub_setup_oadp_pods.resources | length }} operational pod(s)
+{{ _sep }}

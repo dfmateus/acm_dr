@@ -1,0 +1,161 @@
+---
+# playbooks/orchestrate-dr-failover.yml
+# =============================================================================
+# FAILOVER / DISASTER RECOVERY ORCHESTRATION (RHACM DR FAILOVER MANAGER)
+#
+# Description:
+#   Performs the state transition of the Red Hat ACM ecosystem in switchover scenarios.
+#   This automation traverses 8 resilience Stages, performing:
+#   - Fencing (Isolation) of the Source Hub
+#   - Activation of the Target Hub via Red Hat OADP (Velero)
+#   - Sanitization of orphaned tokens from non-OpenShift Spokes (KCS 7039710)
+#   - Post-Failover Audit and Compliance
+#
+# Execution Examples:
+#
+#   Per-cluster credentials + failover action (AAP or CLI):
+#     ansible-playbook playbooks/orchestrate-dr-failover.yml \
+#       -e acm_dr_failover_manager_dry_run=true
+#     # Direction derived from ACM_DR_SOURCE_CONTEXT / ACM_DR_DEST_CONTEXT env vars.
+#     # Default action is "failover". Pass -e acm_dr_failover_action=failback to reverse.
+#
+#   Explicit hub variables (monolithic kubeconfig):
+#     ansible-playbook playbooks/orchestrate-dr-failover.yml \
+#       -e active_hub=hub-primary-sa -e passive_hub=hub-dr-sa
+#
+#   Legacy format (backward compatible):
+#     ansible-playbook playbooks/orchestrate-dr-failover.yml \
+#       -e failover_direction="acm-primary-hub_to_acm-dr-hub"
+#
+# Variables (required):
+#   acm_dr_failover_action               - 'failover' (default) or 'failback'
+#   k8s_source_context / k8s_dest_context - Hub SA contexts. Injected via AAP
+#                                           credentials or load_cluster_env.sh.
+#
+# Variables (commonly overridden):
+#   acm_dr_failover_manager_dry_run      - true runs the full pipeline in check_mode
+#                                           without mutations (default: false)
+#   skip_gates                           - true bypasses the interactive confirmation
+#                                           gate; required for AAP/CI (default: false)
+#   acm_dr_failover_manager_allow_fenced_origin - true permits failover from a Hub
+#                                           that is already in PASSIVE state (required
+#                                           for failback). Default: false.
+#
+# Dependencies:
+#   collections: kubernetes.core
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+#                acm_dr_readiness_check (Stage 00 - called by acm_dr_failover_manager)
+#                acm_dr_failover_manager (Stages 00-08)
+#                acm_dr_spoke_manager (called from Stage 04 to reconnect fleet)
+#
+# Expected outcome:
+#   Exit 0 - Failover complete: Spokes reconnected, new Hub protected (BackupSchedule
+#             active), old Hub detached, postflight compliance report clean.
+#   Exit 1 - A stage failed. The pipeline stops at the failed stage. Check the
+#             ❌ message for the specific failure and consult docs/runbook/.
+# =============================================================================
+
+- name: ACM Hub Switchover Orchestration (DR Failover Manager)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Uses the runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster
+      # credentials from AAP or scripts/lib/load_cluster_env.sh), falling back to the legacy
+      # monolithic K8S_AUTH_KUBECONFIG / KUBECONFIG env var when no per-cluster vars exist.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]  # propagate to tasks inside the role so they also run
+      tags: [always]  # ensures the include itself runs regardless of --tags filtering
+
+    # -----------------------------------------------------------------
+    # Priority 1: explicit -e active_hub + -e passive_hub (skip all below)
+    # -----------------------------------------------------------------
+    # No task needed - if both are already defined, every subsequent
+    # set_fact is guarded by "active_hub is not defined".
+
+    # -----------------------------------------------------------------
+    # Priority 2/3: per-cluster credentials + acm_dr_failover_action
+    # -----------------------------------------------------------------
+    # Read Source/Dest context names from env vars injected by AAP custom
+    # credential types or exported via scripts/lib/load_cluster_env.sh.
+    - name: "[PRE-FLIGHT] | Read Source and Dest context names from per-cluster credentials"
+      ansible.builtin.set_fact:
+        acm_dr_source_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_SOURCE_CONTEXT', default='') }}"
+        acm_dr_dest_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_DEST_CONTEXT', default='') }}"
+      when:
+        - active_hub is not defined
+        - passive_hub is not defined
+
+    # Map acm_dr_failover_action to active/passive hub assignment.
+    # "failover" (default): Source is the active hub, Dest takes over.
+    # "failback": Dest is the active hub, Source takes back control.
+    - name: "[PRE-FLIGHT] | Derive failover direction from credentials and action"
+      ansible.builtin.set_fact:
+        active_hub: >-
+          {{ acm_dr_source_context
+             if (acm_dr_failover_action | default('failover')) == 'failover'
+             else acm_dr_dest_context }}
+        passive_hub: >-
+          {{ acm_dr_dest_context
+             if (acm_dr_failover_action | default('failover')) == 'failover'
+             else acm_dr_source_context }}
+      when:
+        - active_hub is not defined
+        - passive_hub is not defined
+        - acm_dr_source_context | default('') | length > 0
+        - acm_dr_dest_context | default('') | length > 0
+
+    # -----------------------------------------------------------------
+    # Priority 4: legacy -e failover_direction=X_to_Y (backward compat)
+    # -----------------------------------------------------------------
+    - name: "[PRE-FLIGHT] | Parse failover direction from legacy format"
+      ansible.builtin.set_fact:
+        active_hub: "{{ failover_direction.split('_to_')[0] }}"
+        passive_hub: "{{ failover_direction.split('_to_')[1] }}"
+      when:
+        - active_hub is not defined
+        - passive_hub is not defined
+        - failover_direction is defined
+        - "'_to_' in failover_direction"
+
+    # Construct failover_direction for logging and stage banners
+    # (always needed regardless of which priority path resolved the hubs).
+    - name: "[PRE-FLIGHT] | Construct failover_direction for logging"
+      ansible.builtin.set_fact:
+        failover_direction: "{{ active_hub }}_to_{{ passive_hub }}"
+      when:
+        - active_hub is defined
+        - passive_hub is defined
+        - failover_direction is not defined
+
+    # -----------------------------------------------------------------
+    # Priority 5: fail with actionable error listing all input methods
+    # -----------------------------------------------------------------
+    - name: "[PRE-FLIGHT] | Validate failover direction resolved"
+      ansible.builtin.assert:
+        that:
+          - active_hub is defined
+          - passive_hub is defined
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Failover direction could not be resolved.
+          Provide hub assignment via one of:
+          1) -e active_hub=<source> -e passive_hub=<dest>
+          2) Per-cluster credentials (ACM_DR_SOURCE/DEST_CONTEXT) + optional -e acm_dr_failover_action=failover|failback
+          3) -e failover_direction=<source>_to_<dest>
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Failover direction: {{ active_hub }} -> {{ passive_hub }}
+          (action: {{ acm_dr_failover_action | default('failover') }})
+
+  roles:
+    - role: "{{ playbook_dir }}/../roles/acm_dr_failover_manager"
+...

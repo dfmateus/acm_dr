@@ -1,0 +1,78 @@
+---
+# =============================================================================
+# BOOTSTRAP TOKEN WAIT -- poll until Kubernetes populates .data.token
+#
+# Kubernetes fills the token field asynchronously after the Secret object is
+# created. The default wait is 30 seconds (6 retries x 5 seconds).
+# =============================================================================
+
+- name: "[BOOTSTRAP - Token] | 3.1.1) Poll token Secret until .data.token is populated"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context | default(omit) }}"
+    api_version: v1
+    kind: Secret
+    name: "{{ acm_dr_cluster_onboard_token_secret }}"
+    namespace: "{{ acm_dr_cluster_onboard_namespace }}"
+  register: acm_dr_cluster_onboard_token_secret_poll
+  until:
+    - acm_dr_cluster_onboard_token_secret_poll.resources | default([]) | length > 0
+    - acm_dr_cluster_onboard_token_secret_poll.resources[0].data.token is defined
+  retries: "{{ acm_dr_cluster_onboard_token_wait_retries }}"
+  delay: "{{ acm_dr_cluster_onboard_token_wait_delay }}"
+  no_log: "{{ acm_dr_cluster_onboard_debug_no_log | bool }}"
+  ignore_errors: true
+
+# =============================================================================
+# DIAGNOSTIC BLOCK -- runs only when the poll above times out
+# =============================================================================
+
+- name: "[BOOTSTRAP - Token DIAGNOSTIC] | D.1) Check whether the SA exists after timeout"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context | default(omit) }}"
+    api_version: v1
+    kind: ServiceAccount
+    name: "{{ acm_dr_cluster_onboard_sa_name }}"
+    namespace: "{{ acm_dr_cluster_onboard_namespace }}"
+  register: acm_dr_cluster_onboard_diag_sa
+  failed_when: false
+  when: acm_dr_cluster_onboard_token_secret_poll is failed
+
+- name: "[BOOTSTRAP - Token DIAGNOSTIC] | D.2) Build diagnostic summary"
+  ansible.builtin.set_fact:
+    acm_dr_cluster_onboard_diag_summary: >-
+      Secret '{{ acm_dr_cluster_onboard_token_secret }}'
+      in namespace '{{ acm_dr_cluster_onboard_namespace }}' was not populated within
+      {{ acm_dr_cluster_onboard_token_wait_retries * acm_dr_cluster_onboard_token_wait_delay }}s.
+      ServiceAccount '{{ acm_dr_cluster_onboard_sa_name }}':
+      {% set _sa = acm_dr_cluster_onboard_diag_sa.resources | default([]) %}
+      {% if _sa | length > 0 %}exists.{% else %}NOT FOUND.{% endif %}
+      {% if _sa | length == 0 %}
+      The RBAC template at step 2.1.1 may have failed silently.
+      Check: oc get sa -n {{ acm_dr_cluster_onboard_namespace }}.
+      {% else %}
+      The SA exists but the token controller has not populated the Secret.
+      Check: oc get secret {{ acm_dr_cluster_onboard_token_secret }} -n {{ acm_dr_cluster_onboard_namespace }}.
+      {% endif %}
+  when: acm_dr_cluster_onboard_token_secret_poll is failed
+
+- name: "[BOOTSTRAP - Token DIAGNOSTIC] | D.3) Print diagnostic report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ TOKEN SECRET NOT READY: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "{{ acm_dr_cluster_onboard_diag_summary | default('(no summary available)') }}"
+      - ""
+      - "======================================================================"
+  when: acm_dr_cluster_onboard_token_secret_poll is failed
+
+- name: "[BOOTSTRAP - Token DIAGNOSTIC] | D.4) Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Token Secret '{{ acm_dr_cluster_onboard_token_secret }}'
+      in namespace '{{ acm_dr_cluster_onboard_namespace }}' was not populated within
+      {{ acm_dr_cluster_onboard_token_wait_retries * acm_dr_cluster_onboard_token_wait_delay }}s.
+      See the diagnostic report above.
+  when: acm_dr_cluster_onboard_token_secret_poll is failed
+...

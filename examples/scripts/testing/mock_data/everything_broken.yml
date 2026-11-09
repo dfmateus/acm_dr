@@ -1,0 +1,113 @@
+---
+# examples/scripts/testing/mock_data/everything_broken.yml
+# Scenario 8: Worst case. Every anomaly fires at once: split-brain, degraded
+# addons, noncompliant policies, unhealthy GitOps, empty placements,
+# unprotected dashboards, unreachable Spokes, stale backup, version skew.
+_scenario_name: "everything_broken"
+
+# Split-brain
+acm_dr_failover_manager_is_split_brain_detected: true
+acm_dr_failover_manager_active_hub_count: 2
+acm_dr_failover_manager_active_hub_list:
+  - "acm-primary-hub-sa"
+  - "acm-dr-hub-sa"
+acm_dr_failover_manager_topology_hub_schedules:
+  - context: "acm-primary-hub-sa"
+    is_active: true
+    schedule_exists: true
+  - context: "acm-dr-hub-sa"
+    is_active: true
+    schedule_exists: true
+
+# Degraded addons
+acm_dr_failover_manager_degraded_addons_list:
+  - "iks-spoke-01/managed-serviceaccount"
+  - "aks-spoke-01/config-policy-controller"
+acm_dr_failover_manager_degraded_addons_by_spoke:
+  - spoke: "iks-spoke-01"
+    count: 1
+    total: 6
+    addons:
+      - "managed-serviceaccount"
+  - spoke: "aks-spoke-01"
+    count: 1
+    total: 6
+    addons:
+      - "config-policy-controller"
+
+# Noncompliant policies
+acm_dr_failover_manager_policy_summary: >-
+  {"total": 5, "noncompliant": ["policy-etcd-encryption", "policy-cert-rotation"]}
+
+# Unhealthy GitOps apps
+acm_dr_failover_manager_gitops_summary: >-
+  {"total": 3, "unhealthy": ["app-monitoring/Degraded"]}
+
+# Empty placement decisions
+acm_dr_failover_manager_placement_summary: >-
+  {"total": 4, "empty": ["placement-global-region"]}
+
+# Unprotected dashboards
+acm_dr_failover_manager_dashboard_summary: >-
+  {"total": 2, "unprotected": ["custom-slo-dashboard"]}
+
+# Unreachable Spokes
+acm_dr_failover_manager_unreachable_spoke_list:
+  - "eks-spoke-01"
+  - "gke-spoke-01"
+acm_dr_failover_manager_reachable_spoke_list:
+  - "aro-spoke-01"
+  - "aro-spoke-02"
+  - "aro-spoke-03"
+  - "aks-spoke-01"
+  - "iks-spoke-01"
+
+# Residual spokes (production mode, so these count as anomalies)
+acm_dr_failover_manager_residual_spokes:
+  - "aro-spoke-01"
+
+# Stale backup
+acm_dr_failover_manager_backup_age_hours: 12.5
+acm_dr_failover_manager_newest_backup_name: "acm-credentials-schedule-20260811020000"
+
+# Version skew
+acm_dr_failover_manager_source_acm_version: "2.13.6"
+acm_dr_failover_manager_source_ocp_version: "4.17.22"
+acm_dr_failover_manager_source_mce_version: "2.13.6"
+
+# Fleet incompatibility (aro-spoke-03 on old OCP)
+acm_dr_failover_manager_fleet_compat:
+  - name: "aro-spoke-01"
+    openshift_version: "4.18.34"
+    ocp_minor: "4.18"
+    kubernetes_version: "1.31.6"
+    product: "OpenShift"
+    dest_rhacm_supported: true
+  - name: "aro-spoke-02"
+    openshift_version: "4.18.34"
+    ocp_minor: "4.18"
+    kubernetes_version: "1.31.6"
+    product: "OpenShift"
+    dest_rhacm_supported: true
+  - name: "aro-spoke-03"
+    openshift_version: "4.16.12"
+    ocp_minor: "4.16"
+    kubernetes_version: "1.29.8"
+    product: "OpenShift"
+    dest_rhacm_supported: false
+  - name: "aks-spoke-01"
+    openshift_version: "N/A"
+    ocp_minor: "N/A"
+    kubernetes_version: "1.30.9"
+    product: "AKS"
+    dest_rhacm_supported: true
+  - name: "iks-spoke-01"
+    openshift_version: "N/A"
+    ocp_minor: "N/A"
+    kubernetes_version: "1.31.3"
+    product: "IKS"
+    dest_rhacm_supported: true
+acm_dr_failover_manager_fleet_compat_all_ok: false
+acm_dr_failover_manager_fleet_compat_incompatible_count: 1
+
+...

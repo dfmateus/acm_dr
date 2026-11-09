@@ -1,0 +1,49 @@
+---
+# roles/acm_argocd_instance/tasks/03_argocd_cr.yml
+# =============================================================================
+# STAGE 03: ARGOCD CUSTOM RESOURCE (GENERIC)
+# =============================================================================
+
+- name: "[ARGOCD CR] | 3.1) Create the ArgoCD instance - {{ acm_argocd_instance_setup_name }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    template: argocd_cr.yml.j2
+  register: acm_argocd_instance_setup_cr_result
+
+- name: "[ARGOCD CR] | 3.2) WAIT - Validate ArgoCD Server readiness"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: Deployment
+    namespace: "{{ acm_argocd_instance_setup_namespace }}"
+    name: "{{ acm_argocd_instance_setup_name }}-server"
+  register: acm_argocd_instance_setup_server_deploy
+  until:
+    - (acm_argocd_instance_setup_server_deploy.resources | default([])) | length > 0
+    - acm_argocd_instance_setup_server_deploy.resources[0].status.readyReplicas | default(0) | int > 0
+  retries: 40
+  delay: 10
+  ignore_errors: true
+
+# ArgoCD server readiness diagnostic.
+- name: "[ARGOCD CR DIAGNOSTIC] | ❌ ArgoCD server not ready"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => ArgoCD server '{{ acm_argocd_instance_setup_name }}-server'
+      in namespace '{{ acm_argocd_instance_setup_namespace }}'
+      did not reach ready state within 6.7 minutes on context '{{ k8s_target_context }}'.
+      Check the ArgoCD CR status and operator logs: oc get argocd -n
+      {{ acm_argocd_instance_setup_namespace }} -o yaml --context {{ k8s_target_context }}.
+      Verify the GitOps operator controller-manager is running: oc get deploy -n
+      {{ acm_argocd_instance_setup_gitops_operator_namespace | default('openshift-gitops-operator') }}
+      --context {{ k8s_target_context }}.
+  when: acm_argocd_instance_setup_server_deploy is failed
+
+- name: "[ARGOCD CR] | 3.3) ASSERT - Validate ArgoCD instance availability"
+  ansible.builtin.assert:
+    that:
+      - acm_argocd_instance_setup_server_deploy.resources[0].status.readyReplicas > 0
+    fail_msg: "❌ FAILED! Oh. No! => ArgoCD instance '{{ acm_argocd_instance_setup_name }}-server' is not ready."
+    success_msg: "✅ PASSED! Oh. Yes! => ArgoCD instance '{{ acm_argocd_instance_setup_name }}' is active and ready."
+  when: acm_argocd_instance_setup_server_deploy is not failed
+...

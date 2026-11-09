@@ -1,0 +1,202 @@
+---
+# roles/acm_dr_spoke_manager/defaults/main.yml
+# =============================================================================
+# DEFAULT VARIABLES FILE - SPOKE MANAGER
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. AESTHETICS AND LOGGING PARAMETERS
+# -----------------------------------------------------------------------------
+acm_dr_spoke_manager_separator_char: "="
+
+# Suppresses task output for security-sensitive operations (tokens, secrets,
+# kubeconfig content). Set to false (-e acm_dr_spoke_manager_debug_no_log=false)
+# to expose hidden output during troubleshooting sessions.
+acm_dr_spoke_manager_debug_no_log: true  # bool - set false to reveal no_log task output
+
+# -----------------------------------------------------------------------------
+# 2. KUBERNETES CONTEXTS AND ACCESS
+# -----------------------------------------------------------------------------
+# Kubeconfig context pointing to the active Hub
+# Intentionally no hardcoded example value: if neither -e k8s_target_context nor
+# -e acm_dr_spoke_manager_hub_context are provided, the mandatory assert in
+# playbooks/manage-spoke.yml must fail loudly instead of assuming the wrong Hub.
+acm_dr_spoke_manager_hub_context: "{{ k8s_target_context | default('') }}"
+
+# Kubeconfig context pointing to the target Spoke cluster.
+# Reads ACM_DR_SPOKE_CONTEXT first (injected by the AAP "ACM DR - Spoke Cluster"
+# credential type), falling back to the legacy SPOKE_K8S_CONTEXT env var for
+# backward compatibility with older scripts.
+acm_dr_spoke_manager_spoke_context: >-
+  {{ lookup('ansible.builtin.env', 'ACM_DR_SPOKE_CONTEXT', default='')
+     | default(lookup('ansible.builtin.env', 'SPOKE_K8S_CONTEXT', default=''), true) }}
+acm_dr_spoke_manager_spoke_k8s_context: "{{ acm_dr_spoke_manager_spoke_context }}"
+
+# -----------------------------------------------------------------------------
+# 3. MANAGED CLUSTER (SPOKE) IDENTIFICATION
+# -----------------------------------------------------------------------------
+# Spoke cluster name registered in Red Hat ACM
+# Intentionally no hardcoded example value: see note above in acm_dr_spoke_manager_hub_context.
+acm_dr_spoke_manager_cluster_name: "{{ lookup('ansible.builtin.env', 'SPOKE_CLUSTER_NAME') | default('', true) }}"
+
+# Spoke API Server URL (Optional, if you need to force it)
+acm_dr_spoke_manager_api_url: "{{ lookup('ansible.builtin.env', 'SPOKE_API_URL') | default('', true) }}"
+
+# Spoke token (Optional, will be inferred via context if not provided)
+acm_dr_spoke_manager_api_token: "{{ lookup('ansible.builtin.env', 'SPOKE_API_TOKEN') | default('', true) }}"
+
+# -----------------------------------------------------------------------------
+# 4. MANAGED CLUSTER LABELS (Multi-Distribution Support)
+# -----------------------------------------------------------------------------
+# Cloud provider label applied to the ManagedCluster object in RHACM.
+# When a Spoke kubeconfig context is provided and the Spoke is OpenShift, the
+# cloud is auto-detected from Infrastructure.status.platform and translated to
+# the RHACM-canonical value via acm_dr_spoke_manager_platform_to_cloud_map below.
+# For non-OCP Spokes (AKS, Amazon EKS, GKE, IKS, vanilla K8s) or manual-token
+# flows, override via -e with the RHACM value (Amazon, Azure, Google, IBMCloud).
+# Empty string triggers auto-detection.
+acm_dr_spoke_manager_cluster_cloud: ""
+
+# Maps OpenShift Infrastructure.status.platform values to the cloud label strings
+# that RHACM recognizes and displays with the correct provider icon.
+# The Infrastructure CR returns platform-native names (AWS, GCP) while RHACM
+# expects its own canonical names (Amazon, Google) for the ManagedCluster cloud
+# label. Without this mapping, OCP-on-AWS Spokes get cloud=AWS which RHACM
+# renders as "Other" instead of "Amazon".
+# Source: stolostron/console getProvider() switch statement + the
+# platform.open-cluster-management.io ClusterClaim values.
+acm_dr_spoke_manager_platform_to_cloud_map:
+  AWS: "Amazon"              # RHACM displays "Amazon" with AWS icon
+  Azure: "Azure"             # RHACM displays "Microsoft Azure" with Azure icon
+  GCP: "Google"              # RHACM displays "Google" with Google icon
+  IBMCloud: "IBMCloud"       # RHACM displays "IBM" with IBM icon
+  IBMPowerPlatform: "IBMPowerPlatform"  # IBM Power Systems Virtual Server
+  IBMZPlatform: "IBMZPlatform"          # IBM Z (s390x)
+  VSphere: "VSphere"         # VMware vSphere
+  BareMetal: "BareMetal"     # physical / on-premises
+  OpenStack: "OpenStack"     # Red Hat OpenStack Platform
+  Nutanix: "Nutanix"         # Nutanix AHV
+  KubeVirt: "KubeVirt"       # OpenShift Virtualization
+  oVirt: "KubeVirt"          # legacy oVirt, mapped to KubeVirt in the console
+  Alibaba: "Alibaba"         # Alibaba Cloud
+  EquinixMetal: "EquinixMetal"  # Equinix Metal (bare metal cloud)
+  None: "Other"              # platform not reported or unknown
+  External: "Other"          # external infrastructure
+
+# Environment label applied to the ManagedCluster object (e.g., lab, dev,
+# staging, production). Override via -e for non-lab deployments.
+acm_dr_spoke_manager_cluster_environment: "lab"
+
+# -----------------------------------------------------------------------------
+# 5. BEHAVIORAL AND SECURITY SETTINGS (KCS 7039710)
+# -----------------------------------------------------------------------------
+# Defines the default action if the role is called directly (prep or detach)
+acm_dr_spoke_manager_action: "prep"
+
+# Defines whether the role should clean up the Spoke's bootstrap ServiceAccount and ClusterRoleBinding
+acm_dr_spoke_manager_cleanup_bootstrap_sa: true
+
+# When true, task 1.1.0 (sanitization) skips clearing api_url and api_token. Set to
+# true only by callers that explicitly pre-set both values via include_role vars before
+# including this role (e.g., Stage 07 Operation C in 07_sanitize_passive_hub.yml task
+# 7.2.4). Without this flag, the sanitization block wipes caller-supplied values and
+# falls through to the ACM_DR_SPOKE_HOST env var, which is absent on failover job
+# templates that have no ACM DR - Spoke Cluster credential attached. This causes the
+# auto-import-secret to receive an empty or wrong URL for non-OCP spokes (AKS, EKS,
+# GKE, IKS), installing the klusterlet on the wrong cluster.
+acm_dr_spoke_manager_credentials_provided: false  # bool - set true when caller pre-sets api_url/api_token
+
+# Seconds to wait after auto-import-secret creation for the import
+# controller to bootstrap the klusterlet. If the klusterlet namespace
+# does not exist on the Spoke after this period, the fallback applies
+# the klusterlet manifests directly from the Hub ManifestWorks.
+acm_dr_spoke_manager_import_bootstrap_wait: 15  # seconds - import controller bootstrap grace period
+
+# Grace period after deleting hub-kubeconfig-secret for the klusterlet registration
+# agent to detect the deletion and trigger re-registration (task 1.2.6j, bootstrap-switch
+# path). Increase in environments with slow controller reconciliation loops.
+acm_dr_spoke_manager_bootstrap_switch_restart_wait: 30  # seconds - klusterlet restart grace period
+
+# Wait after applying klusterlet CRDs directly to the Spoke (fallback bootstrap path,
+# task 1.2.8b). Ensures the API server fully registers the new CRD before the
+# Klusterlet CR and operator Deployment are applied. 5 seconds is sufficient for
+# most environments; increase only if CRD registration is slow.
+acm_dr_spoke_manager_crd_establish_wait: 5  # seconds - CRD propagation to API server
+
+# Polling retries and delay for the 1.3.2 wait loop that checks when the Spoke
+# reaches ManagedClusterConditionAvailable=True. ARO OCP Spokes with klusterlet
+# v2.9.5 (RHACM 2.14) need 3-10 minutes for bootstrap registration after the
+# RBAC fix (1.2.4b/1.2.5b). 60 × 15s = 15 minutes max before diagnostic fires.
+acm_dr_spoke_manager_spoke_reconcile_retries: 60  # count - 60 × 15s = 15 minutes max
+acm_dr_spoke_manager_spoke_reconcile_delay: 15  # seconds between retries
+
+# Phase 1 wait: poll until the ManagedCluster disappears after a normal detach
+# (no finalizer blocker). 30 retries x 10s = 300 seconds max.
+acm_dr_spoke_manager_detach_wait_retries: 30  # count - initial detach poll retries (300s total)
+acm_dr_spoke_manager_detach_wait_delay: 10    # seconds - delay between initial detach poll retries
+
+# Maximum retries when waiting for a ManagedCluster to disappear after
+# force-removing stuck finalizers (inline break-glass, Phase 2c). Each retry
+# waits acm_dr_spoke_manager_detach_finalizer_delay seconds. Shorter than the
+# Phase 1 wait (300s) because the finalizer blocker has been patched out.
+acm_dr_spoke_manager_detach_finalizer_retries: 12  # count - post-remediation wait retries (120s total)
+acm_dr_spoke_manager_detach_finalizer_delay: 10  # seconds - delay between post-remediation retries
+
+# -----------------------------------------------------------------------------
+# 6. SPOKE ONBOARDING (SA PROVISIONING + FLEET UPDATE)
+# -----------------------------------------------------------------------------
+# Namespace and SA names for the permanent automation identity provisioned on
+# the Spoke during the 'onboard' action. These match the static manifest at
+# examples/rbac/ansible-dr-orchestrator-rbac.yaml and the convention used by
+# examples/examples/scripts/cluster-onboarding/02_provision_automation_sa.sh.
+acm_dr_spoke_manager_automation_namespace: "ansible-automation"  # namespace for the SA and token Secret
+acm_dr_spoke_manager_automation_sa_name: "ansible-dr-orchestrator"  # ServiceAccount name
+acm_dr_spoke_manager_automation_secret_name: "ansible-dr-orchestrator-token"  # token Secret name
+
+# Fleet Secret metadata (must match acm_dr_kubeconfig_resolver defaults).
+# The fleet Secret aggregates all Spoke SA tokens into a single kubeconfig
+# stored on the Hub. OADP replicates it to passive Hubs automatically.
+acm_dr_spoke_manager_fleet_secret_name: "spoke-fleet-kubeconfig"  # Secret name on the Hub
+acm_dr_spoke_manager_fleet_secret_namespace: "ansible-automation"  # namespace on the Hub
+acm_dr_spoke_manager_fleet_secret_key: "kubeconfig"  # data key inside the Secret
+
+# TLS policy for new fleet entries: skip TLS verification when no CA data is
+# available (default for ARO/public-CA clusters in lab environments).
+# Production deployments should provide CA data via the credential and set
+# this to false.
+acm_dr_spoke_manager_fleet_skip_tls_when_no_ca: true  # bool - skip TLS verify when CA is absent
+
+# When true (default), the detach action removes the Spoke's SA context from
+# the fleet Secret (spoke-fleet-kubeconfig) on the Hub after the ManagedCluster
+# and klusterlet are removed. Set to false to preserve stale entries for
+# forensics or when a re-onboard is planned immediately after.
+acm_dr_spoke_manager_fleet_cleanup_on_detach: true  # bool - remove Spoke from fleet Secret on detach
+
+# -----------------------------------------------------------------------------
+# 7. HUB-SIDE MIRRORED SA TOKEN SECRET (OADP BACKUP FALLBACK)
+# -----------------------------------------------------------------------------
+# During 'onboard', Phase 3.5 writes a per-Spoke Secret to the Hub containing
+# the SA token and host URL. The OADP backup label ensures it is replicated to
+# passive Hubs in the cluster-level BackupSchedule alongside the fleet Secret.
+# Stage 07 Operation C reads this Secret as a fallback for Spokes whose context
+# is absent from the restored fleet kubeconfig (added after the last OADP snapshot).
+acm_dr_spoke_manager_hub_token_mirror_enabled: true  # bool - write mirrored Secret during onboard (opt-out)
+acm_dr_spoke_manager_hub_token_mirror_namespace: "ansible-automation"  # namespace for the mirrored Secret on the Hub
+acm_dr_spoke_manager_hub_token_mirror_prefix: "acm-dr-"  # prefix for the mirrored Secret name (e.g. acm-dr-<spoke>-sa-token)
+
+# When false (default), Phase 1.6 fails if ACM_DR_SPOKE_TOKEN is not set and
+# hub_token_mirror_enabled=true. The absent token means Operation C will not
+# function for this Spoke during failover. Set to true only when you have
+# independently confirmed that the Spoke will always be present in the OADP
+# fleet kubeconfig Secret (e.g. it was onboarded before the last backup cycle).
+acm_dr_spoke_manager_allow_missing_spoke_credential: true  # bool - skip assert when ACM_DR_SPOKE_TOKEN is absent
+
+# -----------------------------------------------------------------------------
+# 8. MSA PROVISIONER (OPT-IN)
+# -----------------------------------------------------------------------------
+# When true, Phase 4.5 of the 'onboard' action calls acm_dr_msa_provisioner to
+# create a ManagedServiceAccount CR and ManifestWork on the Hub. The klusterlet
+# then creates the SA on the Spoke and writes the token Secret back to the Hub.
+# Requires the managed-serviceaccount addon enabled in MultiClusterEngine.
+acm_dr_spoke_manager_msa_enabled: false  # bool - call acm_dr_msa_provisioner during onboard (opt-in)
+...

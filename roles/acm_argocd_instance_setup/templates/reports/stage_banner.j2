@@ -1,0 +1,8 @@
+{% set _acm_argocd_instance_setup_banner_all_lines = [acm_argocd_instance_setup_banner_title] + acm_argocd_instance_setup_banner_lines %}
+{% set _acm_argocd_instance_setup_banner_max_len = _acm_argocd_instance_setup_banner_all_lines | map('length') | max %}
+{% set _acm_argocd_instance_setup_banner_sep = (acm_argocd_instance_setup_banner_sep_char | default(acm_argocd_instance_setup_separator_char) | default('=')) * (_acm_argocd_instance_setup_banner_max_len + 2) %}
+{{ _acm_argocd_instance_setup_banner_sep }}
+{% for acm_argocd_instance_setup_banner_line in _acm_argocd_instance_setup_banner_all_lines %}
+ {{ acm_argocd_instance_setup_banner_line }}
+{% endfor %}
+{{ _acm_argocd_instance_setup_banner_sep }}

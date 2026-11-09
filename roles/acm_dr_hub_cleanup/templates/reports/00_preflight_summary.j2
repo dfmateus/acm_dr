@@ -1,0 +1,10 @@
+{% set _sep = (acm_dr_hub_cleanup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 00 - PREFLIGHT & SAFETY VALIDATION PASSED
+{{ _sep }}
+ 🎯 TARGET CONTEXT:            {{ k8s_target_context }}
+ 🔐 OPENSHIFT ACCESS:         cluster-admin confirmed
+ 🚀 RHACM DETECTED?:         {{ (acm_dr_hub_cleanup_discover_mch.resources | default([]) | length > 0) | ternary('Yes', 'No (already absent / idempotent)') }}
+ 📅 BACKUPSCHEDULE ACTIVE?:    {{ acm_dr_hub_cleanup_looks_like_active_hub | ternary('Yes (override applied)', 'No') }}
+ 🔎 EXECUTION MODE:         {{ (acm_dr_hub_cleanup_dry_run | default(false) | bool) | ternary('DRY-RUN (simulation)', 'PRODUCTION (actual removal)') }}
+{{ _sep }}

@@ -1,0 +1,60 @@
+---
+# examples/aap/controller_users.yml
+#
+# Agent user definitions for the MCP optional (examples/mcp/).
+# These users enable AI assistant access to the AAP Controller API.
+#
+# Two users with different access levels:
+#
+#   aiops-readonly   - read-only: the agent can query jobs, inventory, and
+#                      platform health but cannot launch anything.
+#                      Use this with allow_write_operations: false (MCP default).
+#
+#   aiops-operator   - restricted write: the agent can launch low-risk JTs only.
+#                      WF-01 and WF-02 are excluded from its RBAC.
+#                      Use this with allow_write_operations: true (read-write mode).
+#                      See examples/mcp/docs/03-read-write.md before enabling.
+#
+# PLACEHOLDER VARIABLES - set in import-vars.yml before importing:
+#
+#   {{ aiops_readonly_password }}   password for aiops-readonly
+#   {{ aiops_operator_password }}   password for aiops-operator
+#
+# These passwords are for login only; the agent uses Personal Access Tokens,
+# not the password. The password is needed to satisfy the Controller API
+# requirement that every user has a non-empty password.
+# Never commit import-vars.yml with real passwords filled in.
+#
+# IMPORT ORDER: users must be created after organizations but before roles.
+# Run controller_organizations first, then this file, then controller_roles.yml.
+
+controller_users:
+
+  # ---------------------------------------------------------------------------
+  # aiops-readonly - query-only access for AI agent in read-only MCP mode
+  # ---------------------------------------------------------------------------
+  # Personal Access Tokens for this user are scoped 'read'.
+  # The user has no execute permission on any JT or WJT.
+  # RBAC is defined in controller_roles.yml.
+  - username: "aiops-readonly"
+    password: "{{ aiops_readonly_password }}"
+    email: "aiops-readonly@placeholder.invalid"
+    first_name: "AIOps"
+    last_name: "Read-Only Agent"
+    is_superuser: false
+    update_secrets: false  # prevents password churn on re-import
+
+  # ---------------------------------------------------------------------------
+  # aiops-operator - restricted-write access for AI agent in read-write MCP mode
+  # ---------------------------------------------------------------------------
+  # Personal Access Tokens for this user are scoped 'write'.
+  # Execute permission is limited to low-risk JTs only (see controller_roles.yml).
+  # WF-01 (Hub Switchover) and WF-02 (Planned Maintenance) are read-only for this user.
+  - username: "aiops-operator"
+    password: "{{ aiops_operator_password }}"
+    email: "aiops-operator@placeholder.invalid"
+    first_name: "AIOps"
+    last_name: "Operator Agent"
+    is_superuser: false
+    update_secrets: false  # prevents password churn on re-import
+...

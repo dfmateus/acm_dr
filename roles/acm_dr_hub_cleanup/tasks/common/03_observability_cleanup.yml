@@ -1,0 +1,100 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 03 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 03 - Observability Cleanup] | Display Observability removal metadata - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_cleanup_banner_title: "📈 STAGE 03 - Remove MultiClusterObservability (Thanos)"
+    acm_dr_hub_cleanup_banner_lines:
+      - "🎯 TARGET CONTEXT: {{ k8s_target_context }}"
+  run_once: true
+
+# =============================================================================
+# STEP 3.1: REMOVE THE MULTICLUSTEROBSERVABILITY CUSTOM RESOURCE
+# =============================================================================
+# Note: MultiClusterObservability is a CRD provided by the ACM operator itself
+# (multiclusterhub-operator), not by a separate operator. Since ACM
+# as a whole is removed in Stage 04, there is no Observability "operator"
+# to preserve here, only the local configuration data for this cluster.
+
+- name: "[STAGE 03 - Observability Cleanup] | 3.1.1) Remove MultiClusterObservability CR (wait for Thanos dismount) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: observability.open-cluster-management.io/v1beta2
+    kind: MultiClusterObservability
+    name: "{{ acm_dr_hub_cleanup_observability_mco_name }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_mco_delete_timeout | default(600) }}"
+  register: acm_dr_hub_cleanup_mco_removal
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  ignore_errors: true
+
+- name: "[STAGE 03 - Observability Cleanup DIAGNOSTIC] | ❌ MCO removal timed out"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => MultiClusterObservability '{{ acm_dr_hub_cleanup_observability_mco_name }}'
+      removal timed out after {{ acm_dr_hub_cleanup_mco_delete_timeout | default(600) }}s
+      on context '{{ k8s_target_context }}'.
+      The MCO CR may have stuck finalizers. Check:
+      oc get mco -o yaml --context {{ k8s_target_context }}.
+      Ensure the multiclusterhub-operator is still running to reconcile the deletion.
+  when:
+    - acm_dr_hub_cleanup_mco_removal is defined
+    - acm_dr_hub_cleanup_mco_removal is failed
+
+# =============================================================================
+# STEP 3.2: REMOVE ORPHAN PVCS AND THE OBSERVABILITY NAMESPACE
+# =============================================================================
+
+- name: "[STAGE 03 - Observability Cleanup] | 3.2.1) Remove remaining Thanos PVCs by label - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ acm_dr_hub_cleanup_observability_namespace }}"
+    label_selectors:
+      - observability.open-cluster-management.io/name
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[STAGE 03 - Observability Cleanup] | 3.2.2) Remove Observability namespace (thanos/pull-secret Secrets together) - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    kind: Namespace
+    name: "{{ acm_dr_hub_cleanup_observability_namespace }}"
+    wait: true
+    wait_timeout: "{{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}"
+  register: acm_dr_hub_cleanup_obs_ns_removal
+  check_mode: "{{ acm_dr_hub_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+  ignore_errors: true
+
+- name: "[STAGE 03 - Observability Cleanup DIAGNOSTIC] | ❌ Observability namespace stuck"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Namespace '{{ acm_dr_hub_cleanup_observability_namespace }}'
+      did not terminate within {{ acm_dr_hub_cleanup_namespace_delete_timeout | default(600) }}s
+      on context '{{ k8s_target_context }}'.
+      Check for stuck finalizers: oc get ns {{ acm_dr_hub_cleanup_observability_namespace }}
+      -o yaml --context {{ k8s_target_context }}.
+      Use examples/scripts/break-glass/force_delete_namespace.sh if needed.
+  when:
+    - acm_dr_hub_cleanup_obs_ns_removal is defined
+    - acm_dr_hub_cleanup_obs_ns_removal is failed
+
+# =============================================================================
+# STEP 3.3: COMPLETION SUMMARY AND STAGE 03 STATUS
+# =============================================================================
+
+- name: "[STAGE 03 - Observability Cleanup] | Display Observability removal completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/03_observability_cleanup_summary.j2').split('\n') }}"
+  run_once: true
+...

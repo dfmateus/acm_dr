@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "aap-jobs": {
+      "type": "http",
+      "url": "https://<MCP_SERVER_ROUTE>/job_management/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:AIOPS_TOKEN}"
+      }
+    },
+    "aap-inventory": {
+      "type": "http",
+      "url": "https://<MCP_SERVER_ROUTE>/inventory_management/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:AIOPS_TOKEN}"
+      }
+    },
+    "aap-monitoring": {
+      "type": "http",
+      "url": "https://<MCP_SERVER_ROUTE>/system_monitoring/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:AIOPS_TOKEN}"
+      }
+    }
+  }
+}

@@ -1,0 +1,59 @@
+---
+# examples/aap/controller_execution_environments.yml
+#
+# Execution Environment definition for Red Hat Ansible Automation Platform.
+# Compatible with the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES: replace before importing:
+#   {{ aap_organization }}          → Your AAP Organization name
+#   {{ aap_execution_environment }} → EE name as you want it to appear in the AAP UI
+#                                     (must match the value used in controller_job_templates.yml)
+#   {{ aap_ee_image }}              → Full image reference including registry, name, and tag.
+#                                     Build the EE locally with ansible-builder and push to your
+#                                     private registry before importing this file.
+#                                     Example: registry.example.com/ee/acm-dr-orchestrator-ee:latest
+#
+# BUILD THE EE IMAGE FIRST:
+#   ansible-builder build -t acm-dr-orchestrator-ee:latest -f execution-environment.yml
+#   podman push acm-dr-orchestrator-ee:latest registry.example.com/ee/acm-dr-orchestrator-ee:latest
+#
+# See docs/aap/aap-setup.md for the full EE build and registry push procedure.
+#
+# Usage:
+#   ansible-playbook -e @examples/aap/controller_execution_environments.yml \
+#     -e "controller_hostname=https://aap.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=changeme" \
+#     -e "aap_organization=ACM DR Operations" \
+#     -e "aap_execution_environment=acm-dr-orchestrator-ee" \
+#     -e "aap_ee_image=registry.example.com/ee/acm-dr-orchestrator-ee:latest" \
+#     infra.controller_configuration.execution_environments
+#
+# IMPORT ORDER: create the organization first, then EEs, then everything else.
+
+controller_execution_environments:
+
+  # ---------------------------------------------------------------------------
+  # ACM DR Orchestrator EE
+  # ---------------------------------------------------------------------------
+  # The EE packages:
+  #   - ansible-core >= 2.16.0
+  #   - kubernetes.core, azure.azcollection, community.general collections
+  #   - Python dependencies: kubernetes, azure-mgmt-*, openshift, boto3, botocore
+  #   - System tools: oc, jq
+  #
+  # See execution-environment.yml at the project root for the full ansible-builder
+  # v3 definition, including the base image, pip/dnf requirements, and galaxy deps.
+  - name: "{{ aap_execution_environment }}"
+    image: "{{ aap_ee_image }}"
+    # pull: missing - only pull the image when it is not already present in the local
+    # container runtime cache. Avoids rate-limiting issues on airgapped clusters where
+    # the registry may be slow or unreachable after the initial push.
+    pull: missing
+    organization: "{{ aap_organization }}"
+    description: >-
+      Execution Environment for the dfmateus.acm_dr collection. Contains all required Ansible
+      collections, Python libraries, and CLI tools (oc, kubectl, jq) for RHACM Multi-Cluster Business
+      Continuity automation. The Azure CLI and AWS CLI are not included; cloud credentials are
+      injected via AAP credential types and consumed by Ansible modules directly.
+...

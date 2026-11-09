@@ -1,0 +1,89 @@
+---
+# =============================================================================
+# STEP 6: CONTROL PLANE TOPOLOGY DETECTION (OPTIONAL)
+# =============================================================================
+# Queries the OpenShift Infrastructure CR on the target cluster to detect the
+# control plane topology (HighlyAvailable vs External/HCP) and platform
+# (Azure, AWS, etc.). Sets cross-role facts consumed by acm_dr_hub_setup,
+# acm_dr_hub_cleanup, and acm_dr_failover_manager for provider-aware routing.
+#
+# Non-OCP clusters (AKS, EKS, GKE, IKS, vanilla K8s) do not have the
+# Infrastructure CRD. The query uses failed_when: false to degrade gracefully,
+# setting all facts to Unknown/false. Callers should not assume OCP presence
+# based on these facts alone.
+#
+# Override: set -e acm_dr_topology_override=External (or HighlyAvailable)
+# to skip auto-detection and force a topology classification.
+
+- name: "[KUBECONFIG RESOLVER] | 6.1) Query Infrastructure CR on target cluster"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: config.openshift.io/v1
+    kind: Infrastructure
+    name: cluster
+  register: acm_dr_kubeconfig_resolver_infra_cr
+  # Infrastructure CRD does not exist on non-OCP clusters. Treat the
+  # lookup failure as "not an OCP cluster" and fall through to defaults.
+  failed_when: false
+  when:
+    - k8s_target_context is defined
+    - k8s_target_context | default('', true) | length > 0
+    - acm_dr_topology_override | default('', true) | length == 0
+
+# Extract topology, platform, and infrastructure name from the CR response.
+# Each field is guarded against missing keys so a partial CR (or empty
+# resources list from a failed lookup) produces 'Unknown' / false.
+- name: "[KUBECONFIG RESOLVER] | 6.2) Extract topology facts from Infrastructure CR"  # noqa var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    # e.g. "HighlyAvailable" (Classic/standalone) or "External" (HCP/hosted)
+    acm_dr_control_plane_topology: >-  # noqa var-naming[no-role-prefix]
+      {{ (acm_dr_kubeconfig_resolver_infra_cr.resources | default([]))[0].status.controlPlaneTopology
+         | default('Unknown')
+         if (acm_dr_kubeconfig_resolver_infra_cr.resources | default([]) | length > 0)
+         else 'Unknown' }}
+    # e.g. "Azure", "AWS", "None" (bare-metal), "VSphere", etc.
+    acm_dr_platform: >-  # noqa var-naming[no-role-prefix]
+      {{ (acm_dr_kubeconfig_resolver_infra_cr.resources | default([]))[0].status.platform
+         | default('Unknown')
+         if (acm_dr_kubeconfig_resolver_infra_cr.resources | default([]) | length > 0)
+         else 'Unknown' }}
+    # Infrastructure name from the status (e.g. "your-hub-01-xxxxx")
+    acm_dr_infrastructure_name: >-  # noqa var-naming[no-role-prefix]
+      {{ (acm_dr_kubeconfig_resolver_infra_cr.resources | default([]))[0].status.infrastructureName
+         | default('Unknown')
+         if (acm_dr_kubeconfig_resolver_infra_cr.resources | default([]) | length > 0)
+         else 'Unknown' }}
+  when:
+    - acm_dr_topology_override | default('', true) | length == 0
+
+# When the user supplies an explicit override, skip the CR query and set
+# the topology directly. Platform and infra name remain Unknown since we
+# did not query the cluster.
+- name: "[KUBECONFIG RESOLVER] | 6.3) Apply manual topology override"  # noqa var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    acm_dr_control_plane_topology: "{{ acm_dr_topology_override }}"  # noqa var-naming[no-role-prefix]
+    acm_dr_platform: "Unknown"  # noqa var-naming[no-role-prefix]
+    acm_dr_infrastructure_name: "Unknown"  # noqa var-naming[no-role-prefix]
+  when:
+    - acm_dr_topology_override | default('', true) | length > 0
+
+# Derived boolean for callers that need a simple "is this HCP?" check.
+# External controlPlaneTopology means the control plane runs outside the
+# cluster (ARO HCP, ROSA HCP, or any future Hosted Control Plane offering).
+- name: "[KUBECONFIG RESOLVER] | 6.4) Set hosted control plane boolean"  # noqa var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    acm_dr_is_hosted_control_plane: >-  # noqa var-naming[no-role-prefix]
+      {{ (acm_dr_control_plane_topology | default('Unknown') | trim) == 'External' }}
+
+- name: "[KUBECONFIG RESOLVER] | 6.5) 🔎 Report detected topology"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 Topology detection on '{{ k8s_target_context | default("N/A") }}':
+      controlPlaneTopology={{ acm_dr_control_plane_topology | default('Unknown') | trim }},
+      platform={{ acm_dr_platform | default('Unknown') | trim }},
+      isHostedControlPlane={{ acm_dr_is_hosted_control_plane | default(false) }},
+      infrastructureName={{ acm_dr_infrastructure_name | default('Unknown') | trim }}.
+  when:
+    - k8s_target_context is defined
+    - k8s_target_context | default('', true) | length > 0
+...

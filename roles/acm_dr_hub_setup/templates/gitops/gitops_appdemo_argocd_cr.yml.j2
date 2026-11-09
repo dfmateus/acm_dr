@@ -1,0 +1,38 @@
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata:
+  name: openshift-gitops-appdemo
+  namespace: {{ acm_dr_hub_setup_gitops_namespace_appdemo | default('openshift-gitops-appdemo') }}
+spec:
+  # Real-world finding: the example repository manifests (AppDemo/namespace.yaml,
+  # AppDemo2/namespace.yaml) declare the Namespace itself as a resource managed by the
+  # Application. Since this non-default ArgoCD instance runs with the 'in-cluster' Secret
+  # scoped to its own namespace ('namespaced mode' of the gitops-engine), it can NEVER
+  # reconcile a CLUSTER-SCOPED resource like Namespace - it always fails with "cluster level
+  # Namespace ... can not be managed when in namespaced mode", regardless of RBAC,
+  # CreateNamespace=true, or labels. The namespace is already pre-created by this role
+  # (gitops_namespaces.yml.j2); excluding the Namespace kind from this instance's scope
+  # prevents the management attempt without affecting synchronization of the remaining
+  # resources (Route, Service, Deployment) within it.
+  resourceExclusions: |
+    - apiGroups:
+        - ""
+      kinds:
+        - Namespace
+      clusters:
+        - "*"
+  applicationSet:
+    enabled: true
+  server:
+    route:
+      enabled: true
+  sso:
+    provider: dex
+    dex:
+      openShiftOAuth: true
+  rbac:
+    defaultPolicy: ""
+    policy: |
+      g, system:cluster-admins, role:admin
+      g, cluster-admins, role:admin
+    scopes: '[groups]'

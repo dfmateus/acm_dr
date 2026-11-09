@@ -1,0 +1,124 @@
+---
+# roles/acm_dr_upgrade_manager/tasks/00_preflight.yml
+# =============================================================================
+# STAGE 00: PREFLIGHT AND SAFETY GATES
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# STEP 0.1: REQUIRED VARIABLE VALIDATION
+# ---------------------------------------------------------------------------
+
+- name: "[STAGE 00 - Preflight] | 0.1.1) Validate required variable: k8s_target_context"
+  ansible.builtin.assert:
+    that:
+      - k8s_target_context is defined
+      - k8s_target_context | default('', true) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => 'k8s_target_context' is not defined. Pass it via
+      -e or attach an 'ACM DR - Target Cluster' credential to the AAP Job Template.
+    success_msg: "✅ PASSED! Oh. Yes! => Target context resolved: {{ k8s_target_context }}"
+
+- name: "[STAGE 00 - Preflight] | 0.1.2) Validate required variable: acm_dr_upgrade_manager_target_acm_version"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_upgrade_manager_target_acm_version | default('', true) | trim | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Target ACM version is not defined. Pass it via
+      -e acm_dr_upgrade_manager_target_acm_version=2.15 or via the WF survey
+      acm_dr_failover_manager_target_acm_version=2.15.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Target version set:
+      {{ acm_dr_upgrade_manager_target_acm_version | trim }}
+      -> channel: {{ acm_dr_upgrade_manager_target_channel | trim }}
+
+# ---------------------------------------------------------------------------
+# STEP 0.2: READ CURRENT STATE FROM THE CLUSTER
+# ---------------------------------------------------------------------------
+
+- name: "[STAGE 00 - Preflight] | 0.2.1) Read current ACM Subscription"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ acm_dr_upgrade_manager_subscription_name }}"
+    namespace: "{{ acm_dr_upgrade_manager_acm_namespace }}"
+  register: acm_dr_upgrade_manager_subscription_info
+
+- name: "[STAGE 00 - Preflight] | 0.2.2) Extract current Subscription channel"
+  ansible.builtin.set_fact:
+    acm_dr_upgrade_manager_current_channel: >-
+      {{ acm_dr_upgrade_manager_subscription_info.resources[0].spec.channel
+         | default('unknown') }}
+  when: acm_dr_upgrade_manager_subscription_info.resources | default([]) | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.2.3) Read current MultiClusterHub"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: "{{ acm_dr_upgrade_manager_mch_name }}"
+    namespace: "{{ acm_dr_upgrade_manager_acm_namespace }}"
+  register: acm_dr_upgrade_manager_mch_info
+
+- name: "[STAGE 00 - Preflight] | 0.2.4) Extract current MCH version and phase"
+  ansible.builtin.set_fact:
+    acm_dr_upgrade_manager_current_mch_version: >-
+      {{ acm_dr_upgrade_manager_mch_info.resources[0].status.currentVersion
+         | default('unknown') }}
+    acm_dr_upgrade_manager_current_mch_phase: >-
+      {{ acm_dr_upgrade_manager_mch_info.resources[0].status.phase
+         | default('unknown') }}
+  when: acm_dr_upgrade_manager_mch_info.resources | default([]) | length > 0
+
+# ---------------------------------------------------------------------------
+# STEP 0.3: SAFETY GATES
+# ---------------------------------------------------------------------------
+
+- name: "[STAGE 00 - Preflight] | 0.3.1) 🛡️ GATE - Verify Subscription exists"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_upgrade_manager_subscription_info.resources | default([]) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => ACM Subscription '{{ acm_dr_upgrade_manager_subscription_name }}'
+      not found in namespace '{{ acm_dr_upgrade_manager_acm_namespace }}'
+      on context '{{ k8s_target_context }}'. Verify the ACM operator is installed.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => ACM Subscription found.
+      Current channel: {{ acm_dr_upgrade_manager_current_channel | default('unknown') }}
+
+- name: "[STAGE 00 - Preflight] | 0.3.2) 🛡️ GATE - Verify target channel differs from current"
+  ansible.builtin.assert:
+    that:
+      - (acm_dr_upgrade_manager_target_channel | trim) != (acm_dr_upgrade_manager_current_channel | default('unknown') | trim)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => The target channel '{{ acm_dr_upgrade_manager_target_channel | trim }}'
+      matches the current channel '{{ acm_dr_upgrade_manager_current_channel | default('unknown') }}'
+      on context '{{ k8s_target_context }}'. The hub is already at the target version - no upgrade needed.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Channel upgrade path confirmed:
+      {{ acm_dr_upgrade_manager_current_channel | default('unknown') }}
+      -> {{ acm_dr_upgrade_manager_target_channel | trim }}
+
+- name: "[STAGE 00 - Preflight] | 0.3.3) 🛡️ GATE - Verify MCH is Running before patching"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_upgrade_manager_current_mch_phase | default('unknown') | trim == 'Running'
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => MultiClusterHub is not in 'Running' phase
+      (current: '{{ acm_dr_upgrade_manager_current_mch_phase | default("unknown") }}')
+      on context '{{ k8s_target_context }}'. Patching the channel while the MCH is reconciling
+      is unsafe. Resolve the MCH issue before retrying.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => MCH is Running (version: {{ acm_dr_upgrade_manager_current_mch_version | default('unknown') }}).
+      Safe to patch the Subscription channel.
+
+- name: "[STAGE 00 - Preflight] | 0.3.4) 🔎 DRY-RUN notice - no changes will be applied"
+  ansible.builtin.debug:
+    msg: >-
+      🔎 DRY-RUN mode active. Skipping Stage 01 (channel patch + MCH wait).
+      Intended change: Subscription '{{ acm_dr_upgrade_manager_subscription_name }}'
+      spec.channel {{ acm_dr_upgrade_manager_current_channel | default('unknown') }}
+      -> {{ acm_dr_upgrade_manager_target_channel | trim }}
+      on context '{{ k8s_target_context }}'.
+  when: acm_dr_upgrade_manager_dry_run | default(false) | bool
+...

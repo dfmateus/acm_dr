@@ -1,0 +1,53 @@
+---
+# roles/acm_argocd_instance_cleanup/defaults/main.yml
+# =============================================================================
+# DEFAULT VARIABLES FILE - ARGOCD INSTANCE CLEANUP (GENERIC)
+# =============================================================================
+# Inverse operation of acm_argocd_instance: removes everything that role creates
+# for ONE named instance, without affecting the OpenShift GitOps Operator
+# (cluster-wide, shared by other instances) or any other ArgoCD instance
+# that already exists on the cluster.
+
+# -----------------------------------------------------------------------------
+# 1. COSMETIC AND LOGGING PARAMETERS
+# -----------------------------------------------------------------------------
+acm_argocd_instance_cleanup_separator_char: "="
+
+# Suppresses task output for security-sensitive operations (tokens, secrets,
+# kubeconfig content). Set to false (-e acm_argocd_instance_cleanup_debug_no_log=false)
+# to expose hidden output during troubleshooting sessions.
+acm_argocd_instance_cleanup_debug_no_log: true  # bool - set false to reveal no_log task output
+
+# -----------------------------------------------------------------------------
+# 2. IDENTITY OF THE INSTANCE TO REMOVE (REQUIRED)
+# -----------------------------------------------------------------------------
+acm_argocd_instance_cleanup_name: ""
+acm_argocd_instance_cleanup_namespace: ""
+
+# -----------------------------------------------------------------------------
+# 3. SAFETY GATE (EXPLICIT CONFIRMATION REQUIRED)
+# -----------------------------------------------------------------------------
+acm_argocd_instance_cleanup_confirm: false
+
+# -----------------------------------------------------------------------------
+# 4. EXECUTION MODE
+# -----------------------------------------------------------------------------
+acm_argocd_instance_cleanup_dry_run: false
+
+# -----------------------------------------------------------------------------
+# 5. MANAGED NAMESPACES (APPLICATION TARGETS) TO ALSO REMOVE
+# -----------------------------------------------------------------------------
+# Real-World Finding (see roles/acm_argocd_instance_cleanup - Real-World
+# Finding: Removal Order and the ArgoCD Finalizer): provide the SAME list
+# of names used during creation (acm_argocd_instance_managed_namespaces);
+# the role does not attempt to "guess" which namespaces the instance managed.
+acm_argocd_instance_cleanup_managed_namespaces: []
+acm_argocd_instance_cleanup_remove_managed_namespaces: true
+
+# -----------------------------------------------------------------------------
+# 6. WAIT TIMEOUTS (SECONDS)
+# -----------------------------------------------------------------------------
+acm_argocd_instance_cleanup_application_delete_retries: 20
+acm_argocd_instance_cleanup_application_delete_delay: 5  # seconds between retries
+acm_argocd_instance_cleanup_namespace_delete_timeout: 300  # seconds (5 minutes)
+...

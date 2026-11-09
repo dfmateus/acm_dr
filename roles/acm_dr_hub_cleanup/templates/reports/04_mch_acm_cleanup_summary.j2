@@ -1,0 +1,14 @@
+{% set _sep = (acm_dr_hub_cleanup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 04 - RED HAT ACM FULLY REMOVED
+{{ _sep }}
+ 🗑️  REMOVED: MultiClusterHub, Subscription '{{ acm_dr_hub_cleanup_mch_operator_subscription }}',
+              installed CSV, OperatorGroup and the namespace '{{ acm_dr_hub_cleanup_mch_namespace }}'.
+ ⚠️  REAL FINDING: confirmed in actual testing that the ACM 'cluster-backup' component also
+              dismantles, by cascade, the OADP namespace/OperatorGroup/Subscription in
+              '{{ acm_dr_hub_cleanup_oadp_namespace }}' - even though this role never removes
+              them directly. Manually verify whether the OADP Operator survived (README).
+ 📌 NOTE: ACM CustomResourceDefinitions (CRDs) were INTENTIONALLY preserved
+         (low conflict risk, and a new installation via acm_dr_hub_setup reuses
+         them normally). See README for the optional manual command to fully remove CRDs.
+{{ _sep }}

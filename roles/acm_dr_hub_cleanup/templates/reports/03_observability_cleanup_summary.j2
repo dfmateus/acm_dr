@@ -1,0 +1,9 @@
+{% set _sep = (acm_dr_hub_cleanup_separator_char | default('=')) * 70 %}
+{{ _sep }}
+ ✅ STAGE 03 - OBSERVABILITY (THANOS) REMOVED
+{{ _sep }}
+ 🗑️  REMOVED: MultiClusterObservability, orphaned PVCs and the namespace
+              '{{ acm_dr_hub_cleanup_observability_namespace }}' (including Secrets thanos-object-storage
+              and multiclusterhub-operator-pull-secret).
+ ☁️  PRESERVED IN CLOUD: the Observability {{ ((acm_dr_hub_cleanup_cloud_provider | default('azure')) == 'aws') | ternary('S3 bucket', 'Azure container') }} (Thanos history) was NOT deleted.
+{{ _sep }}

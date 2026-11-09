@@ -1,0 +1,208 @@
+---
+# roles/acm_dr_msa_provisioner/tasks/main.yml
+# =============================================================================
+# MANAGED SERVICE ACCOUNT PROVISIONER
+# =============================================================================
+# All operations target the Hub only. The RHACM klusterlet handles Spoke-side
+# SA creation automatically after the ManagedServiceAccount CR is created.
+# =============================================================================
+
+# =============================================================================
+# PHASE 0: PREFLIGHT - VALIDATE REQUIRED VARIABLES
+# =============================================================================
+
+- name: "[MSA PROVISIONER] | 0.0.1) Validate hub_context and spoke_name are provided"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_msa_provisioner_hub_context | default('', true) | length > 0
+      - acm_dr_msa_provisioner_spoke_name | default('', true) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Both acm_dr_msa_provisioner_hub_context and
+      acm_dr_msa_provisioner_spoke_name are required. Pass them via role vars
+      or -e extra-vars.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Hub context '{{ acm_dr_msa_provisioner_hub_context }}'
+      and Spoke name '{{ acm_dr_msa_provisioner_spoke_name }}' resolved.
+
+# =============================================================================
+# PHASE 0b: PREFLIGHT - CHECK MANAGED-SERVICEACCOUNT ADDON IS ENABLED
+# =============================================================================
+# The ManagedServiceAccount CRD must be present on the Hub. If the addon is not
+# installed, the k8s_info call returns an empty list (not an error) because the
+# API group does not exist. We assert that at least one result comes back after
+# checking the CRD directly.
+
+- name: "[MSA PROVISIONER] | 0.1.1) Check managed-serviceaccount addon CRD on Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_msa_provisioner_hub_context }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: managedserviceaccounts.authentication.open-cluster-management.io
+  register: acm_dr_msa_provisioner_msa_crd_info
+  failed_when: false
+
+- name: "[MSA PROVISIONER] | 0.1.2) Assert managed-serviceaccount addon CRD is present"
+  ansible.builtin.assert:
+    that:
+      - (acm_dr_msa_provisioner_msa_crd_info.resources | default([])) | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => ManagedServiceAccount CRD not found on Hub
+      '{{ acm_dr_msa_provisioner_hub_context }}'. The managed-serviceaccount addon
+      must be enabled. In MultiClusterEngine: set
+      spec.overrides.components[managed-serviceaccount].enabled=true. In
+      ManagedClusterAddOn: create the addon CR in namespace
+      '{{ acm_dr_msa_provisioner_spoke_name }}'.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => ManagedServiceAccount CRD found on Hub
+      '{{ acm_dr_msa_provisioner_hub_context }}'. Addon is enabled.
+
+# =============================================================================
+# PHASE 1: CREATE MANAGEDSERVICEACCOUNT CR ON THE HUB
+# =============================================================================
+# The klusterlet reads this CR and creates the ServiceAccount on the Spoke.
+# The token is written back as a Secret in the same namespace and same name.
+
+- name: "[MSA PROVISIONER] | 1.1.1) Create ManagedServiceAccount CR on Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_msa_provisioner_hub_context }}"
+    state: present
+    definition:
+      apiVersion: authentication.open-cluster-management.io/v1beta1
+      kind: ManagedServiceAccount
+      metadata:
+        name: "{{ acm_dr_msa_provisioner_msa_name }}"
+        namespace: "{{ acm_dr_msa_provisioner_spoke_name }}"
+      spec:
+        rotation:
+          validity: "{{ acm_dr_msa_provisioner_ttl }}"
+          enabled: true
+
+- name: "[MSA PROVISIONER] | 1.1.2) ✅ ManagedServiceAccount CR created on Hub"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ ManagedServiceAccount '{{ acm_dr_msa_provisioner_spoke_name }}/{{ acm_dr_msa_provisioner_msa_name }}'
+      created on Hub '{{ acm_dr_msa_provisioner_hub_context }}' (TTL: {{ acm_dr_msa_provisioner_ttl }}).
+      The klusterlet will create the ServiceAccount on Spoke
+      '{{ acm_dr_msa_provisioner_spoke_name }}' and write the token Secret back to this Hub namespace.
+
+# =============================================================================
+# PHASE 2: CREATE MANIFESTWORK CLUSTERROLEBINDING ON THE HUB
+# =============================================================================
+# Deploys a ClusterRoleBinding via ManifestWork so the MSA ServiceAccount on
+# the Spoke gets the necessary permissions. The klusterlet applies it as soon
+# as the ManifestWork is processed.
+
+- name: "[MSA PROVISIONER] | 2.1.1) Create ManifestWork ClusterRoleBinding on Hub"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_msa_provisioner_hub_context }}"
+    state: present
+    definition:
+      apiVersion: work.open-cluster-management.io/v1
+      kind: ManifestWork
+      metadata:
+        name: "{{ acm_dr_msa_provisioner_msa_name }}-rbac"
+        namespace: "{{ acm_dr_msa_provisioner_spoke_name }}"
+      spec:
+        manifests:
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRoleBinding
+            metadata:
+              name: "{{ acm_dr_msa_provisioner_msa_name }}-admin"
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: "{{ acm_dr_msa_provisioner_cluster_role }}"
+            subjects:
+              - kind: ServiceAccount
+                # The managed-serviceaccount addon places the SA in this namespace
+                # on the Spoke. This namespace is created by the addon controller.
+                namespace: "{{ acm_dr_msa_provisioner_sa_namespace }}"
+                name: "{{ acm_dr_msa_provisioner_msa_name }}"
+
+- name: "[MSA PROVISIONER] | 2.1.2) ✅ ManifestWork ClusterRoleBinding created on Hub"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ ManifestWork '{{ acm_dr_msa_provisioner_spoke_name }}/{{ acm_dr_msa_provisioner_msa_name }}-rbac'
+      created on Hub '{{ acm_dr_msa_provisioner_hub_context }}'.
+      ClusterRoleBinding '{{ acm_dr_msa_provisioner_msa_name }}-admin' → {{ acm_dr_msa_provisioner_cluster_role }}
+      will be applied on Spoke '{{ acm_dr_msa_provisioner_spoke_name }}'.
+
+# =============================================================================
+# PHASE 3: WAIT FOR TOKEN SECRET TO APPEAR ON THE HUB
+# =============================================================================
+# The klusterlet writes the token Secret to the Hub namespace after creating the
+# SA on the Spoke. This normally takes 5-30 seconds but can be slower if the
+# Spoke is under load. Poll until the Secret has a non-empty token field.
+
+- name: "[MSA PROVISIONER] | 3.1.1) ⏳ Wait for klusterlet to write MSA token Secret to Hub"
+  kubernetes.core.k8s_info:
+    context: "{{ acm_dr_msa_provisioner_hub_context }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_msa_provisioner_spoke_name }}"
+    name: "{{ acm_dr_msa_provisioner_msa_name }}"
+  register: acm_dr_msa_provisioner_token_secret_info
+  until:
+    - (acm_dr_msa_provisioner_token_secret_info.resources | default([])) | length > 0
+    - acm_dr_msa_provisioner_token_secret_info.resources[0].data.token is defined
+    - acm_dr_msa_provisioner_token_secret_info.resources[0].data.token | length > 0
+  retries: "{{ acm_dr_msa_provisioner_wait_retries }}"
+  delay: "{{ acm_dr_msa_provisioner_wait_delay }}"
+  no_log: "{{ acm_dr_msa_provisioner_debug_no_log | default(true) | bool }}"
+
+- name: "[MSA PROVISIONER] | 3.1.2) ✅ MSA token Secret appeared on Hub"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ MSA token Secret '{{ acm_dr_msa_provisioner_spoke_name }}/{{ acm_dr_msa_provisioner_msa_name }}'
+      is present on Hub '{{ acm_dr_msa_provisioner_hub_context }}'.
+
+# =============================================================================
+# PHASE 4: PATCH OADP BACKUP LABEL ON THE TOKEN SECRET
+# =============================================================================
+# RHACM does not add the OADP backup label to MSA token Secrets automatically.
+# Without this patch, the Secret is not included in the cluster-level BackupSchedule
+# and is lost on Restore. Stage 07b reads this Secret to verify EE→Spoke
+# reachability after failover.
+
+- name: "[MSA PROVISIONER] | 4.1.1) Patch OADP backup label onto MSA token Secret"
+  kubernetes.core.k8s:
+    context: "{{ acm_dr_msa_provisioner_hub_context }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ acm_dr_msa_provisioner_spoke_name }}"
+    name: "{{ acm_dr_msa_provisioner_msa_name }}"
+    definition:
+      metadata:
+        labels:
+          cluster.open-cluster-management.io/backup: "cluster"
+          app.kubernetes.io/managed-by: "ansible-dr-orchestrator"
+
+- name: "[MSA PROVISIONER] | 4.1.2) ✅ OADP backup label patched onto MSA token Secret"
+  ansible.builtin.debug:
+    msg: >-
+      ✅ OADP backup label 'cluster.open-cluster-management.io/backup: cluster' patched onto
+      MSA token Secret '{{ acm_dr_msa_provisioner_spoke_name }}/{{ acm_dr_msa_provisioner_msa_name }}'.
+      OADP will replicate this Secret to passive Hubs in the next cluster-level BackupSchedule.
+
+# =============================================================================
+# PHASE 5: SUMMARY REPORT
+# =============================================================================
+
+- name: "[MSA PROVISIONER] | 5.1.1) Display MSA provisioning summary"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ✅ MSA PROVISIONING COMPLETE"
+      - "======================================================================"
+      - ""
+      - "  Hub:          {{ acm_dr_msa_provisioner_hub_context }}"
+      - "  Spoke:        {{ acm_dr_msa_provisioner_spoke_name }}"
+      - "  MSA name:     {{ acm_dr_msa_provisioner_msa_name }}"
+      - "  Token TTL:    {{ acm_dr_msa_provisioner_ttl }}"
+      - "  RBAC:         ClusterRoleBinding → {{ acm_dr_msa_provisioner_cluster_role }}"
+      - ""
+      - "  The MSA SA can be consumed by acm_hub_token_resolver by setting:"
+      - "    acm_hub_token_resolver_msa_name: \"{{ acm_dr_msa_provisioner_msa_name }}\""
+      - ""
+      - "======================================================================"
+...

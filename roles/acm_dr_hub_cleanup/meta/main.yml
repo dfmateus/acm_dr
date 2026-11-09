@@ -1,0 +1,31 @@
+---
+galaxy_info:
+  role_name: acm_dr_hub_cleanup
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Declarative and surgical decommissioning of a cluster that was elected as a
+    Disaster Recovery node for Red Hat Advanced Cluster Management for Kubernetes
+    (RHACM 2.10+): fully removes ACM (MultiClusterHub + operator),
+    MultiClusterObservability, governance/appdemo ArgoCD instances, and the OADP
+    DR configuration -- while preserving the OpenShift GitOps and OADP Operators,
+    and optionally the Backup/Observability data in Azure.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - disasterrecovery
+    - openshift
+    - kubernetes
+    - azure
+    - cleanup
+    - teardown
+
+dependencies: []
+...

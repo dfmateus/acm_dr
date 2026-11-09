@@ -1,0 +1,33 @@
+---
+# examples/playbooks/setup-dr-hub.yml
+# Provision a secondary (passive/DR) Hub.
+# Same stack as the primary, but with is_primary_hub=false so OADP creates
+# a passive Restore instead of a BackupSchedule.
+#
+# Required extra vars:
+#   k8s_target_context  - kubeconfig context for the DR Hub cluster
+#   is_primary_hub      - false (passive Restore, no BackupSchedule)
+#
+# Required environment variables (Azure Storage + GitHub):
+#   GUID, SUBSCRIPTION, TENANT, CLIENT_ID, PASSWORD, RESOURCEGROUP
+#   GITHUB_USER, GITHUB_PAT
+#
+# Usage:
+#   ansible-playbook examples/playbooks/setup-dr-hub.yml \
+#     -e k8s_target_context="acm-dr-hub-sa" \
+#     -e is_primary_hub=false
+
+- name: Setup DR (passive) Hub
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    # Resolve kubeconfig from per-cluster credentials or fall back to KUBECONFIG env var
+    - role: dfmateus.acm_dr.acm_dr_kubeconfig_resolver
+
+    # Provision the full DR stack on the passive Hub
+    - role: dfmateus.acm_dr.acm_dr_hub_setup
+      vars:
+        k8s_target_context: "acm-dr-hub-sa"  # kubeconfig context for the DR Hub
+        is_primary_hub: false  # passive mode (Restore, no BackupSchedule)
+...

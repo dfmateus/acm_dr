@@ -1,0 +1,11 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/06_summary.yml
+# =============================================================================
+# STAGE 06: COMPLETION SUMMARY
+# =============================================================================
+
+- name: "[SUMMARY] | Display cleanup completion status - {{ acm_argocd_instance_cleanup_name }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/summary.j2').split('\n') }}"
+  run_once: true
+...

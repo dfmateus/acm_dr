@@ -1,0 +1,183 @@
+---
+# molecule/default/verify.yml
+# Post-converge assertions: checks that role defaults loaded correctly,
+# rendered templates contain expected markers, and naming conventions
+# are followed. Runs after converge.yml writes its artifacts to /tmp/.
+
+- name: "Verify role defaults and rendered template output"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    # =================================================================
+    # PHASE 1: RELOAD DEFAULTS AND VERIFY STRUCTURE
+    # Re-load the same defaults as converge.yml so this playbook can
+    # inspect them independently (verify runs in a separate Ansible
+    # invocation, so facts from converge are not carried over).
+    # =================================================================
+    - name: "Load defaults for each role"
+      ansible.builtin.include_vars:
+        dir: "{{ playbook_dir }}/../../roles/{{ item }}/defaults"
+        name: "{{ item }}_defaults"
+      loop:
+        - acm_dr_kubeconfig_resolver
+        - acm_dr_hub_setup
+        - acm_dr_failover_manager
+        - acm_dr_spoke_manager
+        - acm_dr_hub_cleanup
+        - acm_argocd_instance_setup
+        - acm_argocd_instance_cleanup
+      loop_control:
+        label: "{{ item }}"
+
+    # Confirm each role's defaults dict is a non-empty mapping.
+    - name: "Confirm defaults loaded as non-empty dicts"
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.vars', item + '_defaults') is mapping
+          - lookup('ansible.builtin.vars', item + '_defaults') | length > 0
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Defaults for role '{{ item }}' are missing or empty
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Defaults for role '{{ item }}' present
+          ({{ lookup('ansible.builtin.vars', item + '_defaults') | length }} keys)
+      loop:
+        - acm_dr_kubeconfig_resolver
+        - acm_dr_hub_setup
+        - acm_dr_failover_manager
+        - acm_dr_spoke_manager
+        - acm_dr_hub_cleanup
+        - acm_argocd_instance_setup
+        - acm_argocd_instance_cleanup
+      loop_control:
+        label: "{{ item }}"
+
+    # =================================================================
+    # PHASE 2: VERIFY COMMON VARIABLE CONVENTIONS
+    # Every role in this project defines separator_char and
+    # debug_no_log in its defaults. This check catches accidental
+    # removal of those required baseline variables.
+    # =================================================================
+    - name: "Verify each role has the separator_char variable"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (item + '_separator_char') in
+            lookup('ansible.builtin.vars', item + '_defaults')
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Role '{{ item }}' is missing the
+          '{{ item }}_separator_char' variable in defaults/main.yml
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Role '{{ item }}' defines separator_char
+      loop:
+        - acm_dr_kubeconfig_resolver
+        - acm_dr_hub_setup
+        - acm_dr_failover_manager
+        - acm_dr_spoke_manager
+        - acm_dr_hub_cleanup
+        - acm_argocd_instance_setup
+        - acm_argocd_instance_cleanup
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Verify each role has the debug_no_log variable"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (item + '_debug_no_log') in
+            lookup('ansible.builtin.vars', item + '_defaults')
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Role '{{ item }}' is missing the
+          '{{ item }}_debug_no_log' variable in defaults/main.yml
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Role '{{ item }}' defines debug_no_log
+      loop:
+        - acm_dr_kubeconfig_resolver
+        - acm_dr_hub_setup
+        - acm_dr_failover_manager
+        - acm_dr_spoke_manager
+        - acm_dr_hub_cleanup
+        - acm_argocd_instance_setup
+        - acm_argocd_instance_cleanup
+      loop_control:
+        label: "{{ item }}"
+
+    # =================================================================
+    # PHASE 3: VERIFY RENDERED TEMPLATE OUTPUT
+    # Reads the files converge.yml wrote to /tmp/ and asserts that
+    # expected content markers are present in each one.
+    # =================================================================
+
+    # -- kubeconfig template output --
+    - name: "Read rendered kubeconfig from /tmp"
+      ansible.builtin.slurp:
+        src: /tmp/molecule_test_kubeconfig.yml
+      register: rendered_kubeconfig
+
+    - name: "Verify kubeconfig contains the mock cluster context"
+      ansible.builtin.assert:
+        that:
+          - "'molecule-test-hub' in (rendered_kubeconfig.content | b64decode)"
+          - "'api.molecule-test.example.com' in (rendered_kubeconfig.content | b64decode)"
+          - "'current-context' in (rendered_kubeconfig.content | b64decode)"
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Rendered kubeconfig is missing expected
+          mock cluster data (context name or API server URL)
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Rendered kubeconfig contains the expected
+          molecule-test-hub context and API server URL
+
+    # -- ArgoCD CR template output --
+    - name: "Read rendered ArgoCD CR from /tmp"
+      ansible.builtin.slurp:
+        src: /tmp/molecule_test_argocd_cr.yml
+      register: rendered_argocd_cr
+
+    - name: "Verify ArgoCD CR contains the mock instance identity"
+      ansible.builtin.assert:
+        that:
+          - "'molecule-test-argocd' in (rendered_argocd_cr.content | b64decode)"
+          - "'molecule-test-ns' in (rendered_argocd_cr.content | b64decode)"
+          - "'argoproj.io/v1beta1' in (rendered_argocd_cr.content | b64decode)"
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Rendered ArgoCD CR is missing expected
+          instance name, namespace, or API version
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Rendered ArgoCD CR contains molecule-test-argocd
+          in namespace molecule-test-ns
+
+    # -- stage banner template output --
+    - name: "Read rendered stage banner from /tmp"
+      ansible.builtin.slurp:
+        src: /tmp/molecule_test_stage_banner.txt
+      register: rendered_stage_banner
+
+    - name: "Verify stage banner contains the mock title"
+      ansible.builtin.assert:
+        that:
+          - "'MOLECULE TEST BANNER' in (rendered_stage_banner.content | b64decode)"
+          - "'acm_dr_hub_setup' in (rendered_stage_banner.content | b64decode)"
+        fail_msg: >-
+          ❌ FAILED! Oh. No! => Rendered stage banner is missing the
+          expected title or role name
+        success_msg: >-
+          ✅ PASSED! Oh. Yes! => Rendered stage banner contains the expected
+          title and role reference
+
+    # =================================================================
+    # PHASE 4: CLEANUP TEST ARTIFACTS
+    # Remove the rendered files from /tmp to avoid leaving test debris
+    # on the host.
+    # =================================================================
+    - name: "Clean up rendered test artifacts from /tmp"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/molecule_test_kubeconfig.yml
+        - /tmp/molecule_test_argocd_cr.yml
+        - /tmp/molecule_test_stage_banner.txt
+      loop_control:
+        label: "{{ item | basename }}"
+...

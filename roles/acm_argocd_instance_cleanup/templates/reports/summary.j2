@@ -1,0 +1,16 @@
+{% set _acm_argocd_instance_cleanup_summary_title = ("🔎 [DRY-RUN] INSTANCE '" ~ acm_argocd_instance_cleanup_name ~ "' REMOVAL SIMULATION COMPLETED" if (acm_argocd_instance_cleanup_dry_run | default(false) | bool) else "✅  ARGOCD INSTANCE '" ~ acm_argocd_instance_cleanup_name ~ "' SUCCESSFULLY REMOVED") %}
+{% set _acm_argocd_instance_cleanup_summary_lines = [
+  "📂  Namespace:              " ~ acm_argocd_instance_cleanup_namespace,
+  "🧹  Managed namespaces:     " ~ (acm_argocd_instance_cleanup_managed_namespaces | default([]) | map(attribute='name') | list | join(', ') if (acm_argocd_instance_cleanup_managed_namespaces | default([]) | length > 0) else "none provided"),
+  "🛡️   Cluster-scoped RBAC:    removed",
+  "🖇️   ConsoleLink:            removed",
+  "🔌  OpenShift GitOps Operator: PRESERVED (shared by other instances)"
+] %}
+{% set _acm_argocd_instance_cleanup_summary_all_lines = [_acm_argocd_instance_cleanup_summary_title] + _acm_argocd_instance_cleanup_summary_lines %}
+{% set _acm_argocd_instance_cleanup_summary_max_len = _acm_argocd_instance_cleanup_summary_all_lines | map('length') | max %}
+{% set _acm_argocd_instance_cleanup_summary_sep = "-" * (_acm_argocd_instance_cleanup_summary_max_len + 2) %}
+{{ _acm_argocd_instance_cleanup_summary_sep }}
+{% for _acm_argocd_instance_cleanup_summary_line in _acm_argocd_instance_cleanup_summary_all_lines %}
+ {{ _acm_argocd_instance_cleanup_summary_line }}
+{% endfor %}
+{{ _acm_argocd_instance_cleanup_summary_sep }}

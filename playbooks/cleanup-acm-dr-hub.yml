@@ -1,0 +1,116 @@
+---
+# playbooks/cleanup-acm-dr-hub.yml
+# =============================================================================
+# RHACM DR NODE DECOMMISSIONING (ACM DR LAB CLEANUP)
+#
+# Description:
+#   Inverse operation of playbooks/setup-acm-dr-hub.yml: decommissions a cluster that
+#   was elected as an RHACM DR node, removing only what pertains to that
+#   role, and returning the cluster to general use:
+#   - Stage 00: Preflight & Safety Gates (mandatory confirmation)
+#   - Stage 01: Remove Governance and GitOps (ArgoCD instances)
+#   - Stage 02: Remove OADP configuration (DPA/BackupSchedule)
+#   - Stage 03: Remove Observability (MultiClusterObservability/Thanos)
+#   - Stage 04: Remove Red Hat ACM entirely (MultiClusterHub + operator)
+#   - Stage 05: Optional Azure Storage purge (DISABLED by default)
+#   - Stage 06: Remove Zero-Trust automation identity
+#   - Stage 07: Consolidated final report
+#
+# What is PRESERVED by default (see role README for the full rationale):
+#   - Red Hat OpenShift GitOps Operator (Subscription/CSV/operator namespace)
+#   - Red Hat OADP Operator (Subscription/CSV/OperatorGroup/operator namespace)
+#   - Azure Storage Account and Containers (Backups/Observability)
+#
+# Example 1 (Recommended: simulate before applying for real):
+#   ansible-playbook playbooks/cleanup-acm-dr-hub.yml \
+#     -e k8s_target_context="acm-dr-hub" \
+#     -e acm_dr_hub_cleanup_confirm=true \
+#     -e acm_dr_hub_cleanup_dry_run=true
+#
+# Example 2 (Actually decommission a secondary/passive DR node):
+#   ansible-playbook playbooks/cleanup-acm-dr-hub.yml \
+#     -e k8s_target_context="acm-dr-hub" \
+#     -e acm_dr_hub_cleanup_confirm=true
+#
+# Example 3 (Full cleanup, including Azure Storage Account/Containers):
+#   ansible-playbook playbooks/cleanup-acm-dr-hub.yml \
+#     -e k8s_target_context="acm-dr-hub" \
+#     -e acm_dr_hub_cleanup_confirm=true \
+#     -e acm_dr_hub_cleanup_purge_azure_storage=true
+#
+# Example 4 (Partial Execution via Tags - Remove GitOps/Governance only):
+#   ansible-playbook playbooks/cleanup-acm-dr-hub.yml \
+#     -e k8s_target_context="acm-dr-hub" \
+#     -e acm_dr_hub_cleanup_confirm=true \
+#     --tags "gitops_cleanup"
+#
+# Variables (required):
+#   k8s_target_context               - Hub SA context. Injected via ACM DR Target Cluster
+#                                      AAP credential (ACM_DR_TARGET_CONTEXT).
+#   acm_dr_hub_cleanup_confirm       - MUST be 'true'. The playbook refuses to run without it.
+#   acm_dr_hub_cleanup_cloud_provider - 'azure' (ARO) or 'aws' (ROSA HCP). Must match
+#                                       the provider used during setup.
+#
+# Variables (optional):
+#   acm_dr_hub_cleanup_dry_run       - true runs in check_mode/diff (default: false)
+#   acm_dr_hub_cleanup_force         - true allows teardown of an apparently active Hub
+#                                      (default: false; DANGEROUS)
+#   acm_dr_hub_cleanup_purge_azure_storage - true deletes the Azure Storage Account and
+#                                      Containers (default: false; backups preserved)
+#   acm_dr_hub_cleanup_purge_aws_storage   - true deletes the S3 buckets (default: false)
+#
+# Dependencies:
+#   collections: kubernetes.core, azure.azcollection (Azure path), amazon.aws (AWS path)
+#   roles:       acm_dr_kubeconfig_resolver (pre_tasks)
+#                acm_dr_hub_cleanup (Stages 00-07)
+#
+# Expected outcome:
+#   Exit 0 - DR components removed (RHACM operator + MCH, ArgoCD, OADP config, Observability,
+#             automation RBAC). Cluster returns to general use.
+#   Exit 1 - Safety gate blocked execution (confirm not set, Hub appears active),
+#             or a removal stage failed. Check the ❌ message and Stage identifier.
+# =============================================================================
+
+- name: "[DR LAB CLEANUP] | Decommission RHACM DR Node (ACM, GitOps, OADP, Observability)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      # Uses the runtime kubeconfig assembled by acm_dr_kubeconfig_resolver (per-cluster
+      # credentials from AAP or scripts/lib/load_cluster_env.sh), falling back to the legacy
+      # monolithic K8S_AUTH_KUBECONFIG / KUBECONFIG env var when no per-cluster vars exist.
+      kubeconfig: >-
+        {{ acm_dr_kubeconfig_path
+           | default(lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG')
+                     | default(lookup('ansible.builtin.env', 'KUBECONFIG'), true)) }}
+
+  pre_tasks:
+    - name: "[PRE-FLIGHT] | Resolve kubeconfig from per-cluster credentials"
+      ansible.builtin.include_role:
+        name: acm_dr_kubeconfig_resolver
+        apply:
+          tags: [always]  # propagate to tasks inside the role so they also run
+      tags: [always]  # ensures the include itself runs regardless of --tags filtering
+
+    # Derive k8s_target_context from per-cluster credentials when not passed
+    # as extra var. ACM_DR_TARGET_CONTEXT is injected by the "ACM DR Target
+    # Cluster" credential type or exported via load_cluster_env.sh.
+    - name: "[PRE-FLIGHT] | Derive target context from per-cluster credentials"
+      ansible.builtin.set_fact:
+        k8s_target_context: "{{ lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') }}"  # noqa var-naming[no-role-prefix]
+      when:
+        - k8s_target_context is not defined
+        - lookup('ansible.builtin.env', 'ACM_DR_TARGET_CONTEXT', default='') | length > 0
+
+    - name: "[PRE-FLIGHT] | Validate required input variables"
+      ansible.builtin.assert:
+        that:
+          - k8s_target_context is defined
+          - k8s_target_context | length > 0
+        fail_msg: "❌ FAILED! Oh. No! => Required variable 'k8s_target_context' is not defined. Use: -e k8s_target_context=<context>"
+        success_msg: "✅ PASSED! Oh. Yes! => Required variable 'k8s_target_context' is defined and valid."
+
+  roles:
+    - role: "{{ playbook_dir }}/../roles/acm_dr_hub_cleanup"
+...

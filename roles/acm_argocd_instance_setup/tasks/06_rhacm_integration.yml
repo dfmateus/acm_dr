@@ -1,0 +1,67 @@
+---
+# roles/acm_argocd_instance/tasks/06_rhacm_integration.yml
+# =============================================================================
+# STAGE 06: RHACM INTEGRATION (GITOPSCLUSTER + LOCAL PLACEMENT + MCSB)
+# =============================================================================
+# Registers this ArgoCD instance as a valid GitOps destination for RHACM
+# (required for the ApplicationSet 'cluster_decision' generator to work).
+# The Placement here is just integration boilerplate (always points to
+# local-cluster, where ArgoCD runs) -- it is NOT the Placement that decides
+# which Spokes receive the actual content (that is usually content from the
+# customer's own Git repository, referenced by 'acm_argocd_instance_setup_placement_name').
+
+- name: "[RHACM INTEGRATION] | 6.1) Create ManagedClusterSetBinding - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: cluster.open-cluster-management.io/v1beta2
+      kind: ManagedClusterSetBinding
+      metadata:
+        name: "{{ acm_argocd_instance_setup_cluster_set | default('default') }}"
+        namespace: "{{ acm_argocd_instance_setup_namespace }}"
+      spec:
+        clusterSet: "{{ acm_argocd_instance_setup_cluster_set | default('default') }}"
+
+- name: "[RHACM INTEGRATION] | 6.2) Create integration Placement (local-cluster) - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: cluster.open-cluster-management.io/v1beta1
+      kind: Placement
+      metadata:
+        name: "{{ acm_argocd_instance_setup_name }}-integration-placement"
+        namespace: "{{ acm_argocd_instance_setup_namespace }}"
+      spec:
+        clusterSets:
+          - "{{ acm_argocd_instance_setup_cluster_set | default('default') }}"
+        numberOfClusters: 1
+        predicates:
+          - requiredClusterSelector:
+              labelSelector:
+                matchExpressions:
+                  - key: name
+                    operator: In
+                    values:
+                      - local-cluster
+
+- name: "[RHACM INTEGRATION] | 6.3) Create GitOpsCluster - {{ acm_argocd_instance_setup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition:
+      apiVersion: apps.open-cluster-management.io/v1beta1
+      kind: GitOpsCluster
+      metadata:
+        name: "{{ acm_argocd_instance_setup_name }}-gitops"
+        namespace: "{{ acm_argocd_instance_setup_namespace }}"
+      spec:
+        argoServer:
+          argoNamespace: "{{ acm_argocd_instance_setup_namespace }}"
+          cluster: local-cluster
+        placementRef:
+          apiVersion: cluster.open-cluster-management.io/v1beta1
+          kind: Placement
+          name: "{{ acm_argocd_instance_setup_name }}-integration-placement"
+...

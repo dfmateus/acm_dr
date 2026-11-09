@@ -1,0 +1,131 @@
+---
+# roles/acm_dr_kubeconfig_resolver/defaults/main.yml
+# =============================================================================
+# DEFAULT VARIABLES - KUBECONFIG RESOLVER (PER-CLUSTER CREDENTIALS)
+# =============================================================================
+# Lightweight resolver that detects per-cluster env vars injected by AAP custom
+# credential types (or exported locally via examples/scripts/lib/load_cluster_env.sh) and
+# builds a runtime kubeconfig file from them. If no per-cluster env vars are
+# found, the role is a no-op - backward compatible with the legacy monolithic
+# KUBECONFIG approach.
+#
+# The resolver runs as include_role in every playbook's pre_tasks, BEFORE
+# module_defaults evaluates the kubeconfig path. It sets the fact
+# 'acm_dr_kubeconfig_path' which module_defaults picks up via lazy Jinja2 eval.
+
+# -----------------------------------------------------------------------------
+# 1. COSMETIC AND LOGGING PARAMETERS
+# -----------------------------------------------------------------------------
+# Separator character for banner messages displayed in verbose/AAP job output
+acm_dr_kubeconfig_resolver_separator_char: "="  # cosmetic - stage banner separator
+
+# Suppresses task output for security-sensitive operations (tokens, secrets,
+# kubeconfig content). Set to false (-e acm_dr_kubeconfig_resolver_debug_no_log=false)
+# to expose hidden output during troubleshooting sessions.
+acm_dr_kubeconfig_resolver_debug_no_log: true  # bool - set false to reveal no_log task output
+
+# -----------------------------------------------------------------------------
+# 2. RUNTIME KUBECONFIG FILE LOCATION
+# -----------------------------------------------------------------------------
+# Path where the resolver writes the assembled kubeconfig. The file is created
+# with mode 0600 (owner-only read/write) and contains bearer tokens, so it must
+# not be world-readable. AAP execution environments clean /tmp on job completion.
+acm_dr_kubeconfig_resolver_tempfile_path: "/tmp/acm_dr_runtime_kubeconfig.yml"  # path - assembled kubeconfig destination
+
+# -----------------------------------------------------------------------------
+# 3. PER-CLUSTER ENV VAR PREFIXES
+# -----------------------------------------------------------------------------
+# Each prefix maps to a cluster role in the automation. The resolver reads
+# <PREFIX>_HOST, <PREFIX>_TOKEN, <PREFIX>_CA_DATA (optional), and
+# <PREFIX>_CONTEXT for each prefix that has at least HOST + TOKEN + CONTEXT
+# present and non-empty. AAP custom credential types inject these; locally,
+# examples/scripts/lib/load_cluster_env.sh exports them.
+#
+# The list order does not matter - all detected clusters are merged into a
+# single kubeconfig. Additional passive hubs (N+ topology) use a separate
+# fleet kubeconfig credential rather than individual prefix entries; see
+# acm_dr_kubeconfig_resolver_passive_hub_fleet_env_var below.
+acm_dr_kubeconfig_resolver_cluster_prefixes:  # list - env var prefix families to scan
+  - "ACM_DR_TARGET"        # single-target operations (lab setup, cleanup, ArgoCD, Spoke Manager Hub-side)
+  - "ACM_DR_SOURCE"        # failover origin Hub (currently ACTIVE)
+  - "ACM_DR_DEST"          # failover destination Hub (currently PASSIVE)
+  - "ACM_DR_SPOKE"         # individual Spoke cluster (Spoke Manager Spoke-side)
+
+# -----------------------------------------------------------------------------
+# 4. SPOKE FLEET KUBECONFIG (FAILOVER ORCHESTRATOR)
+# -----------------------------------------------------------------------------
+# The failover orchestrator discovers Spokes dynamically at Stage 01, so
+# individual Spoke credentials can't be attached at Job Template time. Instead,
+# a multi-Spoke kubeconfig file is injected via the "ACM DR - Spoke Fleet Kubeconfig"
+# AAP credential type (or exported locally as an env var pointing to a file).
+# The resolver merges its contexts into the runtime kubeconfig alongside the
+# per-cluster Hub entries.
+#
+# Env var name: ACM_DR_SPOKE_FLEET_KUBECONFIG (path to a kubeconfig file)
+acm_dr_kubeconfig_resolver_spoke_fleet_env_var: "ACM_DR_SPOKE_FLEET_KUBECONFIG"  # env var - path to spoke fleet kubeconfig
+
+# -----------------------------------------------------------------------------
+# 4a. PASSIVE HUB FLEET KUBECONFIG (N+ HUB TOPOLOGY)
+# -----------------------------------------------------------------------------
+# When the topology includes more than two hubs (Hub Primary + Hub Secondary +
+# one or more additional passive hubs), the Failover Orchestrator needs kubeconfig
+# contexts for every additional passive hub so Stage 05a can recycle their passive
+# Restore CRs. AAP cannot attach N credentials of the same type without env var
+# conflicts, so all additional passive hub credentials are packed into a single
+# multi-context kubeconfig and stored in the "ACM DR - Passive Hub Fleet" credential
+# type. That credential injects the kubeconfig file path via this env var.
+#
+# To build the fleet kubeconfig: run provision_automation_sa.sh for each passive
+# hub (producing per-hub kubeconfigs), then merge them:
+#   KUBECONFIG=hub3.kubeconfig:hub4.kubeconfig kubectl config view --flatten
+# Store the merged YAML as the credential field value. Update when hubs are added
+# or removed.
+#
+# Env var name: ACM_DR_PASSIVE_HUB_FLEET_KUBECONFIG (path to a kubeconfig file)
+acm_dr_kubeconfig_resolver_passive_hub_fleet_env_var: "ACM_DR_PASSIVE_HUB_FLEET_KUBECONFIG"  # env var - path to passive hub fleet kubeconfig
+
+# -----------------------------------------------------------------------------
+# 5. TLS VERIFICATION DEFAULT
+# -----------------------------------------------------------------------------
+# When ca_data is not provided for a cluster entry, the resolver sets
+# insecure-skip-tls-verify based on this flag. ARO clusters use publicly
+# trusted certificates (Let's Encrypt), so skipping TLS verification is
+# acceptable for lab environments. Production deployments should provide
+# CA data and set this to false.
+acm_dr_kubeconfig_resolver_skip_tls_when_no_ca: true  # boolean - skip TLS verify when CA is absent
+
+# -----------------------------------------------------------------------------
+# 6. SPOKE FLEET SECRET ON HUB (DYNAMIC FLEET DISCOVERY)
+# -----------------------------------------------------------------------------
+# When ACM_DR_SPOKE_FLEET_KUBECONFIG env var is not set, the resolver can read
+# the Spoke fleet kubeconfig from a Secret stored on the Source Hub cluster.
+# This Secret is created/updated by 03_build_spoke_fleet.sh --push-secret and
+# labeled for OADP backup so it replicates to passive Hubs automatically.
+#
+# Priority order for fleet discovery:
+#   1. ACM_DR_SPOKE_FLEET_KUBECONFIG env var (file path - AAP credential or local export)
+#   2. Hub Secret auto-read (from Source Hub's ansible-automation namespace)
+#   3. No fleet - Spoke contexts not available (Stage 07 sanitize will skip)
+acm_dr_kubeconfig_resolver_fleet_secret_name: "spoke-fleet-kubeconfig"  # Secret name on the Hub
+acm_dr_kubeconfig_resolver_fleet_secret_namespace: "ansible-automation"  # namespace where the automation SA and Secret live
+acm_dr_kubeconfig_resolver_fleet_secret_key: "kubeconfig"  # data key inside the Secret holding the kubeconfig YAML
+acm_dr_kubeconfig_resolver_fleet_secret_enabled: true  # bool - set false to disable Hub Secret auto-read
+
+# -----------------------------------------------------------------------------
+# 7. CONTROL PLANE TOPOLOGY DETECTION
+# -----------------------------------------------------------------------------
+# After assembling the kubeconfig, the resolver queries the target cluster's
+# Infrastructure CR (config.openshift.io/v1) to detect:
+#   - controlPlaneTopology: "HighlyAvailable" (Classic) or "External" (HCP)
+#   - platform: "Azure", "AWS", "None" (bare-metal), etc.
+# These facts are consumed by acm_dr_hub_setup (StorageClass selection,
+# future cloud_provider auto-detection) and acm_dr_failover_manager
+# (informational reporting).
+#
+# Non-OCP clusters (AKS, EKS, GKE, IKS) lack the Infrastructure CRD.
+# The query degrades gracefully to Unknown / false.
+#
+# Set this to "External" or "HighlyAvailable" to skip the API query and
+# force a specific topology classification.
+acm_dr_topology_override: ""  # string - empty = auto-detect from Infrastructure CR  # noqa var-naming[no-role-prefix]
+...

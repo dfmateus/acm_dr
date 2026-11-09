@@ -1,0 +1,26 @@
+---
+galaxy_info:
+  role_name: acm_dr_failover_manager
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Core Disaster Recovery Failover/Failback orchestration engine
+    for Red Hat Advanced Cluster Management for Kubernetes (RHACM 2.10+):
+    logical fencing, Hub activation via OADP/Velero Restore, Spoke fleet
+    reconnection, and post-failover compliance audit.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - disasterrecovery
+    - openshift
+    - kubernetes
+
+dependencies: []
+...

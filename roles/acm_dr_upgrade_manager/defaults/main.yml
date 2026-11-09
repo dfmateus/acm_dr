@@ -1,0 +1,56 @@
+---
+# roles/acm_dr_upgrade_manager/defaults/main.yml
+# =============================================================================
+# DEFAULT VARIABLES - ACM UPGRADE MANAGER
+# =============================================================================
+# Patches the ACM operator Subscription to a new OLM channel and waits for the
+# MultiClusterHub to reach Running. Intended for automated rolling upgrades
+# inside WF - ACM DR - LAB - Planned Maintenance Switchover.
+
+# -----------------------------------------------------------------------------
+# 1. TARGET VERSION
+# -----------------------------------------------------------------------------
+
+# Target RHACM major.minor version (e.g. "2.15" or "2.15.9" - role normalizes
+# to major.minor). Also accepts the full WF survey variable name as a fallback
+# so WF-19 nodes do not need a separate extra_data mapping.
+acm_dr_upgrade_manager_target_acm_version: >-
+  {{ acm_dr_failover_manager_target_acm_version | default('') }}
+
+# -----------------------------------------------------------------------------
+# 2. CLUSTER OBJECT NAMES
+# -----------------------------------------------------------------------------
+
+# Namespace where the ACM operator and MultiClusterHub live
+acm_dr_upgrade_manager_acm_namespace: "open-cluster-management"  # namespace
+
+# Name of the OLM Subscription object for ACM
+acm_dr_upgrade_manager_subscription_name: "advanced-cluster-management"  # k8s object name
+
+# Name of the MultiClusterHub CR
+acm_dr_upgrade_manager_mch_name: "multiclusterhub"  # k8s object name
+
+# -----------------------------------------------------------------------------
+# 3. WAIT PARAMETERS
+# -----------------------------------------------------------------------------
+
+# OLM CSV reconciliation + operator + MCH controller upgrade takes 15-30 min.
+acm_dr_upgrade_manager_mch_wait_retries: 60  # retries - 60 x 15s = 15 minutes max (halved delay reduces overshoot by ~15s on success)
+acm_dr_upgrade_manager_mch_wait_delay: 15    # seconds between MCH phase polls
+
+# Post-Running stability window: waits for Complete=True (all sub-components up).
+# After MCH enters Running, sub-components may still initialize for 1-2 minutes.
+# Complete=True with reason=ComponentsAvailable is the authoritative stable signal.
+acm_dr_upgrade_manager_stable_wait_retries: 10  # retries - 10 x 30s = 5 minutes max
+acm_dr_upgrade_manager_stable_wait_delay: 30     # seconds between stability polls
+# Fail the play when Complete=True is not reached within stable_wait_retries x stable_wait_delay.
+# Set false only when you accept a partially-settled hub and intend to verify manually before failback.
+acm_dr_upgrade_manager_fail_on_unstable: true  # bool - hard-fail when MCH does not reach Complete=True
+
+# -----------------------------------------------------------------------------
+# 4. EXECUTION MODE
+# -----------------------------------------------------------------------------
+
+# Dry-run mode: reports the intended channel change but does not patch the Subscription.
+acm_dr_upgrade_manager_dry_run: false  # bool - set true to simulate without applying
+...

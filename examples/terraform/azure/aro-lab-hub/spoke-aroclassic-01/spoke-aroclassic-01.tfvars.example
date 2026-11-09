@@ -1,0 +1,30 @@
+# spoke-aroclassic-01.tfvars.example - ARO Classic Spoke
+#
+# See README.md in the parent directory for setup steps.
+# =============================================================================
+
+cluster_name = "acmdr-spoke-aroclassic-01"
+domain       = "acmdraroclassic01"
+location     = "eastus"
+aro_version  = "4.20.15"
+
+# Spoke occupies the 10.2.x.x block - no overlap with Hub 01 or Hub 02.
+aro_virtual_network_cidr_block = "10.2.0.0/20"
+aro_control_subnet_cidr_block  = "10.2.0.0/23"
+aro_machine_subnet_cidr_block  = "10.2.2.0/23"
+
+main_vm_size      = "Standard_D8s_v3"
+worker_vm_size    = "Standard_D8s_v3"
+worker_node_count = 3
+
+pull_secret_path = null
+
+api_server_profile = "Public"
+ingress_profile    = "Public"
+
+tags = {
+  environment = "lab"
+  owner       = "dfmateus"
+  project     = "dfmateus.acm_dr"
+  role        = "spoke"
+}

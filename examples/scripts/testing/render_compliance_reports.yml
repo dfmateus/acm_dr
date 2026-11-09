@@ -1,0 +1,131 @@
+---
+# examples/scripts/testing/render_compliance_reports.yml
+# Renders the DR compliance report template with mock data to validate
+# Jinja2 syntax, missing default() filters, and layout regressions.
+# No cluster access needed. Run from the project root:
+#
+#   ansible-playbook examples/scripts/testing/render_compliance_reports.yml
+#
+# Rendered reports go to examples/scripts/testing/rendered_reports/<scenario>.txt.
+# Validate with: bash examples/scripts/testing/validate_rendered_reports.sh
+
+# --- Scenario 1: All Green ---
+- name: "Render compliance report - all_green"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/all_green.yml
+  tasks:
+    - name: "Render all_green report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/all_green.txt"
+        mode: "0644"
+
+# --- Scenario 2: Split-Brain ---
+- name: "Render compliance report - split_brain"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/split_brain.yml
+  tasks:
+    - name: "Render split_brain report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/split_brain.txt"
+        mode: "0644"
+
+# --- Scenario 3: Degraded Addons ---
+- name: "Render compliance report - degraded_addons"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/degraded_addons.yml
+  tasks:
+    - name: "Render degraded_addons report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/degraded_addons.txt"
+        mode: "0644"
+
+# --- Scenario 4: Multi-Hub Topology ---
+- name: "Render compliance report - multi_hub"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/multi_hub.yml
+  tasks:
+    - name: "Render multi_hub report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/multi_hub.txt"
+        mode: "0644"
+
+# --- Scenario 5: Unreachable Spokes ---
+- name: "Render compliance report - unreachable_spokes"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/unreachable_spokes.yml
+  tasks:
+    - name: "Render unreachable_spokes report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/unreachable_spokes.txt"
+        mode: "0644"
+
+# --- Scenario 6: Version Skew ---
+- name: "Render compliance report - version_skew"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/version_skew.yml
+  tasks:
+    - name: "Render version_skew report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/version_skew.txt"
+        mode: "0644"
+
+# --- Scenario 7: Dry-Run ---
+- name: "Render compliance report - dry_run"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/dry_run.yml
+  tasks:
+    - name: "Render dry_run report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/dry_run.txt"
+        mode: "0644"
+
+# --- Scenario 8: Everything Broken ---
+- name: "Render compliance report - everything_broken"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - mock_data/_base.yml
+    - mock_data/everything_broken.yml
+  tasks:
+    - name: "Render everything_broken report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/acm_dr_failover_manager/templates/reports/dr_compliance_report.j2"
+        dest: "{{ playbook_dir }}/rendered_reports/everything_broken.txt"
+        mode: "0644"
+...

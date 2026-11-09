@@ -1,0 +1,14 @@
+======================================================================
+ 🌐 IDENTIFIED MANAGED CLUSTER FLEET ({{ acm_dr_failover_manager_spoke_fleet | length }} SPOKES)
+======================================================================
+{% for spoke in acm_dr_failover_manager_spoke_fleet %}
+📌 CLUSTER: {{ spoke.name }}
+   ├─ Product / Type:  {{ spoke.product }}
+   ├─ Platform:        {{ spoke.platform }}
+   ├─ K8s Version:     {{ spoke.kubernetes_version }}
+{% if spoke.openshift_version is defined and spoke.openshift_version != 'N/A' %}
+   ├─ OCP Version:     {{ spoke.openshift_version }}
+{% endif %}
+   └─ API URL:         {{ spoke.api_url }}
+----------------------------------------------------------------------
+{% endfor %}

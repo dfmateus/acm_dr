@@ -1,0 +1,104 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/01_remove_applications.yml
+# =============================================================================
+# STAGE 01: REMOVE APPLICATIONS/APPLICATIONSET (CONTROLLER STILL RUNNING)
+# =============================================================================
+# Real-World Finding: when removing the entire instance at once (namespace +
+# everything inside), the argocd-application-controller is terminated BEFORE
+# it can process the 'resources-finalizer.argocd.argoproj.io' finalizer on
+# its own Applications, so the namespace gets stuck in Terminating indefinitely.
+# The correct order is: remove the Applications/ApplicationSet FIRST (with the
+# controller still running, so it correctly prunes the resources it manages),
+# and only then remove the instance itself.
+
+- name: "[REMOVE APPLICATIONS] | 1.1) Discover ApplicationSets in the instance - {{ acm_argocd_instance_cleanup_namespace }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+  register: acm_argocd_instance_cleanup_appsets_info
+  failed_when: false
+
+- name: "[REMOVE APPLICATIONS] | 1.2) Remove discovered ApplicationSets - {{ acm_argocd_instance_cleanup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+  loop: "{{ acm_argocd_instance_cleanup_appsets_info.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  check_mode: "{{ acm_argocd_instance_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[REMOVE APPLICATIONS] | 1.3) Discover Applications in the instance - {{ acm_argocd_instance_cleanup_namespace }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+  register: acm_argocd_instance_cleanup_apps_info
+  failed_when: false
+
+- name: "[REMOVE APPLICATIONS] | 1.4) Remove discovered Applications (let the controller handle the prune) - {{ acm_argocd_instance_cleanup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+  loop: "{{ acm_argocd_instance_cleanup_apps_info.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  check_mode: "{{ acm_argocd_instance_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[REMOVE APPLICATIONS] | 1.5) ⏳ WAIT - Poll for complete Application purge - {{ acm_argocd_instance_cleanup_namespace }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+  register: acm_argocd_instance_cleanup_apps_recheck
+  until: acm_argocd_instance_cleanup_apps_recheck.resources | default([]) | length == 0
+  retries: "{{ acm_argocd_instance_cleanup_application_delete_retries | default(20) }}"
+  delay: "{{ acm_argocd_instance_cleanup_application_delete_delay | default(5) }}"
+  failed_when: false
+  when: not (acm_argocd_instance_cleanup_dry_run | default(false) | bool)
+
+# Real-World Finding: if after polling there are still stuck Applications (the
+# controller could not process the finalizer in time, or the resource it
+# managed no longer exists to be 'pruned'), the self-healing below removes
+# the finalizer manually and retries the deletion. This is the same self-healing pattern
+# already used throughout this repository for orphaned finalizers.
+- name: "[REMOVE APPLICATIONS] | 1.6) 🧹 SELF-HEALING - Remove finalizer from still-stuck Applications"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: patched
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: "{{ acm_argocd_instance_cleanup_apps_recheck.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_argocd_instance_cleanup_dry_run | default(false) | bool)
+    - acm_argocd_instance_cleanup_apps_recheck.resources | default([]) | length > 0
+
+- name: "[REMOVE APPLICATIONS] | 1.7) 🔎 [DRY-RUN] Preview of Applications/ApplicationSet removal"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] {{ acm_argocd_instance_cleanup_appsets_info.resources | default([]) | length }}
+      ApplicationSet(s) and {{ acm_argocd_instance_cleanup_apps_info.resources | default([]) | length }}
+      Application(s) would be removed from namespace '{{ acm_argocd_instance_cleanup_namespace }}'.
+  when: acm_argocd_instance_cleanup_dry_run | default(false) | bool
+...

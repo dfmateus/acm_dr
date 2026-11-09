@@ -1,0 +1,36 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: {{ acm_argocd_instance_setup_name }}-applicationset
+  namespace: {{ acm_argocd_instance_setup_namespace }}
+spec:
+  generators:
+    - clusterDecisionResource:
+        configMapRef: {{ acm_argocd_instance_setup_placement_configmap | default('acm-placement') }}
+        labelSelector:
+          matchLabels:
+            cluster.open-cluster-management.io/placement: {{ acm_argocd_instance_setup_placement_name }}
+        requeueAfterSeconds: 180
+  template:
+    metadata:
+      name: {{ acm_argocd_instance_setup_name }}-{{ '{{' }}name{{ '}}' }}
+      labels:
+        cluster.open-cluster-management.io/backup: cluster-activation
+    spec:
+      project: default
+      source:
+        repoURL: {{ acm_argocd_instance_setup_repo_url }}
+        targetRevision: {{ acm_argocd_instance_setup_repo_target_revision | default('main') }}
+        path: {{ acm_argocd_instance_setup_cluster_decision_path }}
+      destination:
+        server: "{{ '{{' }}server{{ '}}' }}"
+        namespace: {{ acm_argocd_instance_setup_cluster_decision_destination_namespace }}
+      syncPolicy:
+{% if acm_argocd_instance_setup_sync_automated | default(true) | bool %}
+        automated:
+          prune: {{ acm_argocd_instance_setup_sync_prune | default(true) | bool | lower }}
+          selfHeal: {{ acm_argocd_instance_setup_sync_self_heal | default(true) | bool | lower }}
+{% endif %}
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true

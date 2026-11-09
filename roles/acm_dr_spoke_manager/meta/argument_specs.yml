@@ -1,0 +1,239 @@
+---
+argument_specs:
+  main:
+    short_description: Spoke onboarding and graceful detach in RHACM
+    description:
+      - >-
+        Manages the lifecycle of Spoke clusters in RHACM: onboarding (prep) with
+        KCS 7039710 token sanitization and auto-import-secret re-injection, or
+        graceful detach (KCS 5950901) with agent cleanup on the edge cluster.
+    author:
+      - Diego Felipe Mateus
+    options:
+      # --- AESTHETICS AND LOGGING ---
+      acm_dr_spoke_manager_separator_char:
+        description:
+          - Separator character used in log output formatting.
+        type: str
+        default: "="
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_debug_no_log:
+        description:
+          - Suppresses task output for security-sensitive operations (tokens, secrets, kubeconfig content). Set to false to expose hidden output during troubleshooting sessions.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      # --- KUBERNETES CONTEXTS ---
+      acm_dr_spoke_manager_hub_context:
+        description: Kubeconfig context of the active Hub where the Spoke is registered.
+        type: str
+        required: true
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_spoke_context:
+        description: Kubeconfig context of the target Spoke cluster.
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_spoke_k8s_context:
+        description: Alias for acm_dr_spoke_manager_spoke_context (backward compatibility).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      # --- SPOKE IDENTIFICATION ---
+      acm_dr_spoke_manager_cluster_name:
+        description: Spoke cluster name registered in Red Hat ACM (ManagedCluster).
+        type: str
+        required: true
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_api_url:
+        description: Spoke API Server URL (optional, inferred via context if not provided).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_api_token:
+        description: Spoke token (optional, inferred via context if not provided).
+        type: str
+        required: false
+        default: ""
+        version_added: "1.0.0"
+      # --- MANAGED CLUSTER LABELS ---
+      acm_dr_spoke_manager_cluster_cloud:
+        description:
+          - Cloud provider label applied to the ManagedCluster object in RHACM. Auto-detected from OpenShift Infrastructure for OCP Spokes, or override via -e for non-OCP Spokes (AKS, Amazon EKS, GKE, IKS, vanilla K8s).
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_platform_to_cloud_map:
+        description:
+          - Maps OpenShift Infrastructure.status.platform values to RHACM-canonical cloud label strings. Translates platform-native names (AWS, GCP) to RHACM display names (Amazon, Google) for correct provider icon rendering.
+        type: dict
+        default:
+          AWS: "Amazon"
+          Azure: "Azure"
+          GCP: "Google"
+          IBMCloud: "IBMCloud"
+          IBMPowerPlatform: "IBMPowerPlatform"
+          IBMZPlatform: "IBMZPlatform"
+          VSphere: "VSphere"
+          BareMetal: "BareMetal"
+          OpenStack: "OpenStack"
+          Nutanix: "Nutanix"
+          KubeVirt: "KubeVirt"
+          oVirt: "KubeVirt"
+          Alibaba: "Alibaba"
+          EquinixMetal: "EquinixMetal"
+          None: "Other"
+          External: "Other"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_cluster_environment:
+        description:
+          - Environment label applied to the ManagedCluster object (e.g., lab, dev, staging, production). Override via -e for non-lab deployments.
+        type: str
+        default: "lab"
+        version_added: "1.0.0"
+      # --- BEHAVIOR ---
+      acm_dr_spoke_manager_action:
+        description: "Action to execute: 'prep' (onboarding/sanitization) or 'detach' (graceful removal)."
+        type: str
+        default: "prep"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_cleanup_bootstrap_sa:
+        description: Clean up the Spoke's bootstrap ServiceAccount and ClusterRoleBinding after onboarding.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_import_bootstrap_wait:
+        description: >-
+          Seconds to wait after auto-import-secret creation for the import
+          controller to bootstrap the klusterlet. If the klusterlet namespace
+          does not exist on the Spoke after this period, the fallback applies
+          the klusterlet manifests directly from the Hub ManifestWorks.
+        type: int
+        default: 15
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_bootstrap_switch_restart_wait:
+        description: >-
+          Grace period in seconds after deleting hub-kubeconfig-secret for the
+          klusterlet registration agent to detect the deletion and trigger
+          re-registration (bootstrap-switch path, task 1.2.6j). Increase in
+          environments with slow controller reconciliation loops.
+        type: int
+        default: 30
+        version_added: "1.3.0"
+      acm_dr_spoke_manager_crd_establish_wait:
+        description: >-
+          Seconds to wait after applying klusterlet CRDs directly to the Spoke
+          (fallback bootstrap path, task 1.2.8b). Ensures the API server fully
+          registers the new CRD before the Klusterlet CR and operator Deployment
+          are applied. Increase only if CRD registration is slow on the target cluster.
+        type: int
+        default: 5
+        version_added: "1.3.0"
+      acm_dr_spoke_manager_spoke_reconcile_retries:
+        description: >-
+          Number of polling retries for the Spoke to reach
+          ManagedClusterConditionAvailable=True after import. ARO Spokes with
+          klusterlet v2.9.5 (RHACM 2.14) need 3-10 minutes for bootstrap
+          registration. Total wait = retries × delay = 60 × 15s = 15 minutes max.
+        type: int
+        default: 60
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_spoke_reconcile_delay:
+        description: Interval in seconds between Spoke reconciliation polling retries.
+        type: int
+        default: 15
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_detach_wait_retries:
+        description: >-
+          Polling retries for Phase 1 of the detach sequence: wait until the
+          ManagedCluster object disappears after a normal detach (no finalizer
+          blocker). Total wait = retries x delay = 30 x 10s = 300 seconds max.
+        type: int
+        default: 30
+        version_added: "1.3.0"
+      acm_dr_spoke_manager_detach_wait_delay:
+        description: Interval in seconds between initial detach poll retries.
+        type: int
+        default: 10
+        version_added: "1.3.0"
+      acm_dr_spoke_manager_detach_finalizer_retries:
+        description: >-
+          Maximum polling retries when waiting for a ManagedCluster to disappear
+          after force-removing stuck finalizers (inline break-glass, Phase 2c).
+          Shorter than the Phase 1 wait because the finalizer blocker has been patched out.
+        type: int
+        default: 12
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_detach_finalizer_delay:
+        description: Interval in seconds between post-remediation finalizer polling retries.
+        type: int
+        default: 10
+        version_added: "1.0.0"
+      # --- SPOKE ONBOARDING (SA + FLEET) ---
+      acm_dr_spoke_manager_automation_namespace:
+        description:
+          - Namespace for the permanent automation identity provisioned on the Spoke during the onboard action.
+        type: str
+        default: "ansible-automation"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_automation_sa_name:
+        description:
+          - ServiceAccount name for the permanent automation identity provisioned on the Spoke.
+        type: str
+        default: "ansible-dr-orchestrator"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_automation_secret_name:
+        description:
+          - Token Secret name for the automation ServiceAccount provisioned on the Spoke.
+        type: str
+        default: "ansible-dr-orchestrator-token"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_fleet_secret_name:
+        description:
+          - Secret name on the Hub that aggregates all Spoke SA tokens into a single kubeconfig.
+        type: str
+        default: "spoke-fleet-kubeconfig"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_fleet_secret_namespace:
+        description:
+          - Namespace on the Hub where the fleet kubeconfig Secret is stored.
+        type: str
+        default: "ansible-automation"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_fleet_secret_key:
+        description:
+          - Data key inside the fleet Secret that holds the kubeconfig content.
+        type: str
+        default: "kubeconfig"
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_fleet_skip_tls_when_no_ca:
+        description:
+          - TLS policy for new fleet entries. Skip TLS verification when no CA data is available (default for ARO/public-CA clusters in lab environments). Production deployments should provide CA data and set this to false.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_fleet_cleanup_on_detach:
+        description: >-
+          Remove the Spoke's SA context from the fleet Secret
+          (spoke-fleet-kubeconfig) on the Hub after the ManagedCluster
+          and klusterlet are removed. Set to false to preserve stale entries
+          for forensics or when a re-onboard is planned immediately after.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_dr_spoke_manager_allow_missing_spoke_credential:
+        description: >-
+          Skip the assert in Phase 1.6 that requires ACM_DR_SPOKE_TOKEN to be set.
+          When false (default), the task fails if the 'ACM DR - Spoke Cluster'
+          credential is not attached to the job, preventing a silent onboard
+          without Operation C fallback coverage. Set to true only when the Spoke
+          will always appear in the OADP fleet kubeconfig Secret after restore
+          (for example, it was onboarded before the last backup cycle and has
+          a context in the fleet Secret already).
+        type: bool
+        default: false
+        version_added: "1.0.0"
+...

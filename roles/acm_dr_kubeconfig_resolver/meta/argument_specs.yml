@@ -1,0 +1,130 @@
+---
+argument_specs:
+  main:
+    short_description: Runtime kubeconfig assembly from per-cluster credentials
+    description:
+      - >-
+        Lightweight pre-tasks role that detects per-cluster env vars injected by
+        AAP custom credential types (or exported locally via
+        examples/scripts/lib/load_cluster_env.sh) and builds a single runtime kubeconfig
+        file from them. If no per-cluster env vars are detected, the role is a
+        no-op and the playbook falls back to the legacy monolithic KUBECONFIG.
+        Included in every playbook's pre_tasks via include_role (tagged 'always').
+    author:
+      - Diego Felipe Mateus
+    options:
+      # --- COSMETIC AND LOGGING ---
+      acm_dr_kubeconfig_resolver_separator_char:
+        description: >-
+          Separator character for banner messages displayed in verbose/AAP job output.
+        type: str
+        default: "="
+        required: false
+        version_added: "1.0.0"
+      acm_dr_kubeconfig_resolver_debug_no_log:
+        description: >-
+          Suppresses task output for security-sensitive operations (tokens,
+          secrets, kubeconfig content). Set to false to reveal hidden output
+          during troubleshooting sessions.
+        type: bool
+        default: true
+        required: false
+        version_added: "1.0.0"
+      # --- RUNTIME KUBECONFIG FILE LOCATION ---
+      acm_dr_kubeconfig_resolver_tempfile_path:
+        description: >-
+          Path where the resolver writes the assembled kubeconfig. Created with
+          mode 0600 (owner-only read/write) because it contains bearer tokens.
+          AAP execution environments clean /tmp on job completion.
+        type: str
+        default: "/tmp/acm_dr_runtime_kubeconfig.yml"
+        required: false
+        version_added: "1.0.0"
+      # --- PER-CLUSTER ENV VAR PREFIXES ---
+      acm_dr_kubeconfig_resolver_cluster_prefixes:
+        description: >-
+          List of env var prefix families to scan. Each prefix maps to a cluster
+          role in the automation. The resolver reads <PREFIX>_HOST, <PREFIX>_TOKEN,
+          <PREFIX>_CA_DATA (optional), and <PREFIX>_CONTEXT for each prefix that
+          has at least HOST + TOKEN + CONTEXT present and non-empty. Adding a new
+          prefix here extends support without any task logic changes.
+        type: list
+        elements: str
+        default:
+          - "ACM_DR_TARGET"
+          - "ACM_DR_SOURCE"
+          - "ACM_DR_DEST"
+          - "ACM_DR_SPOKE"
+        required: false
+        version_added: "1.0.0"
+      # --- SPOKE FLEET KUBECONFIG ---
+      acm_dr_kubeconfig_resolver_spoke_fleet_env_var:
+        description: >-
+          Name of the env var holding the path to a multi-Spoke kubeconfig file.
+          The failover orchestrator discovers Spokes dynamically, so individual
+          Spoke credentials cannot be attached at Job Template time. The resolver
+          merges contexts from this file alongside the per-cluster Hub entries.
+        type: str
+        default: "ACM_DR_SPOKE_FLEET_KUBECONFIG"
+        required: false
+        version_added: "1.0.0"
+      # --- TLS VERIFICATION ---
+      acm_dr_kubeconfig_resolver_skip_tls_when_no_ca:
+        description: >-
+          When CA data is not provided for a cluster entry, the resolver sets
+          insecure-skip-tls-verify based on this flag. ARO clusters use publicly
+          trusted certificates (Let's Encrypt), so skipping TLS verification is
+          acceptable for lab environments. Production deployments should provide
+          CA data and set this to false.
+        type: bool
+        default: true
+        required: false
+        version_added: "1.0.0"
+      # --- SPOKE FLEET SECRET ON HUB ---
+      acm_dr_kubeconfig_resolver_fleet_secret_name:
+        description: >-
+          Name of the Secret on the Hub cluster that holds the Spoke fleet
+          kubeconfig. Created and updated by 03_build_spoke_fleet.sh --push-secret,
+          labeled for OADP backup so it replicates to passive Hubs automatically.
+        type: str
+        default: "spoke-fleet-kubeconfig"
+        required: false
+        version_added: "1.0.0"
+      acm_dr_kubeconfig_resolver_fleet_secret_namespace:
+        description: >-
+          Namespace where the automation ServiceAccount and the fleet kubeconfig
+          Secret live on the Hub cluster.
+        type: str
+        default: "ansible-automation"
+        required: false
+        version_added: "1.0.0"
+      acm_dr_kubeconfig_resolver_fleet_secret_key:
+        description: >-
+          Data key inside the fleet Secret that holds the kubeconfig YAML content.
+        type: str
+        default: "kubeconfig"
+        required: false
+        version_added: "1.0.0"
+      acm_dr_kubeconfig_resolver_fleet_secret_enabled:
+        description: >-
+          Enables automatic reading of the Spoke fleet kubeconfig from a Secret
+          stored on the Source Hub cluster. Set to false to disable Hub Secret
+          auto-read and rely only on the file-based fleet (env var) or the legacy
+          monolithic KUBECONFIG.
+        type: bool
+        default: true
+        required: false
+        version_added: "1.0.0"
+      # --- TOPOLOGY DETECTION ---
+      acm_dr_topology_override:
+        description: >-
+          Manual override for control plane topology detection. Set to
+          "External" (HCP) or "HighlyAvailable" (Classic) to skip the
+          Infrastructure CR query. Empty string (default) triggers
+          auto-detection from the target cluster's Infrastructure CR.
+          Non-OCP clusters degrade to "Unknown" / false.
+        type: str
+        default: ""
+        required: false
+        version_added: "1.6.0"
+...

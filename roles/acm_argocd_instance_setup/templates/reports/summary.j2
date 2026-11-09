@@ -1,0 +1,17 @@
+{% set _acm_argocd_instance_setup_summary_title = "✅  ARGOCD INSTANCE '" ~ acm_argocd_instance_setup_name ~ "' PROVISIONED SUCCESSFULLY" %}
+{% set _acm_argocd_instance_setup_summary_lines = [
+  "📂  Namespace:      " ~ acm_argocd_instance_setup_namespace,
+  "🌐  URL:            https://" ~ (acm_argocd_instance_setup_route_info.resources[0].spec.host if (acm_argocd_instance_setup_route_info is defined and acm_argocd_instance_setup_route_info.resources | default([]) | length > 0) else "N/A"),
+  "🔀  Generator:      " ~ acm_argocd_instance_setup_generator_type,
+  "🛡️   Cluster-admin RBAC: " ~ (acm_argocd_instance_setup_cluster_admin_rbac | default(false) | bool | string),
+  "🔗  Git Repository:  " ~ (acm_argocd_instance_setup_repo_url if (acm_argocd_instance_setup_repo_url | default('') | length > 0) else "N/A (no repository)"),
+  "🖇️   ConsoleLink:    " ~ (acm_argocd_instance_setup_console_link_text if (acm_argocd_instance_setup_console_link_enabled | default(false) | bool) else "disabled")
+] %}
+{% set _acm_argocd_instance_setup_summary_all_lines = [_acm_argocd_instance_setup_summary_title] + _acm_argocd_instance_setup_summary_lines %}
+{% set _acm_argocd_instance_setup_summary_max_len = _acm_argocd_instance_setup_summary_all_lines | map('length') | max %}
+{% set _acm_argocd_instance_setup_summary_sep = "-" * (_acm_argocd_instance_setup_summary_max_len + 2) %}
+{{ _acm_argocd_instance_setup_summary_sep }}
+{% for _acm_argocd_instance_setup_summary_line in _acm_argocd_instance_setup_summary_all_lines %}
+ {{ _acm_argocd_instance_setup_summary_line }}
+{% endfor %}
+{{ _acm_argocd_instance_setup_summary_sep }}

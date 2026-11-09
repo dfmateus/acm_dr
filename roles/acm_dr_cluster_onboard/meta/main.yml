@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: acm_dr_cluster_onboard
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Creates the ansible-dr-orchestrator ServiceAccount, ClusterRoleBinding, and
+    non-expiring token Secret on any Kubernetes/OpenShift cluster. Run once per
+    cluster (Hub or Spoke) to bootstrap the Zero-Trust automation identity before
+    configuring permanent credentials in Ansible Automation Platform.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - disasterrecovery
+    - openshift
+    - kubernetes
+    - bootstrap
+
+dependencies: []
+...

@@ -1,0 +1,145 @@
+---
+# PrometheusRule for ACM DR backup health monitoring.
+# Deployed when acm_dr_hub_setup_prometheusrule_enabled is true.
+# Two alerts cover the most common backup failure modes:
+# 1. Governance Policy non-compliance (18 ConfigurationPolicy templates)
+# 2. Stale validation backups (heartbeat schedule stopped firing)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: "{{ acm_dr_hub_setup_prometheusrule_name }}"
+  namespace: "{{ acm_dr_hub_setup_acm_backup_namespace }}"
+  labels:
+    app.kubernetes.io/part-of: acm-dr
+    app.kubernetes.io/managed-by: ansible
+spec:
+  groups:
+    - name: acm-dr-backup-health
+      rules:
+        # Alert 1: The backup-restore-enabled governance Policy is NonCompliant.
+        # This Policy has 18 ConfigurationPolicy templates that check MCH,
+        # DPA, BSL, auto-import secrets, and other backup prerequisites.
+        # A sustained non-compliance means the backup pipeline is broken.
+        - alert: ACMBackupPolicyNonCompliant
+          annotations:
+            summary: "ACM backup-restore-enabled Policy is NonCompliant"
+            description: >-
+              The backup-restore-enabled governance Policy on cluster
+              {% raw %}{{ $labels.cluster }}{% endraw %} has been NonCompliant
+              for more than {{ acm_dr_hub_setup_policy_noncompliant_threshold }}.
+              Check the Policy status in the ACM console or run:
+              oc get policy backup-restore-enabled -A -o wide
+            runbook_url: "https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index"
+          expr: >-
+            policy_governance_info{policy="backup-restore-enabled"} > 0
+          for: "{{ acm_dr_hub_setup_policy_noncompliant_threshold }}"
+          labels:
+            severity: warning
+            source: acm-dr-automation
+
+        # Alert 2: The validation schedule backup is stale. ACM creates a
+        # heartbeat backup (acm-validation-policy-schedule) with a short TTL.
+        # If the last successful backup is older than the threshold, backups
+        # have stopped running (schedule paused, OADP broken, BSL unavailable).
+        - alert: VeleroBackupStale
+          annotations:
+            summary: "Velero validation backup is stale"
+            description: >-
+              The last successful backup from schedule
+              acm-validation-policy-schedule on cluster
+              {% raw %}{{ $labels.cluster }}{% endraw %} is older than
+              {{ acm_dr_hub_setup_backup_stale_threshold }}.
+              Backups may have stopped. Check: oc get backups -n
+              {{ acm_dr_hub_setup_acm_backup_namespace }} -o wide
+            runbook_url: "https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index"
+          expr: >-
+            (time() - velero_backup_last_successful_timestamp{schedule=~".*acm-validation-policy-schedule.*"})
+            > {{ acm_dr_hub_setup_backup_stale_seconds }}
+          labels:
+            severity: warning
+            source: acm-dr-automation
+
+        # Alert 3: Velero has created at least one failed backup in the last lookback window.
+        # A failed backup means the full backup was not written to the BSL - distinct from
+        # "stale" (backup ran but is old). Requires Velero metrics to be scraped by the
+        # cluster monitoring stack (OADP deploys a ServiceMonitor for this automatically).
+        - alert: VeleroBackupFailed
+          annotations:
+            summary: "Velero backup failures detected on cluster"
+            description: >-
+              Velero recorded at least one failed backup on cluster
+              {% raw %}{{ $labels.cluster }}{% endraw %} in the last {{ acm_dr_hub_setup_backup_failure_lookback }}.
+              A failed backup means data was not written to the Backup Storage Location.
+              Check: oc logs -n {{ acm_dr_hub_setup_acm_backup_namespace }} -l app.kubernetes.io/name=velero
+            runbook_url: "https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index"
+          expr: >-
+            increase(velero_backup_failure_total[{{ acm_dr_hub_setup_backup_failure_lookback }}]) > 0
+          for: "0m"  # fire immediately - a failed backup is actionable regardless of duration
+          labels:
+            severity: warning
+            source: acm-dr-automation
+
+        # Alert 4: Velero has created at least one partially-failed backup in the last lookback
+        # window. A PartiallyFailed backup means some items were backed up, but others were not -
+        # typically due to webhook errors, missing CRDs, or API permission gaps. Not as severe as
+        # a full failure, but indicates that the backup may be incomplete.
+        - alert: VeleroBackupPartiallyFailed
+          annotations:
+            summary: "Velero partial backup failures detected on cluster"
+            description: >-
+              Velero recorded at least one partially-failed backup on cluster
+              {% raw %}{{ $labels.cluster }}{% endraw %} in the last {{ acm_dr_hub_setup_backup_partial_failure_lookback }}.
+              Some backup items failed; others succeeded. The backup is usable but incomplete.
+              Check Velero logs for skipped resources: oc logs -n {{ acm_dr_hub_setup_acm_backup_namespace }} -l app.kubernetes.io/name=velero
+            runbook_url: "https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index"
+          expr: >-
+            increase(velero_backup_partial_failure_total[{{ acm_dr_hub_setup_backup_partial_failure_lookback }}]) > 0
+          for: "0m"
+          labels:
+            severity: warning
+            source: acm-dr-automation
+
+        # Alert 5: The Velero container is not running in the OADP namespace.
+        # Uses kube-state-metrics (available in all OpenShift clusters via cluster-monitoring-operator).
+        # Fires when the Velero pod has been absent or not running for longer than the threshold -
+        # a brief CrashLoop restart is tolerated; a sustained outage blocks backup and restore.
+        - alert: VeleroPodNotReady
+          annotations:
+            summary: "Velero pod is not running in the OADP namespace"
+            description: >-
+              The Velero container has been absent or not running in namespace
+              {{ acm_dr_hub_setup_acm_backup_namespace }} on cluster
+              {% raw %}{{ $labels.cluster }}{% endraw %} for more than {{ acm_dr_hub_setup_velero_pod_unhealthy_threshold }}.
+              Backups and restores will fail until Velero recovers.
+              Check: oc get pods -n {{ acm_dr_hub_setup_acm_backup_namespace }}
+            runbook_url: "https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index"
+          expr: >-
+            kube_pod_container_status_running{namespace="{{ acm_dr_hub_setup_acm_backup_namespace }}",container="velero"} == 0
+          for: "{{ acm_dr_hub_setup_velero_pod_unhealthy_threshold }}"
+          labels:
+            severity: critical
+            source: acm-dr-automation
+
+        # Alert 6: Multiple governance policy templates are NonCompliant simultaneously.
+        # The existing ACMBackupPolicyNonCompliant alert fires at > 0 (any single template failing).
+        # This alert fires only when more than acm_dr_hub_setup_policy_severe_threshold templates
+        # are NonCompliant at once, which indicates a systemic failure (hub misconfiguration, OADP
+        # operator crash, or storage outage) rather than a single isolated check failure.
+        - alert: ACMBackupPolicySevereDegradation
+          annotations:
+            summary: "Multiple ACM backup governance policy templates are NonCompliant"
+            description: >-
+              More than {{ acm_dr_hub_setup_policy_severe_threshold }} templates in the
+              backup-restore-enabled governance Policy are NonCompliant on cluster
+              {% raw %}{{ $labels.cluster }}{% endraw %}. This indicates a systemic DR infrastructure
+              failure, not a single isolated check. Investigate MCH, OADP/DPA, BSL, and
+              auto-import secrets immediately.
+              Check: oc get policy backup-restore-enabled -A -o wide
+            runbook_url: "https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index"
+          expr: >-
+            policy_governance_info{policy="backup-restore-enabled"} > {{ acm_dr_hub_setup_policy_severe_threshold }}
+          for: "{{ acm_dr_hub_setup_policy_noncompliant_threshold }}"
+          labels:
+            severity: critical
+            source: acm-dr-automation
+...

@@ -1,0 +1,48 @@
+---
+# =============================================================================
+# acm_dr_msa_provisioner - role defaults
+#
+# Provisions a ManagedServiceAccount CR + ManifestWork ClusterRoleBinding on a
+# RHACM Hub for a single Spoke. The klusterlet creates the SA on the Spoke and
+# writes the auto-rotated token Secret back to the Hub namespace for that Spoke.
+# =============================================================================
+
+# Hub kubeconfig context. Required - the role cannot infer the Hub from the
+# environment. Pass explicitly via vars or as an extra-var.
+acm_dr_msa_provisioner_hub_context: ""  # string (required) - Hub kubeconfig context
+
+# ManagedCluster name on the Hub. Doubles as the Hub namespace where the MSA CR
+# and token Secret are created (RHACM places all per-Spoke objects in the
+# namespace named after the ManagedCluster).
+acm_dr_msa_provisioner_spoke_name: ""  # string (required) - ManagedCluster name = Hub namespace
+
+# Name of the ManagedServiceAccount CR. The klusterlet creates a ServiceAccount
+# with the same name on the Spoke and the token Secret on the Hub also uses this
+# name. External consumers (e.g. acm_hub_token_resolver) reference this name.
+acm_dr_msa_provisioner_msa_name: "ansible-dr-orchestrator-msa"  # string - MSA CR name and token Secret name
+
+# Token validity period. The managed-serviceaccount addon auto-rotates tokens
+# before expiry. Set to a value longer than the longest expected DR drill cycle
+# so tokens remain valid through backup, restore, and reconnect sequences.
+acm_dr_msa_provisioner_ttl: "720h"  # duration - MSA token validity (default: 30 days)
+
+# ClusterRole bound by the ManifestWork ClusterRoleBinding on the Spoke.
+# cluster-admin is required for the same reason as the permanent SA: the
+# orchestration reads and writes RHACM CRs, OADP objects, and RBAC resources
+# across all namespaces.
+acm_dr_msa_provisioner_cluster_role: "cluster-admin"  # string - ClusterRole for the MSA on the Spoke
+
+# Namespace where the managed-serviceaccount addon controller places the
+# ServiceAccount on the Spoke. Verified against RHACM 2.10 addon controller
+# behavior; update if the addon version changes the target namespace.
+acm_dr_msa_provisioner_sa_namespace: "open-cluster-management-agent-addon"  # string - SA namespace on the Spoke
+
+# Poll settings for waiting until the klusterlet writes the token Secret to
+# the Hub after the MSA CR is created. Total max wait: retries × delay seconds.
+acm_dr_msa_provisioner_wait_retries: 18  # count - poll retries for token Secret to appear (180s total)
+acm_dr_msa_provisioner_wait_delay: 10   # seconds - delay between retries
+
+# Set to false to show sensitive intermediate values in task output (debug only).
+# Must remain true in production - the MSA token must never appear in AAP job logs.
+acm_dr_msa_provisioner_debug_no_log: true
+...

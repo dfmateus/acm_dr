@@ -1,0 +1,500 @@
+---
+# =============================================================================
+# INITIAL HEADER AND STAGE 00 METADATA DISPLAY
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.0.1) Display prerequisite validation metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "📋 STAGE 00 - Preflight & Safety Validation"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT (K8S): {{ k8s_target_context | default('NOT DEFINED') }}"
+      - "🛠️ REQUIRED BINARIES: oc, kubectl, helm"
+      - "🏷️ TARGET ACM VERSION:  {{ acm_dr_hub_setup_mch_channel | default('release-2.14') }}"
+  run_once: true
+
+# =============================================================================
+# STEP 0.1: VARIABLE NORMALIZATION AND ENVIRONMENT READING
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.1.1) Normalize and read credentials from environment variables (export)"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_azure_subscription_id: "{{ lookup('ansible.builtin.env', 'SUBSCRIPTION') | default(acm_dr_hub_setup_azure_subscription_id, true) }}"
+    acm_dr_hub_setup_azure_tenant_id: "{{ lookup('ansible.builtin.env', 'TENANT') | default(acm_dr_hub_setup_azure_tenant_id, true) }}"
+    acm_dr_hub_setup_azure_client_id: "{{ lookup('ansible.builtin.env', 'CLIENT_ID') | default(acm_dr_hub_setup_azure_client_id, true) }}"
+    acm_dr_hub_setup_azure_client_secret: "{{ lookup('ansible.builtin.env', 'PASSWORD') | default(acm_dr_hub_setup_azure_client_secret, true) }}"
+    acm_dr_hub_setup_azure_resource_group: "{{ lookup('ansible.builtin.env', 'RESOURCEGROUP') | default(acm_dr_hub_setup_azure_resource_group, true) }}"
+    acm_dr_hub_setup_github_username: "{{ lookup('ansible.builtin.env', 'GITHUB_USER') | default(acm_dr_hub_setup_github_username, true) }}"
+    acm_dr_hub_setup_github_pat: "{{ lookup('ansible.builtin.env', 'GITHUB_PAT') | default(acm_dr_hub_setup_github_pat, true) }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.1.2) Display lab initialization status and operational metadata"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/stage_banner.j2').split('\n') }}"
+  vars:
+    acm_dr_hub_setup_banner_title: "⚙️ STAGE 00 - Resolved Environment & Cloud Configuration"
+    acm_dr_hub_setup_banner_lines:
+      - "🎯 TARGET CONTEXT (K8S): {{ k8s_target_context | default('NOT DEFINED') }}"
+      - "🏗️ HUB TYPE:             {{ is_primary_hub | default(false) | bool | ternary('PRIMARY HUB (ACTIVE)', 'SECONDARY / PASSIVE HUB (DR)') }}"
+      - "☁️ CLOUD PROVIDER:       {{ acm_dr_hub_setup_cloud_provider | default('azure') }}"
+      - >-
+        {{
+          (acm_dr_hub_setup_cloud_provider == 'aws')
+          | ternary(
+              '🌎 AWS REGION:           ' ~ (acm_dr_hub_setup_aws_region | default('NOT DEFINED')),
+              '🌎 AZURE RESOURCE GROUP: ' ~ (acm_dr_hub_setup_azure_resource_group | default('NOT DEFINED'))
+            )
+        }}
+      - "🔗 GITOPS REPOSITORY:    {{ acm_dr_hub_setup_github_repo_url | default('NOT DEFINED') }}"
+  run_once: true
+
+# =============================================================================
+# STEP 0.2: PARAMETER AND SECURITY VALIDATION (ASSERTIONS)
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.1.3) ⚠️ Warn when ACM channel uses the built-in default"
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ WARNING: ACM_CHANNEL env var is not set. Using built-in default channel
+      '{{ acm_dr_hub_setup_mch_channel }}'. This may install an outdated RHACM version.
+      Set the ACM_CHANNEL env var or pass -e acm_dr_hub_setup_mch_channel=release-X.Y
+      before running in production.
+  when: lookup('ansible.builtin.env', 'ACM_CHANNEL') | length == 0
+
+- name: "[STAGE 00 - Preflight] | 0.2.0) Validate cloud_provider setting"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_cloud_provider in ['azure', 'aws']
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => cloud_provider '{{ acm_dr_hub_setup_cloud_provider }}' is not a
+      supported value. Set -e acm_dr_hub_setup_cloud_provider=azure (or aws).
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => cloud_provider '{{ acm_dr_hub_setup_cloud_provider }}' validated.
+
+- name: "[STAGE 00 - Preflight] | 0.2.1) Assert mandatory cluster connectivity variable"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.name, default='') | length > 0
+      - lookup('ansible.builtin.vars', item.name, default='') not in item.forbidden_values
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Variable '{{ item.name }}' is missing, empty, or still contains the default placeholder value.
+      Supported loading sources: Defaults, AAP Credentials, Extra-vars (-e) or Environment Variables ({{ item.env_var }}).
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Parameter '{{ item.name }}'
+      validated ({{ lookup('ansible.builtin.vars', item.name) | length }} chars).
+  loop:
+    - name: "k8s_target_context"
+      forbidden_values: ["", "NOT DEFINED"]
+      env_var: "KUBECONFIG / Context"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# Only required when Stage 04 (GitOps/ArgoCD) is enabled. Skipped when
+# acm_dr_hub_setup_enable_gitops=false so the Hub Setup JT can run without a GitHub PAT credential.
+- name: "[STAGE 00 - Preflight] | 0.2.1c) Assert GitOps credential variables (enable_gitops=true)"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.name, default='') | length > 0
+      - lookup('ansible.builtin.vars', item.name, default='') not in item.forbidden_values
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Variable '{{ item.name }}' is missing, empty, or still contains the default placeholder value.
+      Supported loading sources: Defaults, AAP Credentials, Extra-vars (-e) or Environment Variables ({{ item.env_var }}).
+      To skip ArgoCD setup entirely, set acm_dr_hub_setup_enable_gitops=false.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => GitOps parameter '{{ item.name }}'
+      validated ({{ lookup('ansible.builtin.vars', item.name) | length }} chars).
+  loop:
+    - name: "acm_dr_hub_setup_github_username"
+      forbidden_values: ["SEU_USUARIO_GITHUB_AQUI", ""]
+      env_var: "GITHUB_USER"
+    - name: "acm_dr_hub_setup_github_pat"
+      forbidden_values: ["github_pat_SEU_TOKEN_AQUI", ""]
+      env_var: "GITHUB_PAT"
+    - name: "acm_dr_hub_setup_github_repo_url"
+      forbidden_values: [""]
+      env_var: "GITHUB_REPO"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: acm_dr_hub_setup_enable_gitops | default(true) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.2.1a) Assert mandatory Azure infrastructure variables"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.name, default='') | length > 0
+      - lookup('ansible.builtin.vars', item.name, default='') not in item.forbidden_values
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Variable '{{ item.name }}' is missing, empty, or still contains the default placeholder value.
+      Supported loading sources: Defaults, AAP Credentials, Extra-vars (-e) or Environment Variables ({{ item.env_var }}).
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Parameter '{{ item.name }}'
+      validated ({{ lookup('ansible.builtin.vars', item.name) | length }} chars).
+  loop:
+    - name: "acm_dr_hub_setup_azure_storage_account_name"
+      forbidden_values: ["", "acmsa"]
+      env_var: "AZURE_STORAGE_ACCOUNT or GUID (shorthand)"
+    - name: "acm_dr_hub_setup_azure_subscription_id"
+      forbidden_values: ["00000000-0000-0000-0000-000000000000", ""]
+      env_var: "SUBSCRIPTION"
+    - name: "acm_dr_hub_setup_azure_tenant_id"
+      forbidden_values: ["00000000-0000-0000-0000-000000000000", ""]
+      env_var: "TENANT"
+    - name: "acm_dr_hub_setup_azure_client_id"
+      forbidden_values: ["00000000-0000-0000-0000-000000000000", ""]
+      env_var: "CLIENT_ID"
+    - name: "acm_dr_hub_setup_azure_client_secret"
+      forbidden_values: ["SUBSTITUA_PELO_SECRET_AZURE", ""]
+      env_var: "PASSWORD"
+    - name: "acm_dr_hub_setup_azure_resource_group"
+      forbidden_values: ["", "openenv-"]
+      env_var: "RESOURCEGROUP or AZURE_RESOURCE_GROUP"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: acm_dr_hub_setup_cloud_provider == 'azure'
+
+- name: "[STAGE 00 - Preflight] | 0.2.1b) Assert mandatory AWS infrastructure variables"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item.name, default='') | length > 0
+      - lookup('ansible.builtin.vars', item.name, default='') not in item.forbidden_values
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Variable '{{ item.name }}' is missing, empty, or still contains the default placeholder value.
+      Supported loading sources: Defaults, AAP Credentials, Extra-vars (-e) or Environment Variables ({{ item.env_var }}).
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Parameter '{{ item.name }}'
+      validated ({{ lookup('ansible.builtin.vars', item.name) | length }} chars).
+  loop:
+    - name: "acm_dr_hub_setup_aws_access_key_id"
+      forbidden_values: [""]
+      env_var: "AWS_ACCESS_KEY_ID"
+    - name: "acm_dr_hub_setup_aws_secret_access_key"
+      forbidden_values: [""]
+      env_var: "AWS_SECRET_ACCESS_KEY"
+    - name: "acm_dr_hub_setup_aws_region"
+      forbidden_values: [""]
+      env_var: "AWS_DEFAULT_REGION"
+    - name: "acm_dr_hub_setup_aws_s3_bucket_backup"
+      forbidden_values: [""]
+      env_var: "extra-var -e acm_dr_hub_setup_aws_s3_bucket_backup=..."
+    - name: "acm_dr_hub_setup_aws_s3_bucket_observability"
+      forbidden_values: [""]
+      env_var: "extra-var -e acm_dr_hub_setup_aws_s3_bucket_observability=..."
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  when: acm_dr_hub_setup_cloud_provider == 'aws'
+
+- name: "[STAGE 00 - Preflight] | 0.2.2) Validate Azure Storage Account name format (3-24 chars, lowercase + digits only)"
+  ansible.builtin.assert:
+    that:
+      # Azure Storage Account names must be 3-24 characters, lowercase letters
+      # and digits only, and globally unique across all Azure subscriptions.
+      - acm_dr_hub_setup_azure_storage_account_name | regex_search('^[a-z0-9]{3,24}$') is not none
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Storage Account name '{{ acm_dr_hub_setup_azure_storage_account_name }}'
+      does not meet Azure naming rules (3-24 characters, lowercase letters and digits only).
+      Provide a valid name via: -e acm_dr_hub_setup_azure_storage_account_name=<name>,
+      the AZURE_STORAGE_ACCOUNT env var, or set GUID to construct 'acmsa<guid>' automatically.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Storage Account name '{{ acm_dr_hub_setup_azure_storage_account_name }}'
+      meets Azure naming rules ({{ acm_dr_hub_setup_azure_storage_account_name | length }} chars).
+  when: acm_dr_hub_setup_cloud_provider == 'azure'
+
+- name: "[STAGE 00 - Preflight] | 0.2.3) Validate mandatory parameters for Spoke import"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_spoke_cluster_name | length > 0
+      - acm_dr_hub_setup_spoke_api_url | length > 0
+      - acm_dr_hub_setup_spoke_api_token | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Spoke import is enabled, but the required variables
+      (acm_dr_hub_setup_spoke_api_url / acm_dr_hub_setup_spoke_api_token) were not provided.
+    success_msg: "✅ PASSED! Oh. Yes! => Spoke cluster import parameters validated successfully."
+  when: acm_dr_hub_setup_enable_spoke_import | default(false) | bool
+
+- name: "[STAGE 00 - Preflight] | 0.2.4) ASSERT - DPA name within Kubernetes Route length limit"
+  ansible.builtin.assert:
+    that:
+      # The DPA name becomes part of a Kubernetes Route (used by Velero/OADP for
+      # BSL access). Route names are constrained to 63 characters by RFC 1123.
+      - (acm_dr_hub_setup_oadp_dpa_name | default('') | length) <= acm_dr_hub_setup_dpa_name_max_length
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => DPA name '{{ acm_dr_hub_setup_oadp_dpa_name }}'
+      is {{ acm_dr_hub_setup_oadp_dpa_name | length }} characters, exceeding the
+      {{ acm_dr_hub_setup_dpa_name_max_length }}-character Kubernetes Route
+      name limit. Use a shorter name to avoid Route creation failures.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => DPA name '{{ acm_dr_hub_setup_oadp_dpa_name }}'
+      ({{ acm_dr_hub_setup_oadp_dpa_name | length }} chars) is within the
+      {{ acm_dr_hub_setup_dpa_name_max_length }}-character limit.
+  when: acm_dr_hub_setup_oadp_dpa_name | default('') | length > 0
+
+# =============================================================================
+# STEP 0.3: LOCAL BINARY AND TOOL VALIDATION
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.3.1) Check presence of local CLI utilities (oc)"
+  # noqa command-instead-of-shell - 'command -v' is a shell built-in (no external binary);
+  # 'which' is unavailable on minimal EE container images (ee-minimal-rhel9).
+  # az CLI is no longer required: all Azure Storage operations use
+  # azure.azcollection modules (azure_rm_storageaccount, azure_rm_storageblob).
+  ansible.builtin.shell: "command -v {{ item }}"
+  changed_when: false
+  failed_when: false
+  register: acm_dr_hub_setup_cli_check
+  loop:
+    - oc
+  loop_control:
+    label: "{{ item }}"
+
+- name: "[STAGE 00 - Preflight] | 0.3.2) Validate that oc binary is installed in PATH"
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => The utility '{{ item.item }}' was not found in the execution host's PATH.
+      Install the required CLI before proceeding.
+    success_msg: "✅ PASSED! Oh. Yes! => CLI '{{ item.item }}' found in the local environment."
+  loop: "{{ acm_dr_hub_setup_cli_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# =============================================================================
+# STEP 0.4: CONNECTIVITY, PERMISSIONS AND AUTOMATION RBAC CHECKS
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.4.1) Validate connectivity and access to Kubernetes cluster - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Namespace
+    name: openshift-config
+  register: acm_dr_hub_setup_target_cluster_check
+  ignore_errors: true
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+- name: "[STAGE 00 - Preflight] | 0.4.2) Assert connectivity to the OpenShift API - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - not acm_dr_hub_setup_target_cluster_check.failed | default(false)
+      - acm_dr_hub_setup_target_cluster_check.resources is defined
+      - acm_dr_hub_setup_target_cluster_check.resources | length > 0
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Access to context '{{ k8s_target_context }}' was denied (HTTP 401 Unauthorized) or the cluster is unreachable.
+      🛡️ ACTION REQUIRED: Your token has expired or the context is invalid. Run 'oc login' on the target terminal and try again.
+    success_msg: "✅ PASSED! Oh. Yes! => Connectivity, authentication and access to context '{{ k8s_target_context }}' validated successfully."
+
+- name: "[STAGE 00 - Preflight] | 0.4.3) Validate cluster-admin privileges on context - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Node
+  register: acm_dr_hub_setup_auth_check
+  failed_when: >
+    acm_dr_hub_setup_auth_check.resources is not defined or
+    acm_dr_hub_setup_auth_check.resources | length == 0
+
+- name: "[STAGE 00 - Preflight] | 0.4.4) Ensure DR automation Namespace, ServiceAccount and RBAC - {{ k8s_target_context }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: present
+    definition: "{{ lookup('template', 'rbac/ansible_dr_orchestrator_rbac.yml.j2') }}"
+  register: acm_dr_hub_setup_sa_rbac_apply
+
+- name: "[STAGE 00 - Preflight] | 0.4.5) Wait for automation Bearer Token Secret creation"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Secret
+    name: "{{ acm_dr_hub_setup_automation_secret_name }}"
+    namespace: "{{ acm_dr_hub_setup_automation_namespace }}"
+  register: acm_dr_hub_setup_sa_token_secret
+  until:
+    - (acm_dr_hub_setup_sa_token_secret.resources | default([])) | length > 0
+    - acm_dr_hub_setup_sa_token_secret.resources[0].data.token is defined
+  retries: 6
+  delay: 5
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+  ignore_errors: true
+
+# =============================================================================
+# SA TOKEN SECRET DIAGNOSTIC SECTION
+# =============================================================================
+# Runs if the SA Token Secret poll (0.4.5) timed out. Checks whether the
+# ServiceAccount and Namespace exist to narrow the root cause.
+
+# D.1) Check if the automation ServiceAccount exists.
+- name: "[STAGE 00 - Preflight DIAGNOSTIC] | D.1) Check automation ServiceAccount existence"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: ServiceAccount
+    name: "{{ acm_dr_hub_setup_automation_sa_name | default('ansible-dr-orchestrator') }}"
+    namespace: "{{ acm_dr_hub_setup_automation_namespace }}"
+  register: acm_dr_hub_setup_diag_sa_check
+  failed_when: false
+  when: acm_dr_hub_setup_sa_token_secret is failed
+
+# D.2) Build diagnostic summary and hints.
+- name: "[STAGE 00 - Preflight DIAGNOSTIC] | D.2) Build SA Token diagnostic"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_diag_sa_summary: >-
+      Secret '{{ acm_dr_hub_setup_automation_secret_name }}'
+      in namespace '{{ acm_dr_hub_setup_automation_namespace }}':
+      not found or has no token field after 30s.
+      ServiceAccount '{{ acm_dr_hub_setup_automation_sa_name | default('ansible-dr-orchestrator') }}':
+      {% set sa = acm_dr_hub_setup_diag_sa_check.resources | default([]) %}
+      {% if sa | length > 0 %}exists.{% else %}NOT FOUND.{% endif %}
+    acm_dr_hub_setup_diag_sa_hints: >-
+      {% set sa = acm_dr_hub_setup_diag_sa_check.resources | default([]) %}
+      {% set hints = [] %}
+      {% if sa | length == 0 %}
+      {%   set _ = hints.append(
+             'SA MISSING: The ServiceAccount was not created by the RBAC template at 0.4.4. '
+             ~ 'Check if the template apply at 0.4.4 succeeded and the namespace '
+             ~ acm_dr_hub_setup_automation_namespace ~ ' exists.') %}
+      {% else %}
+      {%   set _ = hints.append(
+             'SA EXISTS BUT NO TOKEN: The ServiceAccount exists but the kubernetes.io/service-account-token '
+             ~ 'Secret was not created within 30s. The SA token controller may be delayed or the Secret name '
+             ~ acm_dr_hub_setup_automation_secret_name ~ ' does not match the Secret the SA references. '
+             ~ 'Check: oc get secret -n ' ~ acm_dr_hub_setup_automation_namespace
+             ~ ' --context ' ~ k8s_target_context ~ '.') %}
+      {% endif %}
+      {{ hints }}
+  when: acm_dr_hub_setup_sa_token_secret is failed
+
+# D.3) Print the diagnostic report.
+- name: "[STAGE 00 - Preflight DIAGNOSTIC] | D.3) ❌ SA TOKEN FAILED: Diagnostic Report"
+  ansible.builtin.debug:
+    msg:
+      - "======================================================================"
+      - " ❌ SA TOKEN SECRET CREATION FAILED: DIAGNOSTIC REPORT"
+      - "======================================================================"
+      - ""
+      - "TARGET CLUSTER:"
+      - "  {{ k8s_target_context }}"
+      - ""
+      - "STATUS:"
+      - "{{ acm_dr_hub_setup_diag_sa_summary | default('  (could not gather status)') }}"
+      - ""
+      - "TROUBLESHOOTING HINTS:"
+      - "{{ acm_dr_hub_setup_diag_sa_hints | default(['  (no hints available)']) }}"
+      - ""
+      - "======================================================================"
+  when: acm_dr_hub_setup_sa_token_secret is failed
+
+# D.4) Re-fail so the AAP job shows as FAILED with actionable context.
+- name: "[STAGE 00 - Preflight DIAGNOSTIC] | D.4) ❌ Fail with actionable message"
+  ansible.builtin.fail:
+    msg: >-
+      ❌ FAILED! Oh. No! => Automation SA Token Secret
+      '{{ acm_dr_hub_setup_automation_secret_name }}'
+      in namespace '{{ acm_dr_hub_setup_automation_namespace }}'
+      was not created within 30s on context '{{ k8s_target_context }}'.
+      See the diagnostic report above for ServiceAccount status and troubleshooting hints.
+  when: acm_dr_hub_setup_sa_token_secret is failed
+
+- name: "[STAGE 00 - Preflight] | 0.4.6) Extract and register Bearer Token for subsequent stages"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_automation_bearer_token: "{{ acm_dr_hub_setup_sa_token_secret.resources[0].data.token | b64decode }}"
+    acm_dr_hub_setup_automation_target_context: "{{ k8s_target_context }}-sa"
+  no_log: "{{ acm_dr_hub_setup_debug_no_log | default(true) | bool }}"
+
+# =============================================================================
+# STEP 0.5: RED HAT ACM DIAGNOSTIC AND PRELIMINARY RECONNAISSANCE
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.5.1) Check MultiClusterHub CRD presence - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    kind: CustomResourceDefinition
+    name: multiclusterhubs.operator.open-cluster-management.io
+  register: acm_dr_hub_setup_mch_crd_check
+
+- name: "[STAGE 00 - Preflight] | 0.5.2) Check MultiClusterHub resource state - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    namespace: "{{ acm_dr_hub_setup_mch_namespace }}"
+    name: "{{ acm_dr_hub_setup_mch_name }}"
+  register: acm_dr_hub_setup_mch_resource_check
+  when: acm_dr_hub_setup_mch_crd_check.resources | length > 0
+
+- name: "[STAGE 00 - Preflight] | 0.5.3) Register ACM installation status fact"
+  ansible.builtin.set_fact:
+    acm_dr_hub_setup_acm_installed: >-
+      {{
+        (acm_dr_hub_setup_mch_resource_check.resources is defined) and
+        (acm_dr_hub_setup_mch_resource_check.resources | length > 0) and
+        (acm_dr_hub_setup_mch_resource_check.resources[0].status.phase | default('') == 'Running')
+      }}
+
+- name: "[STAGE 00 - Preflight] | 0.5.4) Display ACM state diagnostic for context - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        '✅ Red Hat ACM is already installed and in Running state on context (' ~ k8s_target_context ~ '). Stage 02 will be safely skipped.'
+        if acm_dr_hub_setup_acm_installed else
+        '📢 Red Hat ACM is absent or not operational on context (' ~ k8s_target_context ~ '). Stage 02 will deploy the MultiClusterHub.'
+      }}
+
+# Validate the requested ACM channel against the cluster catalog before Stage 02
+# creates any OLM resources. OLM sets Subscription.status to ResolutionFailed
+# silently when the channel is absent, leaving the namespace and OperatorGroup
+# in place with no install progress. Catching it here, before side effects,
+# gives the operator a clear error and the list of valid channels.
+- name: "[STAGE 00 - Preflight] | 0.5.5) Query catalog for available ACM channels - {{ k8s_target_context }}"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: packages.operators.coreos.com/v1
+    kind: PackageManifest
+    name: advanced-cluster-management
+    namespace: openshift-marketplace
+  register: acm_dr_hub_setup_pkg_manifest
+  when: not acm_dr_hub_setup_acm_installed
+
+- name: "[STAGE 00 - Preflight] | 0.5.6) 🛡️ ASSERT - Requested MCH channel exists in the cluster catalog - {{ k8s_target_context }}"
+  ansible.builtin.assert:
+    that:
+      - acm_dr_hub_setup_pkg_manifest.resources | length > 0
+      - acm_dr_hub_setup_mch_channel in
+        (acm_dr_hub_setup_pkg_manifest.resources[0].status.channels | map(attribute='name') | list)
+    fail_msg: >-
+      ❌ FAILED! Oh. No! => Channel '{{ acm_dr_hub_setup_mch_channel }}' is not
+      available in the redhat-operators catalog on this cluster.
+      Available channels: {{ acm_dr_hub_setup_pkg_manifest.resources[0].status.channels
+        | map(attribute='name') | list | sort | join(', ') }}.
+      Pass the correct value with -e acm_dr_hub_setup_mch_channel=<channel>
+      or set the ACM_CHANNEL environment variable before retrying.
+    success_msg: >-
+      ✅ PASSED! Oh. Yes! => Channel '{{ acm_dr_hub_setup_mch_channel }}' is
+      available in the cluster catalog. Stage 02 will proceed with
+      OLM Subscription creation.
+  when: not acm_dr_hub_setup_acm_installed
+
+# =============================================================================
+# STEP 0.5b: DR TOPOLOGY DETECTION (MULTI-HUB AWARENESS)
+# =============================================================================
+# Discovers existing DR artifacts (BackupSchedule, Restore, DPA, BSL) on the
+# target cluster to prevent accidental re-provisioning and validate that the
+# declared hub type matches the actual cluster state. Guarded by the
+# acm_dr_hub_setup_topology_detection flag (default true).
+
+- name: "[STAGE 00 - Preflight] | 0.5b) Detect existing DR topology on target cluster"
+  ansible.builtin.include_tasks: 00a_topology_detection.yml
+  when: acm_dr_hub_setup_topology_detection | default(true) | bool
+
+# =============================================================================
+# STEP 0.6: COMPLETION SUMMARY AND STAGE 00 CONCLUSION STATUS
+# =============================================================================
+
+- name: "[STAGE 00 - Preflight] | 0.6.1) Display lab prerequisite validation completion status - {{ k8s_target_context }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/00_preflight_summary.j2').split('\n') }}"
+  run_once: true
+...

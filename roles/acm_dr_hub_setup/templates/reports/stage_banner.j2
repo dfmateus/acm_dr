@@ -1,0 +1,8 @@
+{% set _acm_dr_hub_setup_banner_all_lines = [acm_dr_hub_setup_banner_title] + acm_dr_hub_setup_banner_lines %}
+{% set _acm_dr_hub_setup_banner_max_len = _acm_dr_hub_setup_banner_all_lines | map('length') | max %}
+{% set _acm_dr_hub_setup_banner_sep = (acm_dr_hub_setup_banner_sep_char | default(acm_dr_hub_setup_separator_char) | default('=')) * (_acm_dr_hub_setup_banner_max_len + 2) %}
+{{ _acm_dr_hub_setup_banner_sep }}
+{% for acm_dr_hub_setup_banner_line in _acm_dr_hub_setup_banner_all_lines %}
+ {{ acm_dr_hub_setup_banner_line }}
+{% endfor %}
+{{ _acm_dr_hub_setup_banner_sep }}

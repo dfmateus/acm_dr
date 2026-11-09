@@ -1,0 +1,77 @@
+---
+# roles/acm_dr_upgrade_manager/meta/argument_specs.yml
+argument_specs:
+  main:
+    short_description: Planned maintenance ACM channel upgrade for Hub clusters
+    description: >-
+      Patches the Advanced Cluster Management operator Subscription to a new OLM
+      channel on the target Hub and waits for the MultiClusterHub to reach Running
+      with Complete=True. Used inside the Planned Maintenance Switchover workflow
+      to upgrade the idle Hub automatically before failback.
+    options:
+      acm_dr_upgrade_manager_target_acm_version:
+        type: str
+        required: true
+        description: >-
+          Target RHACM major.minor version (e.g. "2.15" or "2.15.9"). The role
+          normalizes to major.minor for the OLM channel name (release-X.Y).
+
+      acm_dr_upgrade_manager_acm_namespace:
+        type: str
+        default: "open-cluster-management"
+        description: >-
+          Namespace where the ACM operator Subscription and MultiClusterHub live.
+
+      acm_dr_upgrade_manager_subscription_name:
+        type: str
+        default: "advanced-cluster-management"
+        description: >-
+          Name of the OLM Subscription object for the ACM operator.
+
+      acm_dr_upgrade_manager_mch_name:
+        type: str
+        default: "multiclusterhub"
+        description: >-
+          Name of the MultiClusterHub CR to monitor for Running phase.
+
+      acm_dr_upgrade_manager_mch_wait_retries:
+        type: int
+        default: 60
+        description: >-
+          Number of retries when polling MCH phase after the channel patch.
+          60 retries x 15s delay = 15 minutes maximum wait.
+
+      acm_dr_upgrade_manager_mch_wait_delay:
+        type: int
+        default: 15
+        description: >-
+          Seconds between MCH phase polls during the upgrade wait loop.
+
+      acm_dr_upgrade_manager_stable_wait_retries:
+        type: int
+        default: 10
+        description: >-
+          Number of retries when polling for MCH Complete=True after Running.
+          10 retries x 30s delay = 5 minutes maximum wait.
+
+      acm_dr_upgrade_manager_stable_wait_delay:
+        type: int
+        default: 30
+        description: >-
+          Seconds between stability polls after MCH reaches Running.
+
+      acm_dr_upgrade_manager_fail_on_unstable:
+        type: bool
+        default: true
+        description: >-
+          Hard-fail the play when MCH does not reach Complete=True within the
+          stable wait window. Set false only when you accept a partially-settled
+          hub and intend to verify manually before failback.
+
+      acm_dr_upgrade_manager_dry_run:
+        type: bool
+        default: false
+        description: >-
+          Dry-run mode. Reports the intended channel change but does not patch
+          the Subscription. Safe for pre-flight validation.
+...

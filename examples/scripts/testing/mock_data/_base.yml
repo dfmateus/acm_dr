@@ -1,0 +1,150 @@
+---
+# examples/scripts/testing/mock_data/_base.yml
+# Base variable set for compliance report template rendering tests. Every
+# scenario inherits from this file and overrides only the variables it needs.
+# Variables mirror the facts set by acm_dr_failover_manager at runtime.
+
+# --- Core identifiers ---
+active_hub: "acm-primary-hub-sa"
+passive_hub: "acm-dr-hub-sa"
+
+# --- Execution mode ---
+acm_dr_failover_manager_dry_run: false
+
+# --- Spoke fleet ---
+acm_dr_failover_manager_spoke_list:
+  - "aro-spoke-01"
+  - "aro-spoke-02"
+  - "aro-spoke-03"
+  - "aks-spoke-01"
+  - "eks-spoke-01"
+  - "gke-spoke-01"
+  - "iks-spoke-01"
+acm_dr_failover_manager_reachable_spoke_list:
+  - "aro-spoke-01"
+  - "aro-spoke-02"
+  - "aro-spoke-03"
+  - "aks-spoke-01"
+  - "eks-spoke-01"
+  - "gke-spoke-01"
+  - "iks-spoke-01"
+acm_dr_failover_manager_unreachable_spoke_list: []
+
+# --- Timing ---
+acm_dr_failover_manager_start_time_fmt: "2026-08-11 14:30:00 UTC"
+acm_dr_failover_manager_elapsed_seconds: 342  # seconds (5m 42s)
+
+# --- Topology ---
+acm_dr_failover_manager_topology_hub_schedules:
+  - context: "acm-primary-hub-sa"
+    is_active: false
+    schedule_exists: true
+  - context: "acm-dr-hub-sa"
+    is_active: true
+    schedule_exists: true
+acm_dr_failover_manager_active_hub_count: 1
+acm_dr_failover_manager_active_hub_list:
+  - "acm-dr-hub-sa"
+acm_dr_failover_manager_is_split_brain_detected: false
+
+# --- Residual state ---
+acm_dr_failover_manager_residual_spokes: []
+
+# --- Addon health ---
+acm_dr_failover_manager_degraded_addons_list: []
+acm_dr_failover_manager_degraded_addons_by_spoke: []
+
+# --- Policy governance ---
+acm_dr_failover_manager_policy_summary: '{"total": 5, "noncompliant": []}'
+
+# --- GitOps ---
+acm_dr_failover_manager_gitops_summary: '{"total": 3, "unhealthy": []}'
+
+# --- Placement decisions ---
+acm_dr_failover_manager_placement_summary: '{"total": 4, "empty": []}'
+
+# --- Observability dashboards ---
+acm_dr_failover_manager_dashboard_summary: '{"total": 2, "unprotected": []}'
+acm_dr_failover_manager_custom_dashboard_label: "grafana-custom-dashboard=true"
+
+# --- Version checks ---
+acm_dr_failover_manager_version_check: true
+acm_dr_failover_manager_source_acm_version: "2.14.2"
+acm_dr_failover_manager_dest_acm_version: "2.14.2"
+acm_dr_failover_manager_source_ocp_version: "4.18.34"
+acm_dr_failover_manager_dest_ocp_version: "4.18.34"
+acm_dr_failover_manager_source_mce_version: "2.14.2"
+acm_dr_failover_manager_dest_mce_version: "2.14.2"
+acm_dr_failover_manager_dest_acm_minor: "2.14"
+acm_dr_failover_manager_skip_version_gate: false
+acm_dr_failover_manager_target_acm_version: ""
+acm_dr_failover_manager_effective_acm_minor: "2.14"
+acm_dr_failover_manager_effective_acm_version: "2.14.2"
+acm_dr_failover_manager_acm_ocp_matrix:
+  "2.13": ["4.16", "4.17", "4.18", "4.19"]
+  "2.14": ["4.17", "4.18", "4.19", "4.20"]
+  "2.15": ["4.18", "4.19", "4.20", "4.21"]
+
+# --- Fleet compatibility ---
+acm_dr_failover_manager_fleet_compat:
+  - name: "aro-spoke-01"
+    openshift_version: "4.18.34"
+    ocp_minor: "4.18"
+    kubernetes_version: "1.31.6"
+    product: "OpenShift"
+    dest_rhacm_supported: true
+  - name: "aro-spoke-02"
+    openshift_version: "4.18.34"
+    ocp_minor: "4.18"
+    kubernetes_version: "1.31.6"
+    product: "OpenShift"
+    dest_rhacm_supported: true
+  - name: "aro-spoke-03"
+    openshift_version: "4.18.34"
+    ocp_minor: "4.18"
+    kubernetes_version: "1.31.6"
+    product: "OpenShift"
+    dest_rhacm_supported: true
+  - name: "aks-spoke-01"
+    openshift_version: "N/A"
+    ocp_minor: "N/A"
+    kubernetes_version: "1.30.9"
+    product: "AKS"
+    dest_rhacm_supported: true
+  - name: "eks-spoke-01"
+    openshift_version: "N/A"
+    ocp_minor: "N/A"
+    kubernetes_version: "1.31.4"
+    product: "EKS"
+    dest_rhacm_supported: true
+  - name: "gke-spoke-01"
+    openshift_version: "N/A"
+    ocp_minor: "N/A"
+    kubernetes_version: "1.31.5"
+    product: "GKE"
+    dest_rhacm_supported: true
+  - name: "iks-spoke-01"
+    openshift_version: "N/A"
+    ocp_minor: "N/A"
+    kubernetes_version: "1.31.3"
+    product: "IKS"
+    dest_rhacm_supported: true
+acm_dr_failover_manager_fleet_compat_all_ok: true
+acm_dr_failover_manager_fleet_compat_incompatible_count: 0
+
+# --- New leader Hub health ---
+acm_dr_failover_manager_new_hub_health: >-
+  {"mch_version": "2.14.2", "mch_phase": "Running",
+   "mce_version": "2.14.2", "mce_phase": "Available",
+   "csv_name": "advanced-cluster-management.v2.14.2", "csv_phase": "Succeeded",
+   "oadp_total": 3, "oadp_running": 3, "oadp_not_running": []}
+
+# --- Multi-hub (additional passive hubs) ---
+acm_dr_failover_manager_passive_hub_status: []
+
+# --- Backup age (RPO gate) ---
+acm_dr_failover_manager_backup_age_hours: 1.2
+acm_dr_failover_manager_backup_max_age_warn: 4
+acm_dr_failover_manager_newest_backup_name: "acm-credentials-schedule-20260811143000"
+
+...

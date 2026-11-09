@@ -1,0 +1,81 @@
+---
+argument_specs:
+  main:
+    short_description: Controlled removal of OpenShift ArgoCD instances
+    description:
+      - >-
+        Inverse operation of acm_argocd_instance_setup: removes everything that
+        role creates for ONE named instance (Applications, ApplicationSets,
+        managed Namespaces, ConsoleLink, RBAC, ArgoCD CR, and the instance
+        namespace) without affecting the GitOps operator (cluster-wide) or
+        other ArgoCD instances.
+    author:
+      - Diego Felipe Mateus
+    options:
+      # --- LOGGING ---
+      acm_argocd_instance_cleanup_separator_char:
+        description:
+          - Character used for cosmetic separators in task output.
+        type: str
+        default: "="
+        version_added: "1.0.0"
+      acm_argocd_instance_cleanup_debug_no_log:
+        type: bool
+        description: >-
+          Toggle for no_log on credential-handling tasks. Set to false during
+          development to reveal masked output. Keep true in production.
+        default: true
+        version_added: "1.0.0"
+      # --- INSTANCE IDENTITY ---
+      acm_argocd_instance_cleanup_name:
+        description: Name of the ArgoCD instance to remove.
+        type: str
+        required: true
+        version_added: "1.0.0"
+      acm_argocd_instance_cleanup_namespace:
+        description: Namespace of the ArgoCD instance to remove.
+        type: str
+        required: true
+        version_added: "1.0.0"
+      # --- SAFETY GATE ---
+      acm_argocd_instance_cleanup_confirm:
+        description: Explicit confirmation required before any removal.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      # --- EXECUTION MODE ---
+      acm_argocd_instance_cleanup_dry_run:
+        description: Simulation mode with dryRun=All on the API Server.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      # --- MANAGED NAMESPACES ---
+      acm_argocd_instance_cleanup_managed_namespaces:
+        description: >-
+          List of managed namespace names to remove (same list used during creation).
+        type: list
+        elements: str
+        default: []
+        version_added: "1.0.0"
+      acm_argocd_instance_cleanup_remove_managed_namespaces:
+        description: Actually remove the listed managed namespaces.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      # --- TIMEOUTS ---
+      acm_argocd_instance_cleanup_application_delete_retries:
+        description: Number of polling retries for Application removal.
+        type: int
+        default: 20
+        version_added: "1.0.0"
+      acm_argocd_instance_cleanup_application_delete_delay:
+        description: Interval in seconds between Application polling retries.
+        type: int
+        default: 5
+        version_added: "1.0.0"
+      acm_argocd_instance_cleanup_namespace_delete_timeout:
+        description: Timeout (seconds) for namespace removal.
+        type: int
+        default: 300
+        version_added: "1.0.0"
+...

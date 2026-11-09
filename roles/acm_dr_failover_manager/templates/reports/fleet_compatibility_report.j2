@@ -1,0 +1,85 @@
+{% set version_check_enabled = acm_dr_failover_manager_version_check | default(true) | bool %}
+{% set src_acm = acm_dr_failover_manager_source_acm_version | default('N/A') | trim %}
+{% set dst_acm = acm_dr_failover_manager_dest_acm_version | default('N/A') | trim %}
+{% set src_ocp = acm_dr_failover_manager_source_ocp_version | default('N/A') | trim %}
+{% set dst_ocp = acm_dr_failover_manager_dest_ocp_version | default('N/A') | trim %}
+{% set src_mce = acm_dr_failover_manager_source_mce_version | default('N/A') | trim %}
+{% set dst_mce = acm_dr_failover_manager_dest_mce_version | default('N/A') | trim %}
+{% set src_acm_minor = acm_dr_failover_manager_source_acm_minor | default('Unknown') | trim %}
+{% set dst_acm_minor = acm_dr_failover_manager_dest_acm_minor | default('Unknown') | trim %}
+{% set src_ocp_minor = acm_dr_failover_manager_source_ocp_minor | default('Unknown') | trim %}
+{% set dst_ocp_minor = acm_dr_failover_manager_dest_ocp_minor | default('Unknown') | trim %}
+{% set target_acm = acm_dr_failover_manager_target_acm_version | default('') | trim %}
+{% set effective_minor = acm_dr_failover_manager_effective_acm_minor | default(dst_acm_minor) | trim %}
+{% set effective_version = acm_dr_failover_manager_effective_acm_version | default(dst_acm) | trim %}
+{% set has_target = (target_acm | length > 0) %}
+{% set matrix = acm_dr_failover_manager_acm_ocp_matrix | default({}) %}
+{% set fleet = acm_dr_failover_manager_fleet_compat | default([]) %}
+{% set all_ok = acm_dr_failover_manager_fleet_compat_all_ok | default(true) | bool %}
+{% set incompatible_count = acm_dr_failover_manager_fleet_compat_incompatible_count | default(0) | int %}
+{% set src_ocp_supported = (src_acm_minor == 'Unknown' or src_ocp_minor == 'Unknown' or (src_ocp_minor in matrix[src_acm_minor] | default([]))) %}
+{% set dst_ocp_supported = (dst_acm_minor == 'Unknown' or dst_ocp_minor == 'Unknown' or (dst_ocp_minor in matrix[dst_acm_minor] | default([]))) %}
+{% set effective_supported_range = matrix[effective_minor] | default([]) %}
+{% set compatible_count = fleet | selectattr('dest_rhacm_supported', 'equalto', true) | list | length %}
+{% set non_ocp_count = fleet | selectattr('ocp_minor', 'equalto', 'N/A') | list | length %}
+{% set ocp_incompatible = fleet | selectattr('dest_rhacm_supported', 'equalto', false) | rejectattr('ocp_minor', 'equalto', 'N/A') | list %}
+======================================================================
+ 🛡️ FLEET-WIDE VERSION COMPATIBILITY REPORT
+======================================================================
+{% if has_target %}
+
+ [🎯 UPGRADE TARGET]
+   Target RHACM Version: {{ target_acm }} (upgrade validation mode)
+   Supported OCP range for RHACM {{ effective_minor }}: {{ effective_supported_range | join(', ') if effective_supported_range | length > 0 else 'unknown' }}
+{% endif %}
+
+ [HUB INFRASTRUCTURE]
+   🌐 Source Hub ({{ active_hub }}):
+      ├─ RHACM: {{ src_acm }}  │  OCP: {{ src_ocp }}  │  MCE: {{ src_mce }}
+{% if src_acm_minor != 'Unknown' and src_ocp_minor != 'Unknown' %}
+      └─ {{ src_ocp_supported | ternary('✅ OCP ' ~ src_ocp_minor ~ ' supported by RHACM ' ~ src_acm_minor, '❌ OCP ' ~ src_ocp_minor ~ ' NOT supported by RHACM ' ~ src_acm_minor) }}
+{% else %}
+      └─ ⚪ Version data unavailable - compatibility check skipped
+{% endif %}
+   📡 Dest Hub ({{ passive_hub }}):
+      ├─ RHACM: {{ dst_acm }}  │  OCP: {{ dst_ocp }}  │  MCE: {{ dst_mce }}
+{% if dst_acm_minor != 'Unknown' and dst_ocp_minor != 'Unknown' %}
+      └─ {{ dst_ocp_supported | ternary('✅ OCP ' ~ dst_ocp_minor ~ ' supported by RHACM ' ~ dst_acm_minor, '❌ OCP ' ~ dst_ocp_minor ~ ' NOT supported by RHACM ' ~ dst_acm_minor) }}
+{% else %}
+      └─ ⚪ Version data unavailable - compatibility check skipped
+{% endif %}
+
+ [MANAGED CLUSTER FLEET vs {{ has_target | ternary('TARGET', 'DESTINATION') }} RHACM {{ effective_version }}]
+{% if effective_minor != 'Unknown' and effective_supported_range | length > 0 %}
+   Supported OCP range for RHACM {{ effective_minor }}: {{ effective_supported_range | join(', ') }}
+{% else %}
+   ⚪ RHACM version unknown - Spoke compatibility check skipped
+{% endif %}
+----------------------------------------------------------------------
+{% for spoke in fleet %}
+   📌 {{ spoke.name }}:
+{% if spoke.ocp_minor != 'N/A' %}
+      ├─ Product: {{ spoke.product }}  │  OCP: {{ spoke.openshift_version }}
+      └─ {{ spoke.dest_rhacm_supported | ternary('✅ Compatible (OCP ' ~ spoke.ocp_minor ~ ' in supported range)', '❌ NOT SUPPORTED - OCP ' ~ spoke.ocp_minor ~ ' outside RHACM ' ~ effective_minor ~ ' range (' ~ (effective_supported_range | join(", ")) ~ ')') }}
+{% else %}
+      ├─ Product: {{ spoke.product }}  │  K8s: {{ spoke.kubernetes_version }}
+      └─ ⚪ Non-OCP cluster (outside RHACM/OCP matrix scope - K8s compatibility assumed)
+{% endif %}
+{% endfor %}
+
+ [SUMMARY]
+   Total Spokes: {{ fleet | length }} | Compatible: {{ compatible_count }} | Incompatible: {{ incompatible_count }} | Non-OCP: {{ non_ocp_count }}
+   Fleet Status: {{ all_ok | ternary('✅ ALL SPOKES COMPATIBLE with ' ~ (has_target | ternary('target', 'destination')) ~ ' RHACM ' ~ effective_version, '❌ ' ~ incompatible_count | string ~ ' SPOKE(S) INCOMPATIBLE with ' ~ (has_target | ternary('target', 'destination')) ~ ' RHACM ' ~ effective_version) }}
+{% if not all_ok and ocp_incompatible | length > 0 %}
+
+ [UPGRADE PATH REQUIRED]
+   To manage all Spokes with RHACM {{ effective_minor }}, the following
+   Spokes need OCP {{ effective_supported_range | first | default('?') }}+:
+{% for spoke in ocp_incompatible %}
+     - {{ spoke.name }} (currently OCP {{ spoke.openshift_version }})
+{% endfor %}
+{% if has_target %}
+   🛡️ To proceed despite incompatibility: -e acm_dr_failover_manager_skip_version_gate=true
+{% endif %}
+{% endif %}
+======================================================================

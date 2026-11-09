@@ -1,0 +1,28 @@
+---
+galaxy_info:
+  role_name: acm_argocd_instance_setup
+  namespace: dfmateus
+  author: Diego Felipe Mateus
+  company: Red Hat
+  description: >-
+    Generic and decoupled provisioning of a named Red Hat OpenShift GitOps
+    (ArgoCD) instance -- RBAC, Git credentials, ApplicationSet (static list
+    or fan-out via RHACM Placement) and ConsoleLink, all fully parameterized
+    via variables. Does not assume any specific use case: each instance
+    (name, namespace, repository, generators) is 100% defined by the caller.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - rhacm
+    - gitops
+    - argocd
+    - openshift
+    - kubernetes
+
+dependencies: []
+...

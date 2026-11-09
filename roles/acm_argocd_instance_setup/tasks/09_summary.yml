@@ -1,0 +1,11 @@
+---
+# roles/acm_argocd_instance/tasks/09_summary.yml
+# =============================================================================
+# STAGE 09: COMPLETION SUMMARY
+# =============================================================================
+
+- name: "[SUMMARY] | Display ArgoCD instance completion status - {{ acm_argocd_instance_setup_name }}"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'reports/summary.j2').split('\n') }}"
+  run_once: true
+...

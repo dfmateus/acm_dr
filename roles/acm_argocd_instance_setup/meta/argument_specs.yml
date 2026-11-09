@@ -1,0 +1,204 @@
+---
+argument_specs:
+  main:
+    short_description: Parameterized provisioning of ArgoCD instances on OpenShift
+    description:
+      - >-
+        Provisions N independent ArgoCD instances: namespace, GitOps operator
+        (idempotent, cluster-wide), ArgoCD CR, RBAC, Git repository Secret,
+        RHACM integration (GitOpsCluster/Placement), ApplicationSet (list or
+        cluster_decision), and ConsoleLink. Each instance is 100% defined by
+        the input variables.
+    author:
+      - Diego Felipe Mateus
+    options:
+      # --- COSMETIC AND LOGGING ---
+      acm_argocd_instance_setup_separator_char:
+        description:
+          - Character used to draw separator lines in output.
+        type: str
+        default: "="
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_debug_no_log:
+        description:
+          - >-
+            Suppresses task output for security-sensitive operations (tokens, secrets,
+            kubeconfig content). Set to false to expose hidden output during troubleshooting.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      # --- INSTANCE IDENTITY ---
+      acm_argocd_instance_setup_name:
+        description: ArgoCD instance name (used in the CR and labels).
+        type: str
+        required: true
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_namespace:
+        description: Namespace where the ArgoCD instance will be created.
+        type: str
+        required: true
+        version_added: "1.0.0"
+      # --- GITOPS OPERATOR ---
+      acm_argocd_instance_setup_manage_operator:
+        description: Install/verify the OpenShift GitOps operator (idempotent).
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_gitops_operator_namespace:
+        description: OpenShift GitOps operator namespace.
+        type: str
+        default: "openshift-gitops-operator"
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_gitops_channel:
+        description: GitOps operator update channel.
+        type: str
+        default: "auto"
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_gitops_approval:
+        description: Operator update approval policy.
+        type: str
+        default: "Automatic"
+        version_added: "1.0.0"
+      # --- RBAC/SSO ---
+      acm_argocd_instance_setup_rbac_default_policy:
+        description: ArgoCD default RBAC policy.
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_rbac_policy:
+        description: ArgoCD custom RBAC rules (CSV format).
+        type: str
+        default: "g, system:cluster-admins, role:admin\ng, cluster-admins, role:admin\n"
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_rbac_scopes:
+        description: SSO scopes for ArgoCD.
+        type: str
+        default: "[groups]"
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_sso_enabled:
+        description: Enable SSO (Dex) on the ArgoCD instance.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_cluster_admin_rbac:
+        description: >-
+          Create a cluster-admin ClusterRoleBinding for the application-controller
+          (required if Applications write outside the instance's namespace).
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      # --- GIT REPOSITORY ---
+      acm_argocd_instance_setup_repo_url:
+        description: Git repository URL (Secret is only created if provided).
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_repo_username:
+        description: Username for Git repository authentication.
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_repo_pat:
+        description: Personal Access Token for the Git repository.
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_repo_target_revision:
+        description: Target branch/revision of the Git repository.
+        type: str
+        default: "main"
+        version_added: "1.0.0"
+      # --- MANAGED NAMESPACES ---
+      acm_argocd_instance_setup_managed_namespaces:
+        description: >-
+          List of managed namespaces pre-created via Ansible.
+          Each item: {name: "...", managed_by_label: true|false}.
+        type: list
+        elements: dict
+        default: []
+        version_added: "1.0.0"
+      # --- RESOURCE EXCLUSIONS ---
+      acm_argocd_instance_setup_resource_exclusions:
+        description: >-
+          List of resources excluded from the instance's scope.
+          Each item: {api_groups: ["..."], kinds: ["..."]}.
+        type: list
+        elements: dict
+        default: []
+        version_added: "1.0.0"
+      # --- APPLICATION GENERATOR ---
+      acm_argocd_instance_setup_generator_type:
+        description: "Generator type: 'none', 'list', or 'cluster_decision'."
+        type: str
+        default: "none"
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_applications:
+        description: Static list of Applications (generator_type=list).
+        type: list
+        elements: dict
+        default: []
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_placement_name:
+        description: RHACM Placement name (generator_type=cluster_decision).
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_placement_configmap:
+        description: ConfigMap name for the RHACM Placement output.
+        type: str
+        default: "acm-placement"
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_cluster_decision_path:
+        description: Repository path for cluster_decision Applications.
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_cluster_decision_destination_namespace:
+        description: Destination namespace for cluster_decision Applications.
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      # --- RHACM INTEGRATION ---
+      acm_argocd_instance_setup_wire_rhacm_integration:
+        description: Register the instance as a valid GitOps destination in RHACM.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_cluster_set:
+        description: ManagedClusterSet for the ManagedClusterSetBinding.
+        type: str
+        default: "default"
+        version_added: "1.0.0"
+      # --- SYNC POLICY ---
+      acm_argocd_instance_setup_sync_automated:
+        description: Enable automated sync on Applications.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_sync_prune:
+        description: Enable automated prune on Applications.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_sync_self_heal:
+        description: Enable self-heal on Applications.
+        type: bool
+        default: true
+        version_added: "1.0.0"
+      # --- CONSOLE LINK ---
+      acm_argocd_instance_setup_console_link_enabled:
+        description: Create a shortcut in the OpenShift Console application menu.
+        type: bool
+        default: false
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_console_link_text:
+        description: ConsoleLink text in the OpenShift menu.
+        type: str
+        default: ""
+        version_added: "1.0.0"
+      acm_argocd_instance_setup_console_link_section:
+        description: Menu section where the ConsoleLink is displayed.
+        type: str
+        default: "OpenShift GitOps"
+        version_added: "1.0.0"
+...

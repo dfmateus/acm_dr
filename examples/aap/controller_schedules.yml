@@ -1,0 +1,86 @@
+---
+# examples/aap/controller_schedules.yml
+#
+# Schedule definitions for Red Hat Ansible Automation Platform.
+# Compatible with the infra.controller_configuration collection and the AAP Controller API.
+#
+# PLACEHOLDER VARIABLES: same as controller_job_templates.yml:
+#   {{ aap_organization }} → Your AAP Organization name
+#
+# ALL SCHEDULES ARE DISABLED BY DEFAULT (enabled: false).
+# Enabling a schedule in production requires:
+#   1. Verifying that the failover direction in extra_data is correct.
+#   2. Confirming that both Hub clusters are reachable from AAP.
+#   3. Attaching the required credentials to the target Workflow Template.
+#   4. Changing enabled: false → enabled: true and re-importing.
+#
+# RRULE FORMAT (RFC 5545 / iCalendar):
+#   DTSTART is in UTC. BYDAY=SU means every Sunday. BYHOUR=0 means midnight UTC.
+#   To adjust the time: change BYHOUR and BYMINUTE.
+#   To change frequency: FREQ=MONTHLY;BYDAY=1SU for the first Sunday each month.
+#
+# Usage:
+#   ansible-playbook -e @examples/aap/controller_schedules.yml \
+#     -e "controller_hostname=https://aap.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=changeme" \
+#     -e "aap_organization=ACM DR Operations" \
+#     infra.controller_configuration.schedules
+
+controller_schedules:
+
+  # ---------------------------------------------------------------------------
+  # Weekly DR Drill - Dry-Run Only
+  # ---------------------------------------------------------------------------
+  # Runs the full 9-stage failover pipeline in dry-run mode against real clusters,
+  # without applying any changes. The Approval Node in the Workflow is skipped
+  # because skip_gates=true replaces it with an automatic pass. Safety assertions
+  # (Stage 00 reversed-direction guard, RPO gate, version matrix) still execute
+  # at full strength.
+  #
+  # Schedule target: WF - ACM DR - LAB - Hub Switchover
+  # When enabled, operators should review the AAP job output every Sunday morning
+  # and resolve any ⚠️ warnings before the next real-failover window.
+  #
+  # BEFORE ENABLING: set extra_data.acm_dr_failover_action to the direction
+  # you want to drill (failover or failback). Verify both Hub contexts are reachable
+  # from the AAP EE pod.
+  - name: "WF - ACM DR - LAB - Hub Switchover - Weekly"
+    description: >-
+      Weekly dry-run rehearsal of the full DR failover pipeline. Executes all 9 stages
+      against real clusters using Kubernetes API check_mode. No state is changed.
+      Disabled by default; enable after confirming Hub reachability and attaching the
+      required Source and Destination Hub credentials to the Workflow Template nodes.
+    organization: "{{ aap_organization }}"
+    unified_job_template: "WF - ACM DR - LAB - Hub Switchover"
+    # enabled: false - must be explicitly changed to true before the schedule takes effect.
+    # Never enable a schedule before verifying the extra_data.acm_dr_failover_action direction.
+    enabled: false
+    # Every Sunday at 00:00 UTC.
+    rrule: "DTSTART:20240101T000000Z RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU;BYHOUR=0;BYMINUTE=0;BYSECOND=0"
+    # extra_data is passed as extra_vars to the Workflow at schedule launch time.
+    # Adjust acm_dr_failover_action to match your desired drill direction.
+    extra_data:
+      acm_dr_failover_manager_dry_run: "true"   # string - AAP surveys pass booleans as strings
+      skip_gates: "true"                          # string - skip interactive confirmation gates
+      acm_dr_failover_action: "failover"          # string - "failover" or "failback"
+
+  # ---------------------------------------------------------------------------
+  # Monthly Full Lab Rebuild
+  # ---------------------------------------------------------------------------
+  # Rebuilds the full DR lab infrastructure (Hub Setup on both Hubs) on the first
+  # Sunday of each month. Validates that the setup automation is still idempotent
+  # and that no manual drift has accumulated. DISABLED by default.
+  - name: "WF - ACM DR - LAB - Full Lab Rebuild - Monthly"
+    description: >-
+      Monthly re-provisioning of the full DR lab. Validates Hub Setup idempotency
+      and catches configuration drift. Disabled by default. Enable only in
+      non-production lab environments where Hub Setup is safe to re-run unattended.
+    organization: "{{ aap_organization }}"
+    unified_job_template: "WF - ACM DR - LAB - Full Lab Rebuild"
+    enabled: false
+    # First Sunday of every month at 01:00 UTC (after the weekly drill at 00:00).
+    # AAP 2.7 does not support numeric BYDAY prefix (1SU); use BYSETPOS to select the first Sunday.
+    rrule: "DTSTART:20240101T010000Z RRULE:FREQ=MONTHLY;INTERVAL=1;BYSETPOS=1;BYDAY=SU;BYHOUR=1;BYMINUTE=0;BYSECOND=0"
+    extra_data: {}
+...

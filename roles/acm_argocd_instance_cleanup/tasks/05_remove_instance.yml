@@ -1,0 +1,85 @@
+---
+# roles/acm_argocd_instance_cleanup/tasks/05_remove_instance.yml
+# =============================================================================
+# STAGE 05: REMOVE THE ARGOCD INSTANCE (CUSTOM RESOURCE + NAMESPACE)
+# =============================================================================
+
+- name: "[REMOVE INSTANCE] | 5.1) Remove the ArgoCD Custom Resource - {{ acm_argocd_instance_cleanup_name }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    api_version: argoproj.io/v1beta1
+    kind: ArgoCD
+    name: "{{ acm_argocd_instance_cleanup_name }}"
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+  check_mode: "{{ acm_argocd_instance_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+- name: "[REMOVE INSTANCE] | 5.2) Remove the instance Namespace (Secret/GitOpsCluster/Placement/MCSB included) - {{ acm_argocd_instance_cleanup_namespace }}"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: absent
+    kind: Namespace
+    name: "{{ acm_argocd_instance_cleanup_namespace }}"
+    wait: true
+    wait_timeout: "{{ acm_argocd_instance_cleanup_namespace_delete_timeout | default(300) }}"
+  register: acm_argocd_instance_cleanup_ns_delete_result
+  failed_when: false
+  check_mode: "{{ acm_argocd_instance_cleanup_dry_run | default(false) | bool }}"
+  diff: true
+
+# Real-World Finding (defense in depth): if, even after Stage 01, the
+# namespace still gets stuck in Terminating (e.g.: an Application recreated
+# between Stage 01 and this one, or an ApplicationSet regenerating before
+# the delete), this step detects and resolves it via the same self-healing path.
+- name: "[REMOVE INSTANCE] | 5.3) Discover remaining Applications (if the Namespace is still stuck)"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+  register: acm_argocd_instance_cleanup_stuck_apps
+  failed_when: false
+  when: not (acm_argocd_instance_cleanup_dry_run | default(false) | bool)
+
+- name: "[REMOVE INSTANCE] | 5.4) 🧹 SELF-HEALING - Remove finalizer from remaining Applications and re-delete the Namespace"
+  kubernetes.core.k8s:
+    context: "{{ k8s_target_context }}"
+    state: patched
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ acm_argocd_instance_cleanup_namespace }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: "{{ acm_argocd_instance_cleanup_stuck_apps.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+  when:
+    - not (acm_argocd_instance_cleanup_dry_run | default(false) | bool)
+    - acm_argocd_instance_cleanup_stuck_apps.resources | default([]) | length > 0
+
+- name: "[REMOVE INSTANCE] | 5.5) ⏳ WAIT - Confirm final purge of the instance Namespace"
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_target_context }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ acm_argocd_instance_cleanup_namespace }}"
+  register: acm_argocd_instance_cleanup_final_ns_check
+  until: acm_argocd_instance_cleanup_final_ns_check.resources | default([]) | length == 0
+  retries: 20
+  delay: 5
+  failed_when: false
+  when: not (acm_argocd_instance_cleanup_dry_run | default(false) | bool)
+
+- name: "[REMOVE INSTANCE] | 5.6) 🔎 [DRY-RUN] Preview of instance removal"
+  ansible.builtin.debug:
+    msg: >-
+      [DRY-RUN] The ArgoCD instance '{{ acm_argocd_instance_cleanup_name }}' and the namespace
+      '{{ acm_argocd_instance_cleanup_namespace }}' (credential Secret, GitOpsCluster,
+      Placement, and ManagedClusterSetBinding, all namespaced, would be removed together) would
+      be permanently deleted.
+  when: acm_argocd_instance_cleanup_dry_run | default(false) | bool
+...
