@@ -7,7 +7,7 @@ galaxy_info:
   description: >-
     Declarative and surgical decommissioning of a cluster that was elected as a
     Disaster Recovery node for Red Hat Advanced Cluster Management for Kubernetes
-    (RHACM 2.10+): fully removes ACM (MultiClusterHub + operator),
+    (RHACM 2.10 to 2.17): fully removes ACM (MultiClusterHub + operator),
     MultiClusterObservability, governance/appdemo ArgoCD instances, and the OADP
     DR configuration -- while preserving the OpenShift GitOps and OADP Operators,
     and optionally the Backup/Observability data in Azure.

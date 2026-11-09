@@ -425,7 +425,7 @@ Start at: [Step 1](#1-install-the-collection). When you reach Step 2, follow the
 ## Prerequisites
 
 * Two OpenShift clusters (4.13+) designated as Hub A (primary) and Hub B (DR). If you need to provision ARO test clusters on Azure, see [*`examples/terraform/azure/aro-lab-hub/`*](../../examples/terraform/azure/aro-lab-hub/).
-* RHACM 2.10+ operator available in the OperatorHub on both Hubs (required only for [Scenario B](#scenario-b) and new Hub setup; existing RHACM installations are supported as-is).
+* RHACM 2.10 to 2.17 operator available in the OperatorHub on both Hubs (required only for [Scenario B](#scenario-b) and new Hub setup; existing RHACM installations are supported as-is).
 * Cloud credentials for backup storage: Azure credentials for ARO Hubs (Storage Account provisioning) or AWS credentials for ROSA HCP Hubs (S3 bucket provisioning). Both Hubs in a DR pair must use the same cloud provider and the same storage resource.
 * **`ansible-core`** >= 2.16.0, Python >= 3.11
 * CLI tools: **`oc`**, **`az`** (ARO) or **`aws`** (ROSA HCP), **`jq`**

@@ -6,7 +6,7 @@ galaxy_info:
   company: Red Hat
   description: >-
     Core Disaster Recovery Failover/Failback orchestration engine
-    for Red Hat Advanced Cluster Management for Kubernetes (RHACM 2.10+):
+    for Red Hat Advanced Cluster Management for Kubernetes (RHACM 2.10 to 2.17):
     logical fencing, Hub activation via OADP/Velero Restore, Spoke fleet
     reconnection, and post-failover compliance audit.
   license: GPL-3.0-or-later

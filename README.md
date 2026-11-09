@@ -5,13 +5,13 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Ansible](https://img.shields.io/badge/ansible-%3E%3D2.16-black.svg)](https://docs.ansible.com/ansible/latest/)
 
-Multi-cluster Disaster Recovery orchestration for Red Hat Advanced Cluster Management for Kubernetes (RHACM 2.10+).
+Multi-cluster Disaster Recovery orchestration for Red Hat Advanced Cluster Management for Kubernetes (RHACM 2.10 to 2.17).
 
 > **What is RHACM?** Red Hat Advanced Cluster Management for Kubernetes offers management, visibility, and control of your entire Kubernetes fleet from a single console. See [*`docs/architecture/rhacm.md`*](docs/architecture/rhacm.md) for a full overview, or visit the official [product page](https://www.redhat.com/en/technologies/management/advanced-cluster-management) and [datasheet](https://www.redhat.com/en/resources/advanced-cluster-management-kubernetes-datasheet).
 
 ## 📖 Overview
 
-This automation suite, built for **`ansible-core` (CLI)** and the **Red Hat Ansible Automation Platform (AAP)**, orchestrates **Business Continuity** for fleets managed by **RHACM 2.10+**. It covers **Disaster Recovery (DR)**, **Failover**, **Failback**, **Planned Maintenance Failover** (zero-downtime Hub upgrades via DR switchover), **DR Readiness Drills**, and **Fleet Lifecycle Management** (Spoke onboarding and detachment across any Kubernetes distribution). Validated against the [RHACM 2.17 Business Continuity](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index#active-passive-config) official documentation (GA: June 16, 2026) following the Red Hat supported [active-passive hub cluster architecture](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index#active-passive-config).
+This automation suite, built for **`ansible-core` (CLI)** and the **Red Hat Ansible Automation Platform (AAP)**, orchestrates **Business Continuity** for fleets managed by **RHACM 2.10 to 2.17**. It covers **Disaster Recovery (DR)**, **Failover**, **Failback**, **Planned Maintenance Failover** (zero-downtime Hub upgrades via DR switchover), **DR Readiness Drills**, and **Fleet Lifecycle Management** (Spoke onboarding and detachment across any Kubernetes distribution). Validated against the [RHACM 2.17 Business Continuity](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index#active-passive-config) official documentation (GA: June 16, 2026) following the Red Hat supported [active-passive hub cluster architecture](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html-single/business_continuity/index#active-passive-config).
 
 The solution has two distinct layers with different distribution requirements:
 

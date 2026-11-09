@@ -11,7 +11,7 @@ Release Summary
 ---------------
 
 Initial release of the RHACM Multi-Cluster Disaster Recovery automation suite
-as an Ansible Galaxy collection. Covers DR failover and failback for RHACM 2.10+
+as an Ansible Galaxy collection. Covers DR failover and failback for RHACM 2.10 to 2.17
 across ARO Classic, ROSA Classic, ROSA HCP, and vanilla Kubernetes, with full
 AAP 2.7 Gateway integration.
 
